@@ -307,6 +307,18 @@ if [ -f /etc/systemd/system/netrun-node-agent.service ]; then
   fi
 fi
 
+# ── 5b) HTTPS on the HTTP proxy ports ────────────────────────────
+# haproxy fronts every HTTP proxy port and answers both plain HTTP and HTTPS
+# (TLS) proxy clients with a Let's Encrypt IP certificate (auto-renewed).
+# Non-fatal: HTTP / SOCKS keep working if it fails; rerun `netrun-https setup`.
+if [ "${NETRUN_HTTPS:-1}" = "1" ]; then
+  _https_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/netrun-https.sh"
+  if [ -f "$_https_script" ]; then
+    log "Enabling HTTPS on the HTTP proxy ports"
+    bash "$_https_script" setup || log "WARNING: HTTPS setup failed — HTTP/SOCKS unaffected; rerun: netrun-https setup"
+  fi
+fi
+
 # ── 6) Post-conditions ──────────────────────────────────────────
 log "─── Verification ───"
 printf "  restore unit  : "

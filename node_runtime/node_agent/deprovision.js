@@ -40,6 +40,8 @@ const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
 const PROXY_BIN = path.join(PROXY_ROOT, "3proxy", "bin", "3proxy");
 const NFT_TABLE = "proxy_accounting";
 const NFTABLES_PERSIST = process.env.NODE_AGENT_NFT_PERSIST || "/etc/nftables.conf";
+// HTTPS frontend reconciler (scripts/netrun-https.sh, installed by followup).
+const HTTPS_SYNC_BIN = process.env.NODE_AGENT_HTTPS_SYNC_BIN || "/usr/local/sbin/netrun-https";
 const HTTP_PORT_OFFSET = 10000; // paired http port = socks port - 10000
 // SIGTERM grace before SIGKILL when tearing down a batch process. Kept SHORT:
 // the removed ports are surplus/dead (no customer session to drain) and a mixed
@@ -332,6 +334,13 @@ async function deprovisionPorts(rawPorts) {
   if (allRequested.length > 0) {
     result.nft = await nftCleanup(allRequested);
     await execCapture("bash", ["-c", `nft list ruleset > ${NFTABLES_PERSIST}`], { timeoutMs: 60000 });
+  }
+  // HTTPS frontend: haproxy still binds the removed HTTP ports until its
+  // frontends are rewritten — release them now, so a later generate that reuses
+  // this port range can bind. Best-effort (the 5-min sync timer is the backstop).
+  if (result.cfgs.some((c) => c.ok) && fs.existsSync(HTTPS_SYNC_BIN)) {
+    const sync = await execCapture(HTTPS_SYNC_BIN, ["sync"], { timeoutMs: 120000 });
+    result.https_sync = { code: sync.code };
   }
   return result;
 }

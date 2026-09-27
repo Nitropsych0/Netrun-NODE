@@ -1220,7 +1220,15 @@ async function listListeningTcpPorts(range) {
   // "not listening" (false ports_not_listening; kill-on-rebind misses daemons).
   // Filter to the caller's range in-kernel so the output stays small + complete.
   const _ssArgs = ["-ltnH"];
-  if (range && Number.isInteger(range.low) && Number.isInteger(range.high) && range.low > 0 && range.high >= range.low) {
+  const exactPorts =
+    range && Array.isArray(range.ports)
+      ? [...new Set(range.ports.map((p) => toPositiveInt(p, 0)).filter((p) => p > 0 && p <= 65535))]
+      : [];
+  if (exactPorts.length > 0) {
+    // Exact ports only — the output stays a few lines no matter how many
+    // listeners the node carries (HTTPS frontends double the HTTP ones).
+    _ssArgs.push(exactPorts.map((p) => `sport = :${p}`).join(" or "));
+  } else if (range && Number.isInteger(range.low) && Number.isInteger(range.high) && range.low > 0 && range.high >= range.low) {
     _ssArgs.push(`sport >= :${range.low} and sport <= :${range.high}`);
   }
   const ss = await runCommand("ss", _ssArgs, { timeoutSec: 8 });
@@ -3199,10 +3207,17 @@ async function handleHealth(req, res) {
   const summary = buildInstanceSummary(instances);
   // Fan out ipv6 + dns + listening-port probes in parallel — each carries its
   // own ~5s budget, so wall-clock stays bounded by max(probe), not sum.
+  // Readiness only needs each instance's start port. Probing exactly those
+  // keeps `ss` output tiny: a full dump of a busy node (socks + http + HTTPS
+  // frontend listeners) blows past runCommand's 500KB tail cap, and the
+  // truncated list made live instances read as «not listening».
+  const startPorts = instances
+    .map((inst) => toPositiveInt(inst && inst.startPort, 0))
+    .filter((port) => port > 0);
   const [ipv6Check, dnsCheck, listenState] = await Promise.all([
     checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
     checkDns(5000),
-    listListeningTcpPorts(),
+    listListeningTcpPorts(startPorts.length > 0 ? { ports: startPorts } : undefined),
   ]);
   // Wave NODE-GENLOCK-HARDENING — 3proxy readiness, additive. Lets the
   // orchestrator distinguish "agent up but 3proxy not listening yet" (fresh

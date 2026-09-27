@@ -795,6 +795,15 @@ function create_startup_script() {
   is_auth_used;
   local use_auth=$?;
 
+  # HTTPS frontend (scripts/netrun-https.sh): when the node has it, HTTP proxy
+  # listeners bind 127.0.0.1 and haproxy owns the public HTTP ports, answering
+  # both plain HTTP and HTTPS (TLS) proxy clients on the same port. SOCKS
+  # listeners stay on the public IPv4.
+  local http_listen_ip="$backconnect_ipv4"
+  if [ -d /etc/haproxy/netrun.d ]; then http_listen_ip="127.0.0.1"; fi
+  local main_listen_ip="$backconnect_ipv4"
+  if [ "$proxies_type" = "http" ]; then main_listen_ip="$http_listen_ip"; fi
+
   cat > $startup_script_path <<-EOF
 	#!$bash_location
 
@@ -887,13 +896,13 @@ $dns_nserver_lines
 	      echo "\$access_rules_part" >> $proxyserver_config_path;
 	      IFS=\$' \t\n';
 	    fi;
-	    echo "\$proxy_startup_depending_on_type -p\$port -i$backconnect_ipv4 -e\$random_ipv6_address" >> $proxyserver_config_path;
+	    echo "\$proxy_startup_depending_on_type -p\$port -i$main_listen_ip -e\$random_ipv6_address" >> $proxyserver_config_path;
 	    # Wave HTTP.A — dual mode: also emit a paired http listener on
 	    # port-10000 for the SAME IPv6. The "$proxies_type" literal is
 	    # baked at generation time, so for socks5/http this branch is a
 	    # dead no-op (backward-compatible).
 	    if [ "$proxies_type" = "dual" ]; then
-	      echo "proxy $mode_flag -n -a -p\$((port - 10000)) -i$backconnect_ipv4 -e\$random_ipv6_address" >> $proxyserver_config_path;
+	      echo "proxy $mode_flag -n -a -p\$((port - 10000)) -i$http_listen_ip -e\$random_ipv6_address" >> $proxyserver_config_path;
 	    fi;
 	    ((port+=1))
 	    ((count+=1))
@@ -912,6 +921,10 @@ $dns_nserver_lines
 	# Start THIS 3proxy instance as a detached daemon
 	nohup ${user_home_dir}/proxyserver/3proxy/bin/3proxy ${proxyserver_config_path} >/dev/null 2>&1 &
 	sleep 2  # Wait for daemon to initialize
+
+	# HTTPS frontend: put this instance's HTTP ports behind haproxy right away
+	# (the netrun-https-sync timer would otherwise pick them up within 5 min).
+	if [ -x /usr/local/sbin/netrun-https ]; then /usr/local/sbin/netrun-https sync >/dev/null 2>&1 || true; fi
 
 	# NOTE: We do NOT delete old IPv6 addresses - they belong to other instances!
 
