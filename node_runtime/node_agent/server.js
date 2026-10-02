@@ -10,6 +10,7 @@ const { buildDescribe } = require("./describe.js");
 const accounting = require("./accounting.js");
 const egressMode = require("./egress_mode.js");
 const deprovision = require("./deprovision.js");
+const loadSampler = require("./load_sampler.js").createSampler();
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 const API_KEY = String(process.env.NODE_AGENT_API_KEY || "").trim();
@@ -3272,6 +3273,8 @@ async function handleHealth(req, res) {
     ipv6,
     ipv6Egress: ipv6,
     dns: dnsCheck,
+    // Wave NODE-LOAD-GUARD — additive; the guard itself polls GET /load.
+    load: loadSampler.snapshot(),
   });
 }
 
@@ -3307,6 +3310,17 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && pathname === "/health") {
     await handleHealth(req, res);
+    return;
+  }
+
+  // Wave NODE-LOAD-GUARD — CPU / memory / sockets for the orchestrator's
+  // off-sale guard. Cheap (in-memory ring + three /proc reads).
+  if (req.method === "GET" && pathname === "/load") {
+    if (!ensureAuthorized(req)) {
+      sendJson(res, 401, { success: false, status: "failed", error: "unauthorized" });
+      return;
+    }
+    sendJson(res, 200, { success: true, ...loadSampler.snapshot() });
     return;
   }
 
@@ -3491,6 +3505,7 @@ const server = http.createServer(async (req, res) => {
 // without starting a listener. Behaviour when launched directly (the
 // node-agent process) is unchanged.
 if (require.main === module) {
+  loadSampler.start();
   server.listen(PORT, () => {
     console.log(
       `[node-agent] listening on :${PORT}, jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}`
