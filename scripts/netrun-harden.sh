@@ -78,8 +78,19 @@ restart_cfg() {
   pids="$(pgrep -f "3proxy[^ ]* [^ ]*/$(basename "$cfg")\$" || true)"
   [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
   case "$cfg" in *.disabled) return 0 ;; esac   # disabled batches stay down
-  nohup "$BIN" "$cfg" >/dev/null 2>&1 &
-  disown || true
+  # Respawn in its OWN systemd scope (the cfg has `daemon`, so 3proxy forks and
+  # systemd-run returns): run from an SSH session, a plain nohup would leave the
+  # batch inside that session's scope.
+  # No fallback after systemd-run: the daemonizing parent's exit code is not a
+  # launch failure, and a second spawn would start a duplicate 3proxy.
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --scope --quiet --collect \
+      --unit "netrun-3proxy-$(basename "$cfg" .cfg | sed 's/^3proxy_//')-h$(date +%s)" \
+      "$BIN" "$cfg" </dev/null >/dev/null 2>&1 &
+  else
+    nohup "$BIN" "$cfg" </dev/null >/dev/null 2>&1 &
+  fi
+  disown 2>/dev/null || true
 }
 
 # SOCKS5 probe from the node itself: prints ALLOWED / acl-denied / auth-rejected.
