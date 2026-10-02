@@ -381,12 +381,30 @@ async function reapplyPergbBlocks() {
 // mid-block) THEN best-effort tear down its per-port cfg/process (block-START
 // ports). A missing per-port cfg is no longer an error — the nft drop is the
 // enforcement, so the account converges instead of 404-looping.
+// A BATCH cfg (one 3proxy serving up to ~1500 ports) is named after its START
+// port, so configPathForPort(start) finds it as if it were a per-port cfg.
+function _isBatchCfg(cfgPath) {
+  try {
+    const text = fs.readFileSync(cfgPath, "utf-8");
+    return (text.match(/^[ \t]*socks[ \t]/gm) || []).length > 1;
+  } catch {
+    return false;
+  }
+}
+
 async function disablePort(port) {
   const portNum = Number(port);
   if (!Number.isInteger(portNum) || portNum <= 0) {
     throw new PortNotFoundError(port);
   }
   await _enforceBlock(portNum, true);
+  // Security audit 2026-10-02 — disabling a batch's START port used to SIGTERM
+  // the whole batch (every other customer in it lost the proxy) AND demote its
+  // cfg, so a reboot never brought the batch back. For a batch the nft drop is
+  // the whole enforcement; the shared process and cfg are never touched.
+  if (_isBatchCfg(configPathForPort(portNum))) {
+    return { action: "blocked_nft_only", port: portNum, batch: true };
+  }
   try {
     return await _disablePortCfg(portNum);
   } catch (err) {
@@ -573,6 +591,7 @@ module.exports = {
   ensurePergbBlockInfra,
   _enforceBlock,
   _readBlockedList,
+  _isBatchCfg,
   _writeBlockedList,
   _httpFor,
   BLOCKED_LIST_FILE,
