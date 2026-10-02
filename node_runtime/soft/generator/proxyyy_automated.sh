@@ -863,8 +863,14 @@ $dns_nserver_lines
 	auth_part="auth iponly"
 	if [ $use_auth -eq 0 ]; then
 	  auth_part="
-	    auth strong
+	    auth strong"
+	  # Security fix 2026-10-02 (A1): with per-proxy random auth \$user is EMPTY,
+	  # and "users :CL:" registered a user with an empty login AND password —
+	  # every proxy accepted empty credentials. Only declare a real user.
+	  if [ -n "$user" ]; then
+	    auth_part="\$auth_part
 	    users $user:CL:$password"
+	  fi;
 	fi;
 
 	if [ -n "$denied_hosts" ]; then
@@ -893,7 +899,16 @@ $dns_nserver_lines
 	      read -r username password <<< "\${proxy_random_credentials[\$count]}";
 	      echo "flush" >> $proxyserver_config_path;
 	      echo "users \$username:CL:\$password" >> $proxyserver_config_path;
-	      echo "\$access_rules_part" >> $proxyserver_config_path;
+	      # Security fix 2026-10-02 (A2): 3proxy's user list is GLOBAL (flush
+	      # resets ACLs, not users), so "allow * *" let EVERY login of the batch
+	      # in on EVERY port. Each port admits only its own login.
+	      if [ -n "$denied_hosts" ]; then
+	        echo "deny * * $denied_hosts" >> $proxyserver_config_path;
+	        echo "allow \$username" >> $proxyserver_config_path;
+	      else
+	        echo "allow \$username * $allowed_hosts" >> $proxyserver_config_path;
+	        echo "deny *" >> $proxyserver_config_path;
+	      fi;
 	      IFS=\$' \t\n';
 	    fi;
 	    echo "\$proxy_startup_depending_on_type -p\$port -i$main_listen_ip -e\$random_ipv6_address" >> $proxyserver_config_path;
