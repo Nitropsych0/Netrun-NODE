@@ -592,6 +592,9 @@ module.exports = {
   _enforceBlock,
   _readBlockedList,
   _isBatchCfg,
+  // Metering-cache test hooks (accounting.meter_cache.test.js).
+  _resetCountersCache,
+  _setCounterItemsFetcher,
   _writeBlockedList,
   _httpFor,
   BLOCKED_LIST_FILE,
