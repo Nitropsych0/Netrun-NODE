@@ -93,7 +93,9 @@ function createSampler({ readFile = (p) => fs.readFileSync(p, "utf-8"), now = ()
     const windowSec = first && last ? Math.round((last.at - first.at) / 1000) : 0;
     const tcp = parseSockstatTcp(read("/proc/net/sockstat")) + parseSockstatTcp(read("/proc/net/sockstat6"));
     return {
-      cpuPct: round1(intervals(SAMPLE_MS * 1.5).slice(-1)[0] ?? null),
+      // The newest interval, whenever it was taken (sampling is every 5 s, so
+      // a "last N seconds" window could miss it between ticks).
+      cpuPct: round1(samples.length >= 2 ? cpuPctBetween(samples[samples.length - 2].cpu, last.cpu) : null),
       cpuAvg1m: round1(avgOver(60 * 1000)),
       cpuAvg5m: round1(avgOver(WINDOW_MS)),
       // The LOWEST interval in the window: >80 means it never dipped below

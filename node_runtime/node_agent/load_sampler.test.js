@@ -54,6 +54,9 @@ function fake() {
     init() {
       s.tick();
     },
+    later(ms) {
+      t += ms;
+    },
   };
 }
 
@@ -68,6 +71,9 @@ function fake() {
   const hot = f.s.snapshot();
   ok(hot.cpuMin5m === 90 && hot.cpuAvg5m === 90 && hot.cpuPct === 90, "sustained 90 %");
   ok(hot.windowSec >= 290, "window filled");
+
+  f.later(ls.SAMPLE_MS * 1.9); // read between ticks
+  ok(f.s.snapshot().cpuPct === 90, "cpuPct is the newest interval even between ticks");
 
   f.step(10, 1); // one dip
   const dip = f.s.snapshot();
