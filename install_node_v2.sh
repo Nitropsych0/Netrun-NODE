@@ -34,6 +34,7 @@ REMOVE_LEGACY_ROOT=0
 TMP_SOURCE=""
 
 log() { printf '[install_node_v2] %s\n' "$*"; }
+warn() { printf '[install_node_v2] WARNING: %s\n' "$*" >&2; }
 die() { printf '[install_node_v2] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
@@ -178,7 +179,20 @@ net.netfilter.nf_conntrack_max = 1048576
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.ipv4.tcp_max_syn_backlog = 8192
 net.core.somaxconn = 8192
-net.ipv4.ip_local_port_range = 10000 65000
+# Wave CAPACITY-18K — ephemeral ports BELOW every listener. Proxy listeners
+# use 8100-65535 (socks >= 18100, dual http = socks - 10000 >= 8100) and the
+# agent :8085; 1024-8000 never overlaps them, so an outbound socket can never
+# hold a port a (re)starting 3proxy/haproxy listener needs. The range is shared
+# by IPv4 and IPv6 (there is no IPv6 knob). 3proxy binds each upstream socket
+# to its -e<IPv6> with port 0 BEFORE connect (doconnect: bind(extsa6:0)), and
+# bind-time port allocation is per source address — so every proxy gets its
+# own 6977-port pool, far above its ceiling of 2 listeners x maxconn 200
+# (TIME_WAIT left by node-side closes also holds a slot for 60 s: ~110 new
+# upstream connections/s sustained per proxy). haproxy's loopback leg to
+# 3proxy uses plain connect(), whose ports are reused per destination port.
+# The one node-wide pool is IPv4 egress (bind 0.0.0.0:0), used only in the
+# dualstack egress mode for IPv4-only targets.
+net.ipv4.ip_local_port_range = 1024 8000
 fs.file-max = 2097152
 
 # === TCP/IP fingerprint normalization (Android-like) ===
@@ -292,8 +306,10 @@ server:
     access-control: ::1 allow
     do-ip6: yes
     num-threads: 4
-    msg-cache-size: 128m
-    rrset-cache-size: 256m
+    # Wave CAPACITY-18K — 32m/64m (was 128m/256m, up to ~450 MB RSS): the cache
+    # only serves this node's own proxies, and the RAM goes to proxies instead.
+    msg-cache-size: 32m
+    rrset-cache-size: 64m
     cache-min-ttl: 60
     prefetch: yes
     qname-minimisation: yes
@@ -546,7 +562,7 @@ if systemctl is-enabled --quiet netrun-3proxy-restore 2>/dev/null; then ok "rest
 c "7. 3proxy state"
 cfg_count=$(ls /opt/netrun/proxyserver/3proxy/3proxy_*.cfg 2>/dev/null | wc -l)
 proc_count=$(pgrep -c 3proxy 2>/dev/null || echo 0)
-listening=$(ss -tln 2>/dev/null | grep -cE ':[3-4][0-9]{4} ' || echo 0)
+listening=$(ss -Hltn 2>/dev/null | awk '{ p = $4; sub(/.*:/, "", p); if (p + 0 >= 8100) n++ } END { print n + 0 }')
 echo "  cfg files / procs / listeners: $cfg_count / $proc_count / $listening"
 
 c "8. Resources"
@@ -569,7 +585,7 @@ LOG=/var/log/netrun-trend.log
 ts=$(date '+%Y-%m-%d %H:%M:%S')
 threads=$(ls -d /proc/*/task/* 2>/dev/null | wc -l)
 proc3=$(pgrep -c 3proxy)
-listening=$(ss -tln 2>/dev/null | grep -cE ':(2|3|4|5|6)[0-9]{4} ')
+listening=$(ss -Hltn 2>/dev/null | awk '{ p = $4; sub(/.*:/, "", p); if (p + 0 >= 8100) n++ } END { print n + 0 }')
 estab=$(ss -tn state established 2>/dev/null | wc -l)
 ipv6cnt=$(ip -6 addr show scope global 2>/dev/null | grep -c 'inet6')
 mem=$(free -m | awk '/^Mem:/ {print $3"/"$2}')
@@ -595,20 +611,14 @@ EOF
 # 3proxy binds a missing source address and egress fails ("proxy invalid").
 # DAD/MLD off (98-netrun-ipv6.conf, set by configure_sysctl earlier) makes
 # re-adding thousands of addresses cheap (no MLD-overload).
+# Wave CAPACITY-18K — the script itself lives in the repo
+# (deploy/node/netrun-ipv6-restore.sh): ONE `ip -batch` with `nodad` instead of
+# one `ip` fork per address (18k forks at boot), installed under scripts/ so a
+# later code deploy of the repo never rewrites an existing node's boot script.
 install_ipv6_restore_unit() {
   log "Installing netrun-ipv6-restore (re-add proxy IPv6 addrs after boot)"
   mkdir -p /opt/netrun/scripts
-  cat > /opt/netrun/scripts/netrun-ipv6-restore.sh <<'IPV6RESTORE'
-#!/usr/bin/env bash
-set -u
-IFACE=$(ip -6 route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
-[ -z "$IFACE" ] && exit 0
-grep -rhoE -- '-e2001:[0-9a-f:]+' /opt/netrun/proxyserver/ 2>/dev/null | sed 's/-e//' | sort -u | while read -r a; do
-  [ -n "$a" ] && ip -6 addr add "$a/64" dev "$IFACE" 2>/dev/null
-done
-logger -t netrun-ipv6-restore "re-added proxy IPv6 on $IFACE"
-IPV6RESTORE
-  chmod +x /opt/netrun/scripts/netrun-ipv6-restore.sh
+  install -m 0755 "$NETRUN_HOME/deploy/node/netrun-ipv6-restore.sh" /opt/netrun/scripts/netrun-ipv6-restore.sh
   cat > /etc/systemd/system/netrun-ipv6-restore.service <<'EOF'
 [Unit]
 Description=NETRUN - re-add proxy IPv6 /64 addresses (egress) after boot

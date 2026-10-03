@@ -901,9 +901,21 @@ async function collectRunningInstances() {
 //
 // Parses each line independently and tolerates junk: the local-address column
 // is whatever token contains the LISTEN row's address:port, the port is the
-// number after the LAST ':' in that token, and the pid comes from `pid=<n>`.
-// Lines without a usable port or pid are silently ignored.
-function selectPidsToKill(ssText, low, high) {
+// number after the LAST ':' in that token, and the pids come from the
+// `users:(("<name>",pid=<n>,fd=<m>),...)` column. Lines without a usable port
+// or pid are silently ignored.
+//
+// Wave CAPACITY-18K — only pids whose process name is `processName` (default
+// "3proxy") are selected. With dual http ports reaching down to 8100 (socks
+// start >= 18100) the http range of a generation sits next to the agent's own
+// :8085, and on HTTPS-front nodes haproxy legitimately holds <public-ip>:<http
+// port> for every batch: a stale-port sweep must never SIGKILL the agent,
+// haproxy, unbound or sshd. A foreign listener is left alone — the generator's
+// port pre-check then refuses the batch instead. processName: null = any
+// process (the pre-18k behaviour, kept for callers/tests that want it).
+const REBIND_PROCESS_NAME = "3proxy";
+
+function selectPidsToKill(ssText, low, high, { processName = REBIND_PROCESS_NAME } = {}) {
   const lowN = Number(low);
   const highN = Number(high);
   if (!Number.isFinite(lowN) || !Number.isFinite(highN) || lowN > highN) {
@@ -945,21 +957,32 @@ function selectPidsToKill(ssText, low, high) {
       continue;
     }
 
-    const pidMatch = line.match(/pid=(\d+)/);
-    if (!pidMatch) {
-      continue;
-    }
-    const pid = Number(pidMatch[1]);
-    if (!Number.isInteger(pid) || pid <= 0) {
-      continue;
+    const linePids = [];
+    if (processName === null || processName === undefined) {
+      const pidMatch = line.match(/pid=(\d+)/);
+      if (pidMatch) {
+        linePids.push(Number(pidMatch[1]));
+      }
+    } else {
+      // users:(("3proxy",pid=4242,fd=5),("other",pid=7,fd=3)) — every holder.
+      for (const m of line.matchAll(/\("([^"]*)",pid=(\d+)/g)) {
+        if (m[1] === processName) {
+          linePids.push(Number(m[2]));
+        }
+      }
     }
 
-    let ports = pidToPorts.get(pid);
-    if (!ports) {
-      ports = new Set();
-      pidToPorts.set(pid, ports);
+    for (const pid of linePids) {
+      if (!Number.isInteger(pid) || pid <= 0) {
+        continue;
+      }
+      let ports = pidToPorts.get(pid);
+      if (!ports) {
+        ports = new Set();
+        pidToPorts.set(pid, ports);
+      }
+      ports.add(port);
     }
-    ports.add(port);
   }
 
   return Array.from(pidToPorts.keys()).sort((a, b) => a - b);
@@ -975,7 +998,7 @@ function selectPidsToKill(ssText, low, high) {
 // gap — wiping live, already-validated inventory on each refill. Matching each
 // range independently against one ss snapshot keeps the no-op fast path and
 // never touches the gap. Pure + exported for unit tests.
-function selectGenerationRebindPids(ssText, newStart, newCount) {
+function selectGenerationRebindPids(ssText, newStart, newCount, options = {}) {
   const start = toPositiveInt(newStart, 0);
   const count = toPositiveInt(newCount, 0);
   if (!start || !count) {
@@ -985,9 +1008,9 @@ function selectGenerationRebindPids(ssText, newStart, newCount) {
   const socksHigh = start + count - 1;
   const httpLow = Math.max(1, start - 10000);
   const httpHigh = socksHigh - 10000;
-  const pids = new Set(selectPidsToKill(ssText, socksLow, socksHigh));
+  const pids = new Set(selectPidsToKill(ssText, socksLow, socksHigh, options));
   if (httpHigh >= httpLow) {
-    for (const pid of selectPidsToKill(ssText, httpLow, httpHigh)) {
+    for (const pid of selectPidsToKill(ssText, httpLow, httpHigh, options)) {
       pids.add(pid);
     }
   }

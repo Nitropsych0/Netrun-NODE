@@ -62,7 +62,7 @@ curl http://127.0.0.1:8085/describe | jq .
 Returns a single JSON snapshot the orchestrator consumes via `POST /v1/nodes/enroll {agent_url}` — no per-node manual parameters required. Includes:
 
 - `agent_version`, `node_runtime_commit`
-- `capacity`, `max_parallel_jobs`, `max_batch_size`
+- `capacity` (proxies this box holds: MemTotal-based, ~0.1 MB/proxy + per-process overhead, capped at the 27 436 single-IPv4 dual port ceiling; `capacity_model` shows the inputs), `max_parallel_jobs`, `max_batch_size`
 - `generator_script` (resolved absolute path)
 - `geo_code` (ISO 3166-1 alpha-2, cached 1h via ipapi.co)
 - `ipv6`, `ipv6_egress` (same shape as `/health`)
@@ -70,6 +70,26 @@ Returns a single JSON snapshot the orchestrator consumes via `POST /v1/nodes/enr
 - `supports.{describe,enroll,accounting}`
 
 Open access (mirrors `/health`); set `NODE_AGENT_API_KEY` only if you want auth on the write endpoints.
+
+## Capacity tuning (18k proxies on a 2c/4GB node)
+
+New nodes get it from `install_node_v2.sh`: `ip_local_port_range = 1024 8000`
+(ephemeral ports below every listener), unbound `msg-cache 32m / rrset-cache 64m`,
+and an `ip -batch … nodad` boot-time IPv6 restore. New batches from the generator
+carry no `nscache`/`nscache6`, add their IPv6 addresses with one `ip -batch … nodad`,
+check their ports against ONE `ss` snapshot (and refuse a batch whose ports are
+already bound), and accept socks start ports from 18100 (dual http = socks − 10000
+≥ 8100; floor `NETRUN_MIN_LISTEN_PORT`, default 8100).
+
+Existing nodes are opt-in and never have 3proxy restarted:
+
+```bash
+bash scripts/apply_capacity_tuning.sh            # dry-run: prints the plan + a listener audit
+bash scripts/apply_capacity_tuning.sh --apply    # sysctl range, unbound reload, legacy nft rules, ipv6 restore
+```
+
+Tests: `bash scripts/test_apply_capacity_tuning.sh`, `bash scripts/test_capacity_18k_node.sh`,
+`bash node_runtime/soft/generator/test_capacity_18k.sh`, `cd node_runtime/node_agent && node --test`.
 
 ## Pay-per-GB endpoints (Wave B-8.1)
 

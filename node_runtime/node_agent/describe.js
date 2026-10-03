@@ -20,6 +20,12 @@ async function buildDescribe({ healthSnapshot, jobsRoot, proxyRoot } = {}) {
     agent_version: AGENT_VERSION,
     node_runtime_commit: getGitCommit(),
     capacity: estimateCapacity(),
+    capacity_model: describeCapacityModel(),
+    // Kept at 1 / 1500 (Wave CAPACITY-18K): the agent serialises /generate
+    // behind ONE generation lock (a 2nd parallel job only gets node_busy), and
+    // a bigger batch saves almost no RAM (per-process overhead is ~1.5-7.5 MiB
+    // per 1500 proxies) while 0.9.3 scans its per-process user list linearly
+    // on every auth. Filling 18k = 12 sequential batches.
     max_parallel_jobs: 1,
     max_batch_size: 1500,
     generator_script: getGeneratorScriptPath(),
@@ -52,18 +58,74 @@ function getGitCommit() {
   }
 }
 
-function estimateCapacity() {
+// Wave CAPACITY-18K — RAM model from the node capacity study
+// (docs/wave_node_capacity_report.md §3, 3proxy 0.9.3 disassembly):
+//   - a dual proxy = 2 listener threads x ~42 KB (kernel stack 16 + task_struct
+//     ~10 + user stack 8-12 + socket ~4 + heap 1-2) + ~3 KB address/route/nft/
+//     user ~= 87 KB -> budget 100 KB (was 0.5 MB, 5x too high: Delhi held 12k
+//     proxies on a 4 GB box that the old model capped at 5000);
+//   - one 3proxy process per batch: ~1.5 MiB, +6 MiB on legacy batches that
+//     still carry nscache/nscache6 65536 -> budget the legacy 7.5 MiB at an
+//     average batch of 1000 (prod batches average 304-1360);
+//   - base reserve: OS ~350 + agent ~150 + unbound ~150 (32m/64m caches) +
+//     haproxy ~100 + ~1000 live connections x 150 KB = 900 MB;
+//   - 15 % of MemTotal kept free.
+// MemTotal, not MemAvailable: `capacity` is what the BOX holds (read once at
+// enroll), and must not shrink as the node fills. The result is capped by the
+// port ceiling: dual pairs (http = socks - 10000) with every port in
+// 8100-65535 on one IPv4 = 27 436 (report §3, "port ceiling proof").
+const CAPACITY_MODEL = Object.freeze({
+  perProxyKb: 100,
+  perProcessMb: 7.5,
+  avgBatchSize: 1000,
+  baseReserveMb: 900,
+  freePct: 15,
+  minCapacity: 100,
+  portCeiling: 27436,
+});
+const CAPACITY_FALLBACK = 5000;
+
+function parseMemTotalMb(meminfoText) {
+  const m = /^MemTotal:\s+(\d+)\s+kB/m.exec(String(meminfoText || ""));
+  if (!m) return null;
+  const mb = Number(m[1]) / 1024;
+  return Number.isFinite(mb) && mb > 0 ? mb : null;
+}
+
+function capacityFromMemTotalMb(memTotalMb, model = CAPACITY_MODEL) {
+  const usableMb = memTotalMb * (1 - model.freePct / 100) - model.baseReserveMb;
+  const perProxyMb = model.perProxyKb / 1024 + model.perProcessMb / model.avgBatchSize;
+  const ramLimit = Math.floor(Math.max(0, usableMb) / perProxyMb);
+  return Math.max(model.minCapacity, Math.min(model.portCeiling, ramLimit));
+}
+
+function readMeminfo() {
+  return fs.readFileSync("/proc/meminfo", "utf-8");
+}
+
+// `meminfoText` is injectable for tests; production reads /proc/meminfo.
+function estimateCapacity({ meminfoText } = {}) {
   try {
-    const meminfo = fs.readFileSync("/proc/meminfo", "utf-8");
-    const memAvailableMatch = /^MemAvailable:\s+(\d+)\s+kB/m.exec(meminfo);
-    if (!memAvailableMatch) return 5000;
-    const memAvailableMB = Math.floor(Number(memAvailableMatch[1]) / 1024);
-    const usableMB = Math.max(0, memAvailableMB - 200);
-    const capacity = Math.floor(usableMB / 0.5);
-    return Math.max(100, Math.min(5000, capacity));
+    const text = meminfoText === undefined ? readMeminfo() : meminfoText;
+    const memTotalMb = parseMemTotalMb(text);
+    if (memTotalMb === null) return CAPACITY_FALLBACK;
+    return capacityFromMemTotalMb(memTotalMb);
   } catch {
-    return 5000;
+    return CAPACITY_FALLBACK;
   }
+}
+
+function describeCapacityModel({ meminfoText } = {}) {
+  let memTotalMb = null;
+  try {
+    memTotalMb = parseMemTotalMb(meminfoText === undefined ? readMeminfo() : meminfoText);
+  } catch {
+    memTotalMb = null;
+  }
+  return {
+    ...CAPACITY_MODEL,
+    memTotalMb: memTotalMb === null ? null : Math.round(memTotalMb),
+  };
 }
 
 function getGeneratorScriptPath() {
@@ -119,4 +181,11 @@ async function detectGeoCode() {
   }
 }
 
-module.exports = { buildDescribe };
+module.exports = {
+  buildDescribe,
+  estimateCapacity,
+  capacityFromMemTotalMb,
+  parseMemTotalMb,
+  describeCapacityModel,
+  CAPACITY_MODEL,
+};

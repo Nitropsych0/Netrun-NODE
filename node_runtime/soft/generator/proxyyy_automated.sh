@@ -17,7 +17,8 @@ function usage() { echo "Usage: $0 [-s | --subnet <16|32|48|64|80|96|112> proxy 
                           [--random <bool> generate random username/password for each IPv4 backconnect proxy instead of predefined (default false)] 
                           [-t | --proxies-type <http|socks5|dual> result proxies type (default socks5; 'dual' = socks5 + paired http on port-10000)]
                           [-r | --rotating-interval <0-59> proxies external address rotating time in minutes (default 0, disabled)]
-                          [--start-port <5000-65536> start port for backconnect ipv4 (default 30000)]
+                          [--start-port <8100-65535> start port for backconnect ipv4 (default 30000; every listener port,
+                                incl. the dual http = start - 10000, must be >= NETRUN_MIN_LISTEN_PORT, default 8100)]
                           [-l | --localhost <bool> allow connections only for localhost (backconnect on 127.0.0.1)]
                           [-f | --backconnect-proxies-file <string> path to file, in which backconnect proxies list will be written
                                 when proxies start working (default \`~/proxyserver/backconnect_proxies.list\`)]    
@@ -81,6 +82,8 @@ tcp_timestamps_mode="auto"
 ipv6_policy="strict_dual_stack"
 proxy_maxconn=200
 proxy_count=1
+# Wave CAPACITY-18K — lowest port a proxy listener may bind (see check_startup_parameters).
+min_listen_port="${NETRUN_MIN_LISTEN_PORT:-8100}"
 dns_selected_country="fallback"
 dns_selected_servers_csv="127.0.0.1,::1"
 dns_selection_strategy="local_unbound"
@@ -200,10 +203,33 @@ function check_startup_parameters() {
     log_err_print_usage_and_exit "Error: invalid value of '-t' (proxy type) parameter (http|socks5|dual)";
   fi;
 
-  # Wave HTTP.A — for dual the http port = socks port - 10000, so the
-  # socks start_port must leave room above 5000 for the http range.
-  if [ $proxies_type = "dual" ] && [ $start_port -lt 15000 ]; then
-    log_err_print_usage_and_exit "Error: for '--proxies-type dual' '--start-port' must be >= 15000 (http port = socks port - 10000, must stay >= 5000)";
+  # Wave CAPACITY-18K — one listener floor for every mode (replaces the old
+  # dual "start >= 15000 -> http >= 5000" rule and the generic ">= 5000"). Every
+  # port this batch binds — socks/http, plus the dual http = socks - 10000 —
+  # must be >= $min_listen_port (default 8100, env NETRUN_MIN_LISTEN_PORT).
+  # Below it live the node's own services (node-agent :8085) and, on nodes
+  # installed with the capacity tuning, the ephemeral range
+  # (ip_local_port_range 1024-8000) whose outbound sockets would race a
+  # listener for its port. Dual therefore needs start >= 18100: socks
+  # 18100-65535 + http 8100-55535 hold up to 27 436 disjoint pairs on one IPv4.
+  if ! [[ $min_listen_port =~ $re ]] || [ "$min_listen_port" -lt 1024 ]; then
+    log_err_print_usage_and_exit "Error: NETRUN_MIN_LISTEN_PORT must be an integer >= 1024 (got '$min_listen_port')";
+  fi;
+  if ! [[ $start_port =~ $re ]]; then
+    log_err_print_usage_and_exit "Error: '--start-port' must be a positive integer number";
+  fi;
+  local lowest_listen_port=$start_port
+  if [ "$proxies_type" = "dual" ]; then lowest_listen_port=$((start_port - 10000)); fi
+  if [ "$lowest_listen_port" -lt "$min_listen_port" ]; then
+    if [ "$proxies_type" = "dual" ]; then
+      log_err_print_usage_and_exit "Error: for '--proxies-type dual' '--start-port' must be >= $((min_listen_port + 10000)) (http port = socks port - 10000 must stay >= $min_listen_port)";
+    fi;
+    log_err_print_usage_and_exit "Error: '--start-port' must be >= $min_listen_port (lowest port a proxy listener may bind)";
+  fi;
+  # Dual: the socks range [start, start+count) and its http range shifted by
+  # -10000 overlap once count > 10000 — the batch would collide with itself.
+  if [ "$proxies_type" = "dual" ] && [ "$proxy_count" -gt 10000 ]; then
+    log_err_print_usage_and_exit "Error: for '--proxies-type dual' '--proxy-count' must be <= 10000 (socks and paired http ranges would overlap)";
   fi;
 
   if [ "$ipv6_policy" != "strict_dual_stack" ] && [ "$ipv6_policy" != "ipv6_required" ] && [ "$ipv6_policy" != "ipv6_only" ]; then
@@ -226,8 +252,8 @@ function check_startup_parameters() {
     log_err_print_usage_and_exit "Error: invalid value of '-r' (proxy external ip rotating interval) parameter";
   fi;
 
-  if [ $start_port -lt 5000 ] || (($start_port + $proxy_count > 65536)); then
-    log_err_print_usage_and_exit "Wrong '--start-port' parameter value, it must be more than 5000 and '--start-port' + '--proxy-count' must be lower than 65536";
+  if [ $start_port -lt $min_listen_port ] || (($start_port + $proxy_count > 65536)); then
+    log_err_print_usage_and_exit "Wrong '--start-port' parameter value, it must be at least $min_listen_port and '--start-port' + '--proxy-count' must be lower than 65536";
   fi;
 
   if [ ! -z $backconnect_ipv4 ]; then
@@ -606,6 +632,89 @@ function get_backconnect_ipv4() {
   log_err_and_exit "Error: curl package not installed and cannot parse valid IP from interface info";
 }
 
+# HTTPS frontend (scripts/netrun-https.sh): when the node has it, HTTP proxy
+# listeners bind 127.0.0.1 and haproxy owns the public HTTP ports.
+function http_listen_ip_for_node() {
+  if [ -d /etc/haproxy/netrun.d ]; then echo "127.0.0.1"; else echo "$backconnect_ipv4"; fi;
+}
+
+# Wave CAPACITY-18K — pure filter over ONE `ss -Hltn` (or `ss -ltn`) snapshot
+# read on stdin. Prints "<port> <address>" for every LISTEN socket that would
+# collide with this batch: a port in [lo1,hi1] (socks, or the single-mode
+# range) on an address that clashes with bind address $3, or a port in
+# [lo2,hi2] (the paired dual http range; pass 0 -1 to disable) clashing with $6.
+# An address clashes when it is the very address we bind, or a wildcard
+# (0.0.0.0, `*` = dual-stack [::], [::] / [::ffff:<ip>] — treated as clashing
+# to stay conservative). A listener on a DIFFERENT specific address (e.g.
+# haproxy on <public-ip>:<http-port> while 3proxy http binds 127.0.0.1) does
+# not collide. POSIX awk only (mawk on Ubuntu, BSD awk in tests).
+function select_listen_conflicts() {
+  awk -v lo1="$1" -v hi1="$2" -v ip1="$3" -v lo2="${4:-0}" -v hi2="${5:--1}" -v ip2="${6:-}" '
+    function clash(a, ip) {
+      return (a == ip || a == "0.0.0.0" || a == "*" || a == "::" || a == ("::ffff:" ip))
+    }
+    $1 != "LISTEN" { next }
+    {
+      la = ""
+      for (i = 2; i <= NF; i++) if ($i ~ /:[0-9]+$/) { la = $i; break }
+      if (la == "") next
+      port = la; sub(/.*:/, "", port); port += 0
+      addr = la; sub(/:[0-9]+$/, "", addr); sub(/^\[/, "", addr); sub(/\]$/, "", addr); sub(/%.*$/, "", addr)
+      if (port >= lo1 + 0 && port <= hi1 + 0 && clash(addr, ip1)) print port, addr
+      else if (port >= lo2 + 0 && port <= hi2 + 0 && clash(addr, ip2)) print port, addr
+    }'
+}
+
+# Number of distinct ports in [lo,hi] listening on any address, from ONE ss
+# snapshot on stdin (replaces the old one-`ss`-per-port loop: O(batch x all
+# listeners) — ~1500 full dumps of ~36k sockets per batch on an 18k node).
+function count_listening_in_range() {
+  awk -v lo="$1" -v hi="$2" '
+    $1 != "LISTEN" { next }
+    {
+      for (i = 2; i <= NF; i++) if ($i ~ /:[0-9]+$/) {
+        port = $i; sub(/.*:/, "", port); port += 0
+        if (port >= lo + 0 && port <= hi + 0 && !(port in seen)) { seen[port] = 1; n++ }
+        break
+      }
+    }
+    END { print n + 0 }'
+}
+
+function ss_listen_snapshot() {
+  ss -Hltn 2>/dev/null || ss -ltn 2>/dev/null
+}
+
+# Wave CAPACITY-18K — refuse a batch whose ports are already bound, BEFORE any
+# side effect (cron, nft, startup script, 3proxy). One ss snapshot per batch.
+# Without it a second 3proxy (SO_REUSEPORT, same uid) silently shares the port
+# with a stale one (~50% refused connects), and a port held by another uid
+# (haproxy, unbound, the agent) leaves the new listener dead while the old
+# post-start check still counted the port as "listening".
+# NETRUN_SKIP_PORT_PRECHECK=1 disables it (operator escape hatch).
+function check_ports_not_listening() {
+  if [ "${NETRUN_SKIP_PORT_PRECHECK:-0}" = "1" ]; then
+    echo "   Port pre-check skipped (NETRUN_SKIP_PORT_PRECHECK=1)";
+    return 0;
+  fi;
+  local snapshot main_ip http_lo=0 http_hi=-1 http_ip="" conflicts n
+  if ! snapshot="$(ss_listen_snapshot)"; then
+    echo "   Warning: ss failed - port pre-check skipped";
+    return 0;
+  fi;
+  main_ip="$backconnect_ipv4"
+  if [ "$proxies_type" = "http" ]; then main_ip="$(http_listen_ip_for_node)"; fi;
+  if [ "$proxies_type" = "dual" ]; then
+    http_lo=$((start_port - 10000)); http_hi=$((last_port - 10000)); http_ip="$(http_listen_ip_for_node)";
+  fi;
+  conflicts="$(printf '%s\n' "$snapshot" | select_listen_conflicts "$start_port" "$last_port" "$main_ip" "$http_lo" "$http_hi" "$http_ip")"
+  if [ -n "$conflicts" ]; then
+    n=$(printf '%s\n' "$conflicts" | wc -l | tr -d ' ')
+    log_err_and_exit "Error: ports_already_listening: $n port(s) of batch $start_port-$last_port are already bound by another listener ($(printf '%s\n' "$conflicts" | head -n 5 | tr '\n' ';')) - refusing to generate";
+  fi;
+  echo "   Port pre-check OK: no listener on ports $start_port-$last_port$(if [ "$proxies_type" = "dual" ]; then echo " / $http_lo-$http_hi"; fi)";
+}
+
 function check_ipv6() {
   if test -f /proc/net/if_inet6; then
     echo "РІСљвЂ¦ IPv6 interface is enabled";
@@ -799,11 +908,23 @@ function create_startup_script() {
   # listeners bind 127.0.0.1 and haproxy owns the public HTTP ports, answering
   # both plain HTTP and HTTPS (TLS) proxy clients on the same port. SOCKS
   # listeners stay on the public IPv4.
-  local http_listen_ip="$backconnect_ipv4"
-  if [ -d /etc/haproxy/netrun.d ]; then http_listen_ip="127.0.0.1"; fi
+  local http_listen_ip
+  http_listen_ip="$(http_listen_ip_for_node)"
   local main_listen_ip="$backconnect_ipv4"
   if [ "$proxies_type" = "http" ]; then main_listen_ip="$http_listen_ip"; fi
 
+  # Wave CAPACITY-18K — the batch header no longer carries
+  # `nscache 65536` / `nscache6 65536`. In the bundled 3proxy 0.9.3 they make
+  # inithashtable() malloc+memset+thread a free-list through every entry, i.e.
+  # ~6 MiB RESIDENT per process (2.62 + 3.38 MiB), for a cache the node does
+  # not need: names are resolved through `nserver 127.0.0.1` / `::1` (h_nserver
+  # sets resolvfunc=myresolver -> udpresolve), i.e. the node's own caching
+  # unbound. Without nscache dns_table.hashtable stays NULL and hashresolv()
+  # (0xfe16) / hashadd() (0xfcda) return early — every lookup simply goes to
+  # unbound, nothing else in 3proxy reads that cache (dnspr is unused). Do NOT
+  # "shrink" it instead: h_nscache rejects sizes <= 255 ("Invalid NS cache
+  # size") and 3proxy then refuses the whole config. Existing batches keep
+  # their header until regenerated.
   cat > $startup_script_path <<-EOF
 	#!$bash_location
 
@@ -854,8 +975,6 @@ function create_startup_script() {
 	immutable_config_part="daemon
 $dns_nserver_lines
 	  maxconn $proxy_maxconn
-	  nscache 65536
-	  nscache6 65536
 	  timeouts 1 5 30 60 180 1800 15 60
 	  setgid 65535
 	  setuid 65535"
@@ -926,10 +1045,14 @@ $dns_nserver_lines
 	ulimit -n 600000
 	ulimit -u 600000
 	
-	# Add IPv6 addresses (ignore errors if already exist)
-	for ipv6_address in \$(cat ${random_ipv6_list_file}); do 
-	  ip -6 addr add \$ipv6_address dev $interface_name 2>/dev/null || true
-	done;
+	# Add IPv6 addresses (Wave CAPACITY-18K): ONE ip process per batch (ip -batch)
+	# instead of a fork per address, and nodad so an address is never left
+	# tentative (unusable as the -e egress source) even where accept_dad is still
+	# on for the interface. -force keeps going past "File exists" on re-runs.
+	ipv6_batch_file=\$(mktemp 2>/dev/null || echo "${random_ipv6_list_file}.ipbatch")
+	awk 'NF { print "address add " \$1 " dev $interface_name nodad" }' ${random_ipv6_list_file} > "\$ipv6_batch_file"
+	ip -6 -force -batch "\$ipv6_batch_file" >/dev/null 2>&1 || true
+	rm -f "\$ipv6_batch_file"
 
 	# NOTE: We do NOT kill old proxy processes - each instance is independent!
 	
@@ -1379,17 +1502,19 @@ function run_proxy_server() {
     if ps aux | grep -v grep | grep -q "$proxyserver_config_path"; then
       echo -e "\nРІСљвЂ¦ IPv6 proxy server process started!"
       
-      # Verify ports are actually listening
+      # Verify ports are actually listening — Wave CAPACITY-18K: ONE ss
+      # snapshot per poll (was one full `ss` dump PER PORT: O(batch x all
+      # listeners)). Informational, as before; the agent's own validation
+      # waits for the exact ports. Poll a few times while 3proxy binds.
       local ports_ok=0
       local ports_fail=0
+      local poll
       echo "   Checking ports..."
-      
-      for ((p=$start_port; p<=$last_port; p++)); do
-        if ss -ltn 2>/dev/null | grep -qE ":${p}(\s|$|:)"; then
-          ((ports_ok++))
-        else
-          ((ports_fail++))
-        fi
+      for poll in 1 2 3 4 5; do
+        ports_ok=$(ss_listen_snapshot | count_listening_in_range "$start_port" "$last_port")
+        ports_fail=$((proxy_count - ports_ok))
+        if [ "$ports_fail" -le 0 ]; then break; fi
+        sleep 1
       done
       
       if [ $ports_fail -eq 0 ]; then
@@ -1790,6 +1915,9 @@ fi;
 
 backconnect_ipv4=$(get_backconnect_ipv4);
 echo "   Using: $backconnect_ipv4"
+
+echo "Checking that the batch ports are free (one ss snapshot)..."
+check_ports_not_listening;
 
 echo "СЂСџВ§В­ Selecting DNS resolvers..."
 configure_dns_servers;

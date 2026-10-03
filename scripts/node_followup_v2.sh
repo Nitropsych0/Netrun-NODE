@@ -58,24 +58,47 @@ log "  3proxy bin: $PROXY_BIN"
 log "  cfg dir   : $PROXY_CFG_DIR"
 
 # ── 2) Kernel limits ─────────────────────────────────────────────
-log "Applying kernel sysctl tweaks"
-cat > /etc/sysctl.d/99-netrun.conf <<'SYSCTL'
+# Wave CAPACITY-18K — MERGE into 99-netrun.conf instead of overwriting it. The
+# old `cat > 99-netrun.conf` threw away what install_node_v2.sh had written
+# there (accept_ra=2, tcp_timestamps=1, tcp_mtu_probing=1 — the Android-like
+# fingerprint — and the capacity ephemeral range ip_local_port_range=1024 8000)
+# and forced the range back to 10000-65000, i.e. into the proxy listener ports.
+# Now only the keys below are set (same values as install_node_v2.sh); every
+# other line, including ip_local_port_range, is kept as found. The ephemeral
+# range is owned by install_node_v2.sh (new nodes) and
+# scripts/apply_capacity_tuning.sh (existing nodes, opt-in).
+merge_sysctl_conf() {
+  local file="$1"; shift
+  local kv key value ek tmp
+  [ -f "$file" ] || printf '# NETRUN — node sysctl (install_node_v2.sh + node_followup_v2.sh)\n' > "$file"
+  for kv in "$@"; do
+    key="${kv%%=*}"; value="${kv#*=}"
+    ek="$(printf '%s' "$key" | sed 's/[.]/\\./g')"
+    if grep -Eq "^[[:space:]]*${ek}[[:space:]]*=" "$file"; then
+      tmp="$(mktemp)"
+      sed -E "s|^[[:space:]]*${ek}[[:space:]]*=.*$|${key} = ${value}|" "$file" > "$tmp" && cat "$tmp" > "$file"
+      rm -f "$tmp"
+    else
+      printf '%s = %s\n' "$key" "$value" >> "$file"
+    fi
+  done
+}
+
+log "Applying kernel sysctl tweaks (merge into /etc/sysctl.d/99-netrun.conf)"
 # NETRUN — raised limits for 4000+ concurrent 3proxy instances.
 # Default kernel.pid_max=65536 / threads-max=65536 trips fork EAGAIN
 # when restore script respawns the full pool at boot.
-kernel.pid_max = 4194304
-kernel.threads-max = 4194304
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-net.core.somaxconn = 8192
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.ip_local_port_range = 10000 65000
-fs.file-max = 2097152
-# IPv6 forwarding for the proxy normalization chain
-net.ipv6.ip_nonlocal_bind = 1
-net.ipv6.conf.all.forwarding = 1
-net.ipv6.conf.default.forwarding = 1
-SYSCTL
+merge_sysctl_conf /etc/sysctl.d/99-netrun.conf \
+  "kernel.pid_max=4194304" \
+  "kernel.threads-max=4194304" \
+  "net.netfilter.nf_conntrack_max=1048576" \
+  "net.netfilter.nf_conntrack_tcp_timeout_established=7200" \
+  "net.core.somaxconn=8192" \
+  "net.ipv4.tcp_max_syn_backlog=8192" \
+  "fs.file-max=2097152" \
+  "net.ipv6.ip_nonlocal_bind=1" \
+  "net.ipv6.conf.all.forwarding=1" \
+  "net.ipv6.conf.default.forwarding=1"
 sysctl -p /etc/sysctl.d/99-netrun.conf >/dev/null 2>&1 || warn "sysctl -p had warnings (likely nf_conntrack module not loaded yet — applied on next boot)"
 
 log "Applying ulimit raises (/etc/security/limits.d/99-netrun.conf)"
