@@ -40,13 +40,16 @@ pkill -f 'node_runtime/node_agent/server\.js' 2>/dev/null || true
 pkill -f '3proxy' 2>/dev/null || true
 
 # Wave IPV6-ROTATION — the agent's egress state (also under a kept legacy
-# root) and its nftables.service boot drop-in; the table goes with the other
-# NETRUN tables below. Addresses it added stay on the NIC until the next
-# reboot, like the anchors.
-log "Removing IPv6 egress rotation state and the nftables.service drop-in"
+# root), its nftables.service boot drop-in and its proxy-NDP sysctl file; the
+# table goes with the other NETRUN tables below, together with the proxy
+# entries of the rotated / pool addresses (without the table's forward guard
+# a proxied address would be forwarded back out to the router). The running
+# proxy_ndp / proxy_delay values are harmless with no entries.
+log "Removing IPv6 egress rotation state, the nftables.service drop-in and the sysctl file"
 rm -f /opt/netrun/proxyserver/egress_state.json /root/proxyserver/egress_state.json
 rm -f /etc/systemd/system/nftables.service.d/netrun-egress.conf
 rmdir /etc/systemd/system/nftables.service.d 2>/dev/null || true
+rm -f /etc/sysctl.d/99-netrun-egress.conf
 
 log "Removing /opt/netrun"
 rm -rf /opt/netrun
@@ -69,6 +72,16 @@ if command -v crontab >/dev/null 2>&1; then
     > "$tmp_cron" || true
   crontab "$tmp_cron" 2>/dev/null || true
   rm -f "$tmp_cron"
+fi
+
+# Only the agent's egress module adds proxy neighbour entries on a node; they go
+# before its table (and the table's forward guard).
+egress_if="$(ip -6 route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }' || true)"
+if [ -n "$egress_if" ]; then
+  log "Deleting IPv6 egress proxy-NDP entries on $egress_if"
+  { ip -6 neigh show proxy dev "$egress_if" 2>/dev/null || true; } \
+    | awk -v dev="$egress_if" 'NF { print "neigh del proxy " $1 " dev " dev }' \
+    | ip -6 -force -batch - >/dev/null 2>&1 || true
 fi
 
 log "Deleting NETRUN nftables tables"

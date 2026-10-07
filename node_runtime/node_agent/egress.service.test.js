@@ -1,11 +1,13 @@
 "use strict";
 
 // Wave IPV6-ROTATION — egress.js end to end against a fake host: one NIC's
-// IPv6 addresses (iproute2 semantics, incl. the prefix-length match on delete)
-// and an nftables model that applies our `nft -f` scripts as all-or-nothing
-// transactions (a `delete element` of a missing key aborts the whole file,
-// like the kernel). After every step the kernel table must equal what the
-// persisted state asks for.
+// IPv6 addresses (iproute2 semantics, incl. the prefix-length match on
+// delete), its proxy neighbour entries (`ip -6 neigh ... proxy`), its
+// /proc/sys proxy-NDP sysctls and an nftables model that applies our `nft -f`
+// scripts as all-or-nothing transactions (a `delete element` of a missing key
+// aborts the whole file, like the kernel). After every step the kernel table
+// must equal what the persisted state asks for, every address it maps must
+// have a proxy entry, and none of ours may sit on the NIC.
 // Run with: node --test node_runtime/node_agent/egress.service.test.js
 
 const test = require("node:test");
@@ -18,11 +20,18 @@ const eg = require(path.resolve(__dirname, "egress.js"));
 
 const T = "ip6 netrun_egress";
 const PRIMARY = "2001:db8:1:2::1";
+const PREFIX = "2001:db8:1:2::/64";
+
+const roots = [];
+test.after(() => {
+  for (const r of roots) fs.rmSync(r, { recursive: true, force: true });
+});
 
 // ── fake host ────────────────────────────────────────────────────────────
 
-function emptyTable() {
-  return { dyn: new Set(), map: new Map(), pool: [] };
+// fwd: the /64 of the forward guard (chain forward_guard), null before a definition.
+function emptyTable(fwd = null) {
+  return { dyn: new Set(), map: new Map(), pool: [], fwd };
 }
 
 function parsePoolRule(text) {
@@ -79,12 +88,18 @@ function parseTableBlock(lines) {
   expect(i++, "\t\tip6 saddr @dyn_anchors goto dyn");
   expect(i++, "\t\tsnat to ip6 saddr map @static_egress");
   expect(i++, "\t}");
+  expect(i++, "\tchain forward_guard {");
+  expect(i++, "\t\ttype filter hook forward priority filter; policy accept;");
+  const guard = /^\t\tip6 daddr (\S+\/64) drop$/.exec(lines[i++] || "");
+  if (!guard) throw new Error(`syntax error at "${lines[i - 1]}" (want the forward guard)`);
+  t.fwd = guard[1];
+  expect(i++, "\t}");
   if (i !== lines.length) throw new Error("trailing lines in table block");
   return t;
 }
 
 function nftTransaction(table, script) {
-  let t = table && { dyn: new Set(table.dyn), map: new Map(table.map), pool: table.pool.slice() };
+  let t = table && { dyn: new Set(table.dyn), map: new Map(table.map), pool: table.pool.slice(), fwd: table.fwd };
   const need = () => { if (!t) throw new Error("No such file or directory (table)"); };
   const lines = script.split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -135,17 +150,45 @@ function nftTransaction(table, script) {
   return t;
 }
 
-function fakeHost({ iface = "eth0", route = true, nftMissing = false } = {}) {
+// /proc/sys of a node as the installers leave it: forwarding on (all), proxy
+// NDP off, the kernel's default proxy_delay.
+function fakeProcSys(iface, values = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "netrun-egress-proc-"));
+  roots.push(dir);
+  const all = {
+    "net/ipv6/conf/all/forwarding": "1",
+    "net/ipv6/conf/all/proxy_ndp": "0",
+    [`net/ipv6/conf/${iface}/forwarding`]: "1",
+    [`net/ipv6/conf/${iface}/proxy_ndp`]: "0",
+    [`net/ipv6/conf/${iface}/accept_ra`]: "0",
+    [`net/ipv6/neigh/${iface}/proxy_delay`]: "80",
+    ...values,
+  };
+  for (const [key, value] of Object.entries(all)) {
+    fs.mkdirSync(path.dirname(path.join(dir, key)), { recursive: true });
+    fs.writeFileSync(path.join(dir, key), `${value}\n`);
+  }
+  return dir;
+}
+
+function sysctl(host, key) {
+  return fs.readFileSync(path.join(host.procSys, key), "utf-8").trim();
+}
+
+function fakeHost({ iface = "eth0", route = true, nftMissing = false, sysctls = {} } = {}) {
   const host = {
     iface,
     route,
     nftMissing,
     addrs: new Map([[PRIMARY, 64]]),
+    proxies: new Set(), // `ip -6 neigh show proxy dev <iface>`
+    procSys: fakeProcSys(iface, sysctls),
     table: null,
     log: [], // every command, in order
     nftScripts: [],
     ipBatches: [],
-    refuseAdd: () => false,
+    refuseAdd: () => false, // (address) → its `neigh add proxy` fails
+    refuseLine: () => false, // (batch line) → that line fails
     refuseNft: () => false,
     inFlight: 0,
     maxInFlight: 0,
@@ -160,25 +203,36 @@ function fakeHost({ iface = "eth0", route = true, nftMissing = false } = {}) {
       if (!a.endsWith("scope global")) lines.push(`2: ${host.iface}    inet6 fe80::1/64 scope link \\       valid_lft forever preferred_lft forever`);
       return { code: 0, stdout: `${lines.join("\n")}\n`, stderr: "" };
     }
+    if (a === `-6 neigh show proxy dev ${host.iface}`) {
+      return { code: 0, stdout: [...host.proxies].map((p) => `${p} proxy\n`).join(""), stderr: "" };
+    }
     if (args.slice(0, 3).join(" ") === "-6 -force -batch") {
       const text = fs.readFileSync(args[3], "utf-8");
       host.ipBatches.push(text);
       let failed = 0;
       for (const line of text.split("\n").filter(Boolean)) {
-        let m = /^address add (\S+) dev (\S+) nodad$/.exec(line);
+        if (!line.endsWith(` dev ${host.iface}`)) throw new Error(`fake ip: wrong dev in ${line}`);
+        if (host.refuseLine(line)) { failed += 1; continue; }
+        let m = /^neigh add proxy (\S+) dev \S+$/.exec(line);
         if (m) {
-          if (m[2] !== host.iface) throw new Error(`wrong dev ${m[2]}`);
-          if (host.addrs.has(m[1]) || host.refuseAdd(m[1])) failed += 1;
-          else host.addrs.set(m[1], 128);
+          // adding an entry that exists succeeds (the kernel updates it)
+          if (host.refuseAdd(m[1])) failed += 1;
+          else host.proxies.add(m[1]);
           continue;
         }
-        m = /^address del (\S+)\/(\d+) dev (\S+)$/.exec(line);
+        m = /^neigh del proxy (\S+) dev \S+$/.exec(line);
+        if (m) {
+          if (!host.proxies.delete(m[1])) failed += 1; // ENOENT
+          continue;
+        }
+        m = /^address del (\S+)\/(\d+) dev \S+$/.exec(line);
         if (m) {
           // the kernel matches IPv6 deletes on address AND prefix length
           if (host.addrs.get(m[1]) !== Number(m[2])) failed += 1;
           else host.addrs.delete(m[1]);
           continue;
         }
+        // `address add` included: the module never puts an address on the NIC
         throw new Error(`fake ip: unexpected batch line ${line}`);
       }
       return { code: failed ? 1 : 0, stdout: "", stderr: failed ? `Command failed (${failed})` : "" };
@@ -242,11 +296,6 @@ function block(port, addr, oldShape = false) {
   ].filter((l) => l !== null);
 }
 
-const roots = [];
-test.after(() => {
-  for (const r of roots) fs.rmSync(r, { recursive: true, force: true });
-});
-
 function makeRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "netrun-egress-"));
   roots.push(root);
@@ -285,7 +334,15 @@ const quiet = { log() {}, error() {} };
 
 function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07T12:00:00.000Z") }, writeState, findBin } = {}) {
   const svc = eg.createEgressService({
-    env: { NODE_AGENT_PROXY_ROOT: root, EGRESS_POOL_SIZE: "4", EGRESS_DRAIN_SEC: "600", EGRESS_NFT_DROPIN: "off", ...env },
+    env: {
+      NODE_AGENT_PROXY_ROOT: root,
+      EGRESS_POOL_SIZE: "4",
+      EGRESS_DRAIN_SEC: "600",
+      EGRESS_NFT_DROPIN: "off",
+      EGRESS_SYSCTL_CONF: "off",
+      EGRESS_PROC_SYS: host.procSys,
+      ...env,
+    },
     run: host.run,
     now: () => clock.t,
     randomBytes: deterministicRandom(),
@@ -299,16 +356,31 @@ function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07
 const sorted = (it) => [...it].sort();
 const stateFile = (root) => JSON.parse(fs.readFileSync(path.join(root, "egress_state.json"), "utf-8"));
 
-// The kernel holds exactly what the persisted state asks for, and every
-// address nft can map to is on the NIC.
-function assertConsistent(host, svc, root, msg = "") {
+const ourAddresses = (s) => new Set([
+  ...Object.values(s.ports).map((e) => e.current).filter(Boolean), ...s.pool, ...s.draining.map((d) => d.addr),
+]);
+
+// The kernel holds exactly what the persisted state asks for (the forward
+// guard included), every address nft can map to has a proxy entry, no proxy
+// entry is left that the state does not know (`foreign`: entries a test put
+// there itself), none of ours is on the NIC, and proxy NDP is on.
+function assertConsistent(host, svc, root, msg = "", { foreign = new Set() } = {}) {
   const s = svc.snapshot();
   const want = eg.desiredNft(s);
   assert.ok(host.table, `${msg}: table exists`);
   assert.deepStrictEqual(sorted(host.table.map), sorted(want.staticMap), `${msg}: static_egress`);
   assert.deepStrictEqual(sorted(host.table.dyn), sorted(want.dyn), `${msg}: dyn_anchors`);
   assert.deepStrictEqual(host.table.pool, want.pool, `${msg}: dyn pool`);
-  for (const a of [...want.staticMap.values(), ...want.pool]) assert.ok(host.addrs.has(a), `${msg}: ${a} on the NIC`);
+  assert.strictEqual(host.table.fwd, svc.status().prefix, `${msg}: forward guard for the node's /64`);
+  for (const a of [...want.staticMap.values(), ...want.pool]) assert.ok(host.proxies.has(a), `${msg}: ${a} has a proxy entry`);
+  const ours = ourAddresses(s);
+  for (const a of host.proxies) assert.ok(ours.has(a) || foreign.has(a), `${msg}: proxy entry ${a} leaked`);
+  for (const a of ours) assert.ok(!host.addrs.has(a), `${msg}: ${a} is on the NIC`);
+  assert.deepStrictEqual(
+    eg.egressSysctls(host.iface).map((s) => sysctl(host, s.key.join("/"))),
+    eg.egressSysctls(host.iface).map((s) => s.want),
+    `${msg}: proxy-NDP sysctls`
+  );
   assert.deepStrictEqual(stateFile(root), JSON.parse(JSON.stringify(s)), `${msg}: file == memory`);
   assert.ok(!fs.readdirSync(root).some((f) => f.startsWith(".egress_") || f.endsWith(".tmp")), `${msg}: no temp files left`);
 }
@@ -324,15 +396,16 @@ test("init on a clean node: empty table, no addresses, ready", async () => {
   assert.deepStrictEqual(svc.status(), { available: true, reason: null, iface: "eth0", prefix: "2001:db8:1:2::/64" });
   assert.strictEqual(host.nftScripts.length, 1);
   assert.ok(host.nftScripts[0].startsWith(`add table ${T}\ndelete table ${T}\ntable ${T} {`));
-  assert.deepStrictEqual(host.table, emptyTable());
+  assert.deepStrictEqual(host.table, emptyTable(PREFIX), "empty, with the forward guard for the node's /64");
   assert.strictEqual(host.ipBatches.length, 0, "nothing to re-add");
+  assert.strictEqual(sysctl(host, "net/ipv6/conf/eth0/accept_ra"), "0", "forwarding was on: accept_ra untouched");
   assertConsistent(host, svc, root, "init");
   assert.deepStrictEqual(svc.view(), {
     items: [], pool: { size: 0, refreshed_at: null, idle_since: null }, draining: 0, prefix: "2001:db8:1:2::/64", iface: "eth0",
   });
 });
 
-test("rotate: address added before nft, new current mapped, old one drains", async () => {
+test("rotate: proxy entry added before nft, new current mapped, old one drains, the NIC untouched", async () => {
   const host = fakeHost();
   const root = makeRoot();
   const { svc, clock } = makeService(host, root);
@@ -344,12 +417,15 @@ test("rotate: address added before nft, new current mapped, old one drains", asy
   assert.deepStrictEqual(Object.keys(first), ["port", "ok", "anchor", "mode", "old_ipv6", "new_ipv6", "error"]);
   assert.strictEqual(first.anchor, ANCHOR[30000], "anchor normalised from the cfg's leading-zero text");
   assert.deepStrictEqual([first.mode, first.old_ipv6, first.error], ["static", null, null]);
-  assert.ok(eg.inPrefix(first.new_ipv6, eg.parsePrefix("2001:db8:1:2::/64")));
-  assert.strictEqual(host.addrs.get(first.new_ipv6), 128);
-  assert.deepStrictEqual(host.ipBatches.at(-1), `address add ${first.new_ipv6} dev eth0 nodad\n`);
+  assert.ok(eg.inPrefix(first.new_ipv6, eg.parsePrefix(PREFIX)));
+  assert.ok(host.proxies.has(first.new_ipv6));
+  assert.deepStrictEqual([...host.addrs.keys()], [PRIMARY], "nothing added to the NIC");
+  assert.deepStrictEqual(host.ipBatches.at(-1), `neigh add proxy ${first.new_ipv6} dev eth0\n`);
   const addAt = host.log.findIndex((l) => l.startsWith("ip -6 -force -batch"));
   const nftAt = host.log.findLastIndex((l) => l.startsWith("nft -f"));
-  assert.ok(addAt >= 0 && addAt < nftAt, "ip address add runs before the nft change");
+  assert.ok(addAt >= 0 && addAt < nftAt, "ip neigh add proxy runs before the nft change");
+  assert.deepStrictEqual(host.log.slice(addAt - 2, addAt), ["ip -6 -o addr show dev eth0", "ip -6 neigh show proxy dev eth0"],
+    "a new address is checked against the NIC and every proxy entry");
   assert.deepStrictEqual([...host.table.map], [[ANCHOR[30000], first.new_ipv6]]);
   assertConsistent(host, svc, root, "rotate 1");
 
@@ -360,7 +436,7 @@ test("rotate: address added before nft, new current mapped, old one drains", asy
   assert.notStrictEqual(second.new_ipv6, first.new_ipv6);
   assert.deepStrictEqual(svc.snapshot().draining, [{ addr: first.new_ipv6, until: new Date(clock.t + 120000).toISOString(), port: 30000 }]);
   assert.ok(host.nftScripts.at(-1).startsWith("delete element"), "a rotation is an element delta, not a rebuild");
-  assert.strictEqual(host.addrs.has(first.new_ipv6), true, "the old address stays until the GC");
+  assert.strictEqual(host.proxies.has(first.new_ipv6), true, "the old address stays until the GC");
   assertConsistent(host, svc, root, "rotate 2");
 });
 
@@ -411,7 +487,7 @@ test("per_connection: lazy pool of EGRESS_POOL_SIZE, dyn set, back to static, id
 
   await svc.setMode([30000, 30001], "static", { drainSec: 0 });
   assert.deepStrictEqual(svc.snapshot().pool, s1.pool, "30002 still uses the pool");
-  assert.deepStrictEqual(svc.view([30000]).items, [{ port: 30000, anchor: ANCHOR[30000], current: null, mode: "static" }]);
+  assert.deepStrictEqual(svc.view([30000]).items, [{ port: 30000, anchor: ANCHOR[30000], current: null, mode: null }]);
   assertConsistent(host, svc, root, "static");
 
   clock.t += 5000;
@@ -432,13 +508,13 @@ test("per_connection: lazy pool of EGRESS_POOL_SIZE, dyn set, back to static, id
   assert.deepStrictEqual([s3.pool, s3.pool_idle_since, s3.pool_refreshed_at], [[], null, null]);
   for (const a of s1.pool) {
     assert.deepStrictEqual(s3.draining.find((d) => d.addr === a), { addr: a, until: new Date(clock.t + 600000).toISOString() }, "pool drains for EGRESS_DRAIN_SEC");
-    assert.ok(host.addrs.has(a), "drains, not deleted yet");
+    assert.ok(host.proxies.has(a), "drains, not deleted yet");
   }
-  assert.deepStrictEqual(host.table, emptyTable());
+  assert.deepStrictEqual(host.table, emptyTable(PREFIX));
   assertConsistent(host, svc, root, "pool drained");
 });
 
-test("GC: due addresses deleted with their real prefix length, no-op when nothing is due", async () => {
+test("GC: due proxy entries deleted in one batch, no-op when nothing is due", async () => {
   const host = fakeHost();
   const root = makeRoot();
   const { svc, clock } = makeService(host, root);
@@ -447,22 +523,23 @@ test("GC: due addresses deleted with their real prefix length, no-op when nothin
   await svc.rotate([30001]); // a drains 600 s
   const b = (await svc.rotate([30000])).items[0].new_ipv6;
   const c = (await svc.rotate([30000], { drainSec: 0 })).items[0].new_ipv6; // b is due at once
-  host.addrs.set(b, 64); // came back as /64 through the boot restore
 
   clock.t += 1000;
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 1 });
-  assert.strictEqual(host.ipBatches.at(-1), `address del ${b}/64 dev eth0\n`, "deleted with the length it carries");
-  assert.ok(!host.addrs.has(b) && host.addrs.has(a) && host.addrs.has(c));
+  assert.strictEqual(host.ipBatches.at(-1), `neigh del proxy ${b} dev eth0\n`);
+  assert.ok(!host.proxies.has(b) && host.proxies.has(a) && host.proxies.has(c));
   assert.deepStrictEqual(svc.snapshot().draining.map((d) => d.addr), [a]);
 
   const calls = host.log.length;
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 0 });
-  assert.deepStrictEqual(host.log.slice(calls), [`nft list chain ${T} post`], "nothing due → only the table check");
+  assert.deepStrictEqual(host.log.slice(calls), [`nft list chain ${T} post`, "ip -6 neigh show proxy dev eth0"],
+    "nothing due → only the table and proxy-entry checks");
 
   clock.t += 600 * 1000;
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 1 });
-  assert.strictEqual(host.ipBatches.at(-1), `address del ${a}/128 dev eth0\n`);
-  assert.ok(!host.addrs.has(a) && host.addrs.has(c), "the current address is untouched");
+  assert.strictEqual(host.ipBatches.at(-1), `neigh del proxy ${a} dev eth0\n`);
+  assert.ok(!host.proxies.has(a) && host.proxies.has(c), "the current address is untouched");
+  assert.ok(!host.log.slice(calls).includes("ip -6 -o addr show dev eth0"), "the GC never lists the NIC");
   assert.deepStrictEqual(svc.snapshot().draining, []);
   assertConsistent(host, svc, root, "after gc");
 });
@@ -492,25 +569,20 @@ test("GC never deletes an anchor or an address in use, and retries a failed dele
     ],
   }));
   host.addrs.set(ANCHOR[31000], 64);
-  host.addrs.set(stuck, 128); // a plain agent restart: still on the NIC
+  host.proxies.add(stuck); // a plain agent restart: still there
   let refuseDel = true;
-  const real = host.run;
-  host.run = async (cmd, args) => {
-    if (refuseDel && cmd === "ip" && args[2] === "-batch" && fs.readFileSync(args[3], "utf-8").includes("address del")) {
-      return { code: 1, stdout: "", stderr: "RTNETLINK answers: Operation not permitted" };
-    }
-    return real(cmd, args);
-  };
+  host.refuseLine = (line) => refuseDel && line.startsWith("neigh del proxy");
   const { svc } = makeService(host, root, { clock });
   await svc.init();
-  assert.ok(!host.ipBatches.at(-1).includes(ANCHOR[31000]), "an anchor is never (re-)added by this module");
-  assert.ok(!host.ipBatches.at(-1).includes(stuck), "a draining address is never re-added");
+  assert.ok(host.ipBatches.every((b) => !b.includes(ANCHOR[31000])), "an anchor is never touched by this module");
+  assert.strictEqual(host.ipBatches.length, 1, "one re-add batch, nothing to move off the NIC");
+  assert.deepStrictEqual(sorted(host.ipBatches[0].trim().split("\n")), sorted([cur, pool, stuck].map((a) => `neigh add proxy ${a} dev eth0`)));
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 0 });
   assert.deepStrictEqual(svc.snapshot().draining.map((d) => d.addr), [stuck], "in-use and anchor entries left the list; the failed one stays");
-  assert.ok(host.addrs.has(cur) && host.addrs.has(pool) && host.addrs.get(ANCHOR[31000]) === 64 && host.addrs.has(stuck));
+  assert.ok(host.proxies.has(cur) && host.proxies.has(pool) && host.addrs.get(ANCHOR[31000]) === 64 && host.proxies.has(stuck));
   refuseDel = false;
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 1 });
-  assert.ok(!host.addrs.has(stuck) && host.addrs.has(ANCHOR[31000]));
+  assert.ok(!host.proxies.has(stuck) && host.addrs.get(ANCHOR[31000]) === 64);
   assertConsistent(host, svc, root, "gc retry");
 });
 
@@ -598,13 +670,13 @@ test("nft_failed: state rolls back, kernel unchanged, the new address is garbage
   assert.deepStrictEqual(after.ports, snap.ports, "ports rolled back");
   const orphans = after.draining.map((d) => d.addr);
   assert.strictEqual(orphans.length, 2);
-  for (const a of orphans) assert.ok(host.addrs.has(a), "added before nft failed");
+  for (const a of orphans) assert.ok(host.proxies.has(a), "added before nft failed");
 
   host.refuseNft = () => false;
   assertConsistent(host, svc, root, "rolled back");
   clock.t += 1;
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 2 });
-  for (const a of orphans) assert.ok(!host.addrs.has(a));
+  for (const a of orphans) assert.ok(!host.proxies.has(a));
 });
 
 test("kernel drift (table flushed / deleted outside the agent): the delta fails, a rebuild repairs", async () => {
@@ -656,7 +728,7 @@ test("state write failure: 503-class error, nft put back to what the file holds"
   assertConsistent(host, svc, root, "journal write failed");
 });
 
-test("restart / reboot: one -force re-add batch, rebuild, gone ports dropped, lost addresses forgotten", async () => {
+test("restart / reboot: one -force proxy re-add batch, rebuild, gone ports dropped, lost addresses forgotten", async () => {
   const host = fakeHost();
   const root = makeRoot();
   const { svc, clock } = makeService(host, root);
@@ -673,9 +745,9 @@ test("restart / reboot: one -force re-add batch, rebuild, gone ports dropped, lo
   assertConsistent(host, again, root, "plain restart");
   assert.deepStrictEqual(again.view([30001]).items, [{ port: 30001, anchor: ANCHOR[30001], current: before.ports[30001].current, mode: "static" }]);
 
-  // reboot: the kernel forgot our addresses and the table; meanwhile 31000 was
-  // deprovisioned by hand and 30001 regenerated with a new anchor
-  host.addrs = new Map([[PRIMARY, 64]]);
+  // reboot: the kernel forgot our proxy entries and the table; meanwhile 31000
+  // was deprovisioned by hand and 30001 regenerated with a new anchor
+  host.proxies = new Set();
   host.table = null;
   fs.unlinkSync(path.join(root, "3proxy", "3proxy_31000.cfg"));
   const cfgPath = path.join(root, "3proxy", "3proxy_30000.cfg");
@@ -690,14 +762,15 @@ test("restart / reboot: one -force re-add batch, rebuild, gone ports dropped, lo
   await boot.init();
   assert.strictEqual(host.ipBatches.length, batches + 1, "one batch");
   const lines = host.ipBatches.at(-1).trim().split("\n");
-  assert.ok(lines.every((l) => / dev eth0 nodad$/.test(l)));
+  assert.ok(lines.every((l) => /^neigh add proxy \S+ dev eth0$/.test(l)), "proxy entries only");
+  const readded = lines.map((l) => l.split(" ")[3]);
   const drained = before.draining.map((d) => d.addr);
-  assert.ok(drained.length > 0 && lines.every((l) => !drained.includes(l.split(" ")[2])), "draining addresses are not re-added");
-  assert.ok(host.log.some((l) => l.startsWith("ip -6 -force -batch")));
+  assert.ok(drained.length > 0 && drained.every((a) => readded.includes(a)), "draining addresses are re-added too (the GC deletes them when due)");
   const s = boot.snapshot();
   assert.deepStrictEqual(Object.keys(s.ports), ["30000", "30002"]);
   assert.strictEqual(s.ports[30000].current, null, "an address that could not come back → the anchor");
-  assert.ok(host.addrs.has(r.items[2].new_ipv6) === s.draining.some((d) => d.addr === r.items[2].new_ipv6));
+  assert.ok(host.proxies.has(r.items[2].new_ipv6) && s.draining.some((d) => d.addr === r.items[2].new_ipv6),
+    "a dropped port's address is back as a draining one");
   assert.strictEqual(s.pool.length, 4);
   assertConsistent(host, boot, root, "after reboot");
 });
@@ -784,7 +857,7 @@ test("start(): a per_connection pool that could not come back is refilled at onc
   await svc.setMode([30000], "per_connection");
   const old = svc.snapshot().pool;
 
-  host.addrs = new Map([[PRIMARY, 64]]); // reboot
+  host.proxies = new Set(); // reboot
   host.table = null;
   host.refuseAdd = (a) => old.includes(a); // the pool's addresses cannot come back
   clock.t += 1000;
@@ -828,7 +901,7 @@ test("state write AND the nft rollback fail: memory keeps what the kernel maps, 
   await assert.rejects(svc.rotate([30000]), (err) => err.code === "EGRESS_UNAVAILABLE" && /state_write_failed/.test(err.message));
   const fresh = host.table.map.get(ANCHOR[30000]);
   assert.notStrictEqual(fresh, old, "the kernel kept the delta");
-  assert.ok(host.addrs.has(fresh));
+  assert.ok(host.proxies.has(fresh));
   assert.strictEqual(svc.isAvailable(), false);
   assert.match(svc.status().reason, /^state_write_failed: .*nft_rollback_failed$/);
   assert.strictEqual(svc.snapshot().ports[30000].current, fresh, "memory = what the kernel maps");
@@ -842,21 +915,21 @@ test("state write AND the nft rollback fail: memory keeps what the kernel maps, 
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 0 });
   assert.strictEqual(svc.isAvailable(), true);
   assert.strictEqual(host.table.map.get(ANCHOR[30000]), old);
-  assert.ok(host.addrs.has(fresh), "never deleted while nft mapped it");
+  assert.ok(host.proxies.has(fresh), "never deleted while nft mapped it");
   assertConsistent(host, svc, root, "after init");
   // unmapped now: the GC may delete it
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 1 });
-  assert.ok(!host.addrs.has(fresh) && host.addrs.has(old));
+  assert.ok(!host.proxies.has(fresh) && host.proxies.has(old));
   assertConsistent(host, svc, root, "after gc");
 });
 
-test("switching per_connection / static back and forth reuses one pool: the NIC stays bounded", async () => {
+test("switching per_connection / static back and forth reuses one pool: proxy entries stay bounded", async () => {
   const host = fakeHost();
   const root = makeRoot();
   const N = 8;
   const { svc, clock } = makeService(host, root, { env: { EGRESS_POOL_SIZE: String(N) } });
   await svc.init();
-  const base = host.addrs.size;
+  const base = host.proxies.size;
   // a userbot every 3 s
   for (let i = 0; i < 10; i++) {
     clock.t += 3000;
@@ -865,7 +938,7 @@ test("switching per_connection / static back and forth reuses one pool: the NIC 
     assert.strictEqual((await svc.setMode([30000], "static")).ok, true);
     await svc.gcTick();
   }
-  assert.strictEqual(host.addrs.size, base + N, "one pool, reused");
+  assert.strictEqual(host.proxies.size, base + N, "one pool, reused");
   assertConsistent(host, svc, root, "fast toggles");
   // slower than the idle period: one pool drains while the next is in use
   let peak = 0;
@@ -874,7 +947,7 @@ test("switching per_connection / static back and forth reuses one pool: the NIC 
     await svc.gcTick();
     await svc.setMode([30000], "per_connection");
     await svc.setMode([30000], "static");
-    peak = Math.max(peak, host.addrs.size - base);
+    peak = Math.max(peak, host.proxies.size - base);
   }
   assert.ok(peak <= 2 * N, `peak ${peak} extra addresses (pool ${N})`);
   assertConsistent(host, svc, root, "slow toggles");
@@ -885,13 +958,12 @@ test("a port rotated again and again holds at most its current + one draining ad
   const root = makeRoot();
   const { svc, clock } = makeService(host, root);
   await svc.init();
-  const base = host.addrs.size;
   const seen = [];
   for (let i = 0; i < 12; i++) {
     clock.t += 60 * 1000; // the rotation link's cooldown; drain_sec 600
     seen.push((await svc.rotate([30000], { drainSec: 600 })).items[0].new_ipv6);
     await svc.gcTick();
-    assert.ok(host.addrs.size - base <= 2, `rotation ${i + 1}: ${host.addrs.size - base} extra addresses`);
+    assert.ok(host.proxies.size <= 2, `rotation ${i + 1}: ${host.proxies.size} proxy entries`);
   }
   assert.deepStrictEqual(svc.snapshot().draining, [
     { addr: seen.at(-2), until: new Date(clock.t + 600000).toISOString(), port: 30000 },
@@ -923,7 +995,7 @@ test("EGRESS_MAX_EXTRA_ADDRS: drains end early first, then ports are refused wit
   assert.deepStrictEqual([m.items[0].ok, m.items[0].error], [false, "address_budget_exceeded"]);
   assert.deepStrictEqual(svc.snapshot().pool, []);
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 1 });
-  assert.ok(!host.addrs.has(a1));
+  assert.ok(!host.proxies.has(a1));
   assertConsistent(host, svc, root, "budget");
 });
 
@@ -946,7 +1018,7 @@ test("the GC tick rebuilds a table that vanished (nft flush ruleset / systemctl 
   assertConsistent(host, svc, root, "rebuilt");
   const m = host.log.length;
   await svc.gcTick();
-  assert.deepStrictEqual(host.log.slice(m), [`nft list chain ${T} post`], "present → only the check");
+  assert.deepStrictEqual(host.log.slice(m), [`nft list chain ${T} post`, "ip -6 neigh show proxy dev eth0"], "present → only the checks");
 });
 
 test("start() writes the nftables.service boot drop-in once; daemon-reload only on a change", async () => {
@@ -983,4 +1055,223 @@ test("writeFileAtomic: a failed write leaves no .tmp behind", () => {
   fs.writeFileSync(path.join(target, "x"), "1"); // renaming a file over a non-empty directory fails
   assert.throws(() => eg.writeFileAtomic(target, "text"));
   assert.ok(!fs.existsSync(`${target}.tmp`));
+});
+
+// ── proxy NDP ────────────────────────────────────────────────────────────
+
+const ALL_PROXY_NDP = "net/ipv6/conf/all/proxy_ndp";
+const PROXY_NDP = "net/ipv6/conf/eth0/proxy_ndp";
+const PROXY_DELAY = "net/ipv6/neigh/eth0/proxy_delay";
+const ALL_FORWARDING = "net/ipv6/conf/all/forwarding";
+const FORWARDING = "net/ipv6/conf/eth0/forwarding";
+const ACCEPT_RA = "net/ipv6/conf/eth0/accept_ra";
+const SYSCTLS = [ALL_PROXY_NDP, PROXY_NDP, PROXY_DELAY, ALL_FORWARDING, FORWARDING, ACCEPT_RA];
+const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+// mtime 0 on every file: a later write shows as a new mtime, whatever the
+// file system's timestamp granularity
+function touchZero(files) {
+  for (const f of files) fs.utimesSync(f, 0, 0);
+}
+const untouched = (files) => files.every((f) => fs.statSync(f).mtimeMs === 0);
+
+test("proxy-NDP sysctls: set at init, only what differs is written, persisted when the file differs", async () => {
+  const root = makeRoot();
+  const conf = path.join(root, "sysctl.d", "99-netrun-egress.conf");
+  fs.mkdirSync(path.dirname(conf));
+  const env = { EGRESS_SYSCTL_CONF: conf };
+  const host = fakeHost(); // as the installers leave a node: forwarding 1, proxy_ndp 0, proxy_delay 80
+  const procFiles = SYSCTLS.map((k) => path.join(host.procSys, k));
+  touchZero(procFiles);
+  assert.strictEqual(await makeService(host, root, { env }).svc.init(), true);
+  assert.deepStrictEqual(SYSCTLS.map((k) => sysctl(host, k)), ["1", "1", "0", "1", "1", "0"]);
+  assert.ok(untouched([ALL_FORWARDING, FORWARDING, ACCEPT_RA].map((k) => path.join(host.procSys, k))),
+    "forwarding already 1 is never written (any write of 1 drops RA-learned default routes)");
+  assert.strictEqual(fs.readFileSync(conf, "utf-8"), eg.sysctlConfText("eth0"));
+
+  // a restart: nothing differs, nothing is written
+  touchZero([...procFiles, conf]);
+  assert.strictEqual(await makeService(host, root, { env }).svc.init(), true);
+  assert.ok(untouched([...procFiles, conf]));
+
+  // a hand edit of the file is put back; a missing /etc/sysctl.d is skipped
+  fs.writeFileSync(conf, "net.ipv6.conf.eth0.proxy_ndp = 0\n");
+  assert.strictEqual(await makeService(host, root, { env }).svc.init(), true);
+  assert.strictEqual(fs.readFileSync(conf, "utf-8"), eg.sysctlConfText("eth0"));
+  const nowhere = path.join(root, "no-such-dir", "99-netrun-egress.conf");
+  assert.strictEqual(await makeService(host, root, { env: { EGRESS_SYSCTL_CONF: nowhere } }).svc.init(), true);
+  assert.ok(!fs.existsSync(path.dirname(nowhere)));
+});
+
+test("forwarding off: accept_ra 1 → 2 BEFORE forwarding goes on, kept in the file; accept_ra 0 left alone", async () => {
+  const root = makeRoot();
+  const conf = path.join(root, "99-netrun-egress.conf");
+  const env = { EGRESS_SYSCTL_CONF: conf };
+  const host = fakeHost({ sysctls: { [ALL_FORWARDING]: "0", [FORWARDING]: "0", [ACCEPT_RA]: "1" } });
+  assert.strictEqual(await makeService(host, root, { env }).svc.init(), true);
+  assert.deepStrictEqual(SYSCTLS.map((k) => sysctl(host, k)), ["1", "1", "0", "1", "1", "2"]);
+  assert.strictEqual(fs.readFileSync(conf, "utf-8"), eg.sysctlConfText("eth0", { acceptRa: true }));
+  // the next start (forwarding now 1) keeps the accept_ra line and writes nothing
+  touchZero([conf]);
+  assert.strictEqual(await makeService(host, root, { env }).svc.init(), true);
+  assert.ok(untouched([conf]));
+
+  // accept_ra 0 (static, or a userspace RA client such as systemd-networkd)
+  const quiet0 = fakeHost({ sysctls: { [FORWARDING]: "0", [ACCEPT_RA]: "0" } });
+  assert.strictEqual(await makeService(quiet0, makeRoot()).svc.init(), true);
+  assert.deepStrictEqual([sysctl(quiet0, FORWARDING), sysctl(quiet0, ACCEPT_RA)], ["1", "0"]);
+  // the interface already forwards (it ignores RAs today): accept_ra stays
+  const onlyAll = fakeHost({ sysctls: { [ALL_FORWARDING]: "0", [ACCEPT_RA]: "1" } });
+  assert.strictEqual(await makeService(onlyAll, makeRoot()).svc.init(), true);
+  assert.deepStrictEqual([sysctl(onlyAll, ALL_FORWARDING), sysctl(onlyAll, ACCEPT_RA)], ["1", "1"]);
+
+  // accept_ra cannot be switched → forwarding is never turned on, the module stays down
+  if (!isRoot) {
+    const locked = fakeHost({ sysctls: { [ALL_FORWARDING]: "0", [FORWARDING]: "0", [ACCEPT_RA]: "1" } });
+    fs.chmodSync(path.join(locked.procSys, ACCEPT_RA), 0o444);
+    const svc = makeService(locked, makeRoot()).svc;
+    assert.strictEqual(await svc.init(), false);
+    assert.match(svc.status().reason, /^sysctl_failed: /);
+    assert.deepStrictEqual([sysctl(locked, ALL_FORWARDING), sysctl(locked, FORWARDING)], ["0", "0"], "never forwarding while accept_ra is 1");
+  }
+});
+
+test("sysctls that cannot be set: unavailable before anything is touched; the GC tick retries", async () => {
+  const host = fakeHost();
+  const delayDir = path.join(host.procSys, "net/ipv6/neigh/eth0");
+  fs.rmSync(delayDir, { recursive: true });
+  const root = makeRoot();
+  const { svc } = makeService(host, root);
+  assert.strictEqual(await svc.init(), false);
+  assert.match(svc.status().reason, /^sysctl_failed: .*proxy_delay/);
+  assert.deepStrictEqual([host.nftScripts.length, host.ipBatches.length], [0, 0]);
+  await assert.rejects(svc.rotate([30000]), (err) => err.code === "EGRESS_UNAVAILABLE");
+  fs.mkdirSync(delayDir, { recursive: true });
+  fs.writeFileSync(path.join(delayDir, "proxy_delay"), "80\n");
+  await svc.gcTick();
+  assert.strictEqual(svc.isAvailable(), true);
+  assertConsistent(host, svc, root, "after the retry");
+});
+
+test("upgrade from NIC addresses: proxy entry first, then the NIC copy goes; what cannot move keeps working", async () => {
+  const host = fakeHost();
+  const root = makeRoot();
+  const clock = { t: Date.parse("2026-10-07T12:00:00.000Z") };
+  const at = (ms) => new Date(ms).toISOString();
+  const X = "2001:db8:1:2:e100::1"; // 30000's current
+  const P1 = "2001:db8:1:2:e100::11"; // pool; its proxy entry cannot be added
+  const P2 = "2001:db8:1:2:e100::12"; // pool; its NIC delete fails
+  const D = "2001:db8:1:2:e100::21"; // draining, due
+  const Dn = "2001:db8:1:2:e100::22"; // draining, not due
+  fs.writeFileSync(path.join(root, "egress_state.json"), JSON.stringify({
+    version: 1,
+    ports: {
+      30000: { anchor: ANCHOR[30000], current: X, mode: "static" },
+      30001: { anchor: ANCHOR[30001], current: null, mode: "per_connection" },
+    },
+    pool: [P1, P2],
+    pool_refreshed_at: at(clock.t - 1000),
+    draining: [
+      { addr: D, until: at(clock.t - 1) },
+      { addr: Dn, until: at(clock.t + 300000), port: 30002 },
+      { addr: ANCHOR[31000], until: at(clock.t - 1) }, // damaged: an anchor
+    ],
+  }));
+  // what the version before proxy NDP left: its addresses on the NIC (/128)
+  // and its table still in the kernel (a plain agent restart)
+  for (const a of [X, P1, P2, D, Dn]) host.addrs.set(a, 128);
+  host.addrs.set(ANCHOR[31000], 64);
+  host.table = { ...emptyTable(), map: new Map([[ANCHOR[30000], X]]), dyn: new Set([ANCHOR[30001]]), pool: [P1, P2] };
+  host.refuseAdd = (a) => a === P1;
+  host.refuseLine = (line) => line === `address del ${P2}/128 dev eth0`;
+
+  const { svc } = makeService(host, root, { clock });
+  assert.strictEqual(await svc.init(), true);
+  assert.deepStrictEqual(host.ipBatches.map((b) => b.trim().split("\n")), [
+    [X, P1, P2, D, Dn].map((a) => `neigh add proxy ${a} dev eth0`),
+    [X, P2, D, Dn].map((a) => `address del ${a}/128 dev eth0`), // only with a proxy entry in place; never the anchor
+  ]);
+  const batches = host.log.flatMap((l, i) => (l.startsWith("ip -6 -force -batch") ? [i] : []));
+  const listed = host.log.indexOf("ip -6 neigh show proxy dev eth0");
+  const rebuilt = host.log.findIndex((l) => l.startsWith("nft -f"));
+  assert.ok(batches[0] < listed && listed < batches[1] && batches[1] < rebuilt, "add proxies → check them → leave the NIC → nft");
+  assert.deepStrictEqual(sorted(host.addrs.keys()), sorted([PRIMARY, ANCHOR[31000], P1, P2]));
+  assert.deepStrictEqual(sorted(host.proxies), sorted([X, P2, D, Dn]));
+  const s = svc.snapshot();
+  assert.strictEqual(s.ports[30000].current, X, "moved, still mapped");
+  assert.deepStrictEqual(s.pool, [P1, P2], "P1 still answers from the NIC, P2 from both");
+  assert.deepStrictEqual(s.draining.map((d) => d.addr), [D, Dn], "the anchor left the list");
+  assert.deepStrictEqual([[...host.table.map], host.table.fwd], [[[ANCHOR[30000], X]], PREFIX]);
+
+  // the next tick gives P1 its proxy entry and deletes D's
+  host.refuseAdd = () => false;
+  host.refuseLine = () => false;
+  clock.t += 1000;
+  assert.deepStrictEqual(await svc.gcTick(), { deleted: 1 });
+  assert.ok(host.proxies.has(P1) && !host.proxies.has(D));
+  assert.ok(host.addrs.has(P1) && host.addrs.has(P2), "in use: their NIC copies stay");
+
+  // the pool goes idle, then drains: its NIC copies go with the proxy entries
+  await svc.setMode([30001], "static");
+  clock.t += 600 * 1000;
+  assert.deepStrictEqual(await svc.gcTick(), { deleted: 1 }, "Dn is due; the idle pool starts draining");
+  assert.ok(!host.proxies.has(Dn));
+  clock.t += 600 * 1000;
+  const n = host.ipBatches.length;
+  assert.deepStrictEqual(await svc.gcTick(), { deleted: 2 });
+  assert.deepStrictEqual(host.ipBatches.slice(n), [[
+    `neigh del proxy ${P1} dev eth0`, `address del ${P1}/128 dev eth0`,
+    `neigh del proxy ${P2} dev eth0`, `address del ${P2}/128 dev eth0`, "",
+  ].join("\n")]);
+  assert.deepStrictEqual(sorted(host.addrs.keys()), sorted([PRIMARY, ANCHOR[31000]]));
+  assertConsistent(host, svc, root, "moved and drained");
+
+  // a restart has nothing left to move
+  const m = host.ipBatches.length;
+  const { svc: again } = makeService(host, root, { clock });
+  assert.strictEqual(await again.init(), true);
+  assert.ok(host.ipBatches.slice(m).every((b) => !b.includes("address del")));
+  assertConsistent(host, again, root, "restart");
+});
+
+test("the GC tick puts back proxy entries and sysctls lost under it (link flap, re-created interface)", async () => {
+  const host = fakeHost();
+  const root = makeRoot();
+  const { svc, clock } = makeService(host, root);
+  await svc.init();
+  await svc.rotate([30000]);
+  await svc.setMode([30001], "per_connection");
+  const old = (await svc.rotate([30002])).items[0].new_ipv6;
+  await svc.rotate([30002]); // old drains 600 s
+  const gone = (await svc.rotate([31000])).items[0].new_ipv6;
+  await svc.rotate([31000], { drainSec: 0 }); // due at once
+  host.proxies.clear();
+  for (const [k, v] of [[ALL_PROXY_NDP, "0"], [PROXY_NDP, "0"], [PROXY_DELAY, "80"]]) fs.writeFileSync(path.join(host.procSys, k), `${v}\n`);
+  clock.t += 1000;
+  const n = host.ipBatches.length;
+  assert.deepStrictEqual(await svc.gcTick(), { deleted: 0 }, "a due address without an entry is just forgotten");
+  const readded = host.ipBatches.slice(n).join("").trim().split("\n");
+  assert.ok(readded.every((l) => l.startsWith("neigh add proxy ")) && readded.length === 4 + 3 + 1,
+    "the pool, three currents, the draining one that is not due");
+  assert.ok(host.proxies.has(old), "a draining address keeps answering for its sessions");
+  assert.ok(!host.proxies.has(gone) && !svc.snapshot().draining.some((d) => d.addr === gone));
+  assertConsistent(host, svc, root, "after a link flap");
+});
+
+test("a new address is never one on the NIC or another proxy entry; foreign entries are never deleted", async () => {
+  const host = fakeHost();
+  const root = makeRoot();
+  const { svc, clock } = makeService(host, root);
+  await svc.init();
+  const draw = (k) => eg.formatIpv6([0x2001, 0xdb8, 1, 2, ((0xe0000000 + k) >>> 16) & 0xffff, (0xe0000000 + k) & 0xffff, k >>> 16, k & 0xffff]);
+  const k = rngCounter + 1;
+  host.addrs.set(draw(k), 128); // e.g. an anchor the generator added meanwhile
+  host.proxies.add(draw(k + 1)); // a proxy entry someone else put there
+  const first = (await svc.rotate([30000])).items[0].new_ipv6;
+  assert.strictEqual(first, draw(k + 2));
+  await svc.rotate([30000], { drainSec: 0 });
+  clock.t += 1000;
+  assert.deepStrictEqual(await svc.gcTick(), { deleted: 1 });
+  assert.ok(host.proxies.has(draw(k + 1)) && host.addrs.has(draw(k)));
+  assertConsistent(host, svc, root, "unique", { foreign: new Set([draw(k + 1)]) });
 });

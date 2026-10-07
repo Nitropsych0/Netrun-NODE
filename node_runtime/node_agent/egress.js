@@ -18,6 +18,7 @@
 //     map static_egress   anchor -> current address
 //     chain dyn           snat to numgen random mod K map { pool }
 //     chain post          nat postrouting: @dyn_anchors -> dyn, else the map
+//     chain forward_guard filter forward: drop anything to the node's /64
 //   }
 //
 // Only the first packet of a connection is NATed and conntrack carries the
@@ -25,8 +26,26 @@
 // port; a map miss leaves the packet alone (egress = anchor). Pay-per-GB
 // metering is keyed by the client-facing port and does not notice.
 //
-// Owned here: the table, $PROXY_ROOT/egress_state.json and the addresses this
-// module adds (current / pool / draining). Anchors are never added or removed.
+// Proxy NDP, not NIC addresses. The addresses this module provisions
+// (current / pool / draining) are never put on the interface: on a node that
+// already carries ~16k anchors every `ip address add|del` costs the kernel
+// O(n) (measured on a production node, kernel 6.8: 1000 adds ≈ 35 s, 200
+// deletes ≈ 4.4 s — over the orchestrator's 30 s node timeout for one call).
+// Instead each one is a proxy neighbour entry (`ip -6 neigh add proxy <a> dev
+// <if>`; 1000 in one batch ≈ 0.37 s, 1000 deletes ≈ 0.19 s): the kernel
+// answers the router's neighbour solicitations for it (proxy_ndp,
+// proxy_delay 0, forwarding: egressSysctls), and a reply
+// to it is de-NATed back to the anchor by conntrack in PREROUTING, before
+// routing, so it never has to be a local address. Unsolicited packets to such
+// an address (a drained one, a scan) would be FORWARDED — forwarding is on
+// and the /64 is on-link — back out to the router; chain forward_guard drops them (the
+// node forwards for nobody).
+//
+// Owned here: the table, $PROXY_ROOT/egress_state.json, the proxy entries
+// for the addresses above, the egress interface's proxy-NDP sysctls (also
+// persisted in /etc/sysctl.d/99-netrun-egress.conf) and, once, the NIC
+// copies of addresses an older version of this module added (moved to proxy
+// entries at start). Anchors are never added or removed.
 //
 // nft consistency: every change is ONE `nft -f` transaction, so the kernel
 // holds either the old or the new ruleset, never a mix. Changes go out as
@@ -40,17 +59,18 @@
 // The GC tick also checks that the table still exists (`nft flush ruleset`,
 // `systemctl restart nftables`) and rebuilds it from the state if not.
 //
-// Address count: every extra address is one more /128 on a NIC that already
-// carries up to ~18k anchors (MLD groups, `ip addr` listings, the boot
-// re-add). So a port keeps at most ONE draining address (rotating it again
-// ends the older drain at once), an idle per-connection pool is kept for
-// EGRESS_POOL_REFRESH_SEC before it drains (switching modes back and forth
+// Address count: every extra address is one more proxy entry (and one more
+// solicited-node multicast group: the kernel joins it so the router's
+// solicitations reach the node) on an interface that already carries up to
+// ~18k anchors. So a port keeps at most ONE draining address (rotating it
+// again ends the older drain at once), an idle per-connection pool is kept
+// for EGRESS_POOL_REFRESH_SEC before it drains (switching modes back and forth
 // reuses it instead of adding EGRESS_POOL_SIZE each time), and the node holds
 // at most EGRESS_MAX_EXTRA_ADDRS current + pool + draining addresses.
 //
 // Boot: other writers save the whole ruleset (`nft list ruleset >
-// /etc/nftables.conf`), this table included, and its addresses are gone after
-// a reboot. A drop-in on nftables.service (written at start, see
+// /etc/nftables.conf`), this table included, and its proxy entries are gone
+// after a reboot. A drop-in on nftables.service (written at start, see
 // nftDropinText) deletes the table right after the boot load, so ports leave
 // from their anchors until init() rebuilds it.
 
@@ -76,6 +96,8 @@ const IFACE_RE = /^[A-Za-z0-9_.-]{1,32}$/;
 const MODES = new Set(["static", "per_connection"]);
 const DEFAULT_MAX_EXTRA_ADDRS = 40000;
 const DEFAULT_NFT_DROPIN = "/etc/systemd/system/nftables.service.d/netrun-egress.conf";
+const DEFAULT_SYSCTL_CONF = "/etc/sysctl.d/99-netrun-egress.conf";
+const DEFAULT_PROC_SYS = "/proc/sys";
 
 const ERR_PORT_NOT_FOUND = "port_not_found";
 const ERR_ANCHOR_NOT_FOUND = "anchor_not_found";
@@ -230,6 +252,81 @@ function parseIpAddrShow(text) {
   return out;
 }
 
+// `ip -6 neigh show proxy dev <if>` -> Set of canonical addresses. One entry
+// per line, the address first ("2001:db8::5 proxy"; without a dev filter
+// "2001:db8::5 dev eth0 proxy").
+function parseNeighProxy(text) {
+  const out = new Set();
+  for (const line of String(text || "").split("\n")) {
+    const addr = normalizeIpv6(line.trim().split(/\s+/)[0]);
+    if (addr) out.add(addr);
+  }
+  return out;
+}
+
+// ── proxy-NDP sysctls ────────────────────────────────────────────────────
+
+// What proxy NDP needs, in the order it is applied:
+// - <if>.proxy_ndp: answer the router's (multicast) neighbour solicitations
+//   for the proxy entries of the interface;
+// - all.proxy_ndp: its unicast solicitations — the reachability probes it
+//   sends before trusting a stale entry — are addressed to the proxied
+//   address itself, so they take the forwarding path, and ip6_forward()
+//   hands them to neighbour discovery only when the "all" value is on (it
+//   does not look at the interface's). Without it every probe goes
+//   unanswered and the router drops the entry and re-resolves, a hiccup on
+//   every reachability cycle. Proxy entries are per device, so this answers
+//   for nothing else;
+// - <if>.proxy_delay 0: answer at once (the default delays the answer to a
+//   multicast solicitation by up to 0.8 s);
+// - forwarding: neighbour discovery answers for proxy entries only on a
+//   forwarding interface, and ip6_forward() — the unicast probes above —
+//   drops everything unless "all" forwards. The installers already turn
+//   all.forwarding on; a write of 1 over a 1 is never made (ensureSysctls).
+function egressSysctls(iface) {
+  return [
+    { key: ["net", "ipv6", "conf", "all", "proxy_ndp"], want: "1" },
+    { key: ["net", "ipv6", "conf", iface, "proxy_ndp"], want: "1" },
+    { key: ["net", "ipv6", "neigh", iface, "proxy_delay"], want: "0" },
+    { key: ["net", "ipv6", "conf", "all", "forwarding"], want: "1", forwarding: true },
+    { key: ["net", "ipv6", "conf", iface, "forwarding"], want: "1", forwarding: true },
+  ];
+}
+
+function acceptRaKey(iface) {
+  return ["net", "ipv6", "conf", iface, "accept_ra"];
+}
+
+// sysctl.conf name: dot-separated, a dot inside a component (eth0.100)
+// written as "/" (sysctl.d(5), sysctl(8)).
+function sysctlName(parts) {
+  return parts.map((p) => p.replace(/\./g, "/")).join(".");
+}
+
+// /etc/sysctl.d/99-netrun-egress.conf, so the settings survive a reboot (the
+// agent sets them at start anyway). `acceptRa`: the agent had to switch the
+// interface to accept_ra=2 before turning forwarding on (see ensureSysctls);
+// that line comes before the forwarding ones, as sysctl applies the file in
+// order.
+function sysctlConfText(iface, { acceptRa = false } = {}) {
+  const lines = [
+    "# NETRUN IPv6 egress rotation (node-agent egress.js). Rotated and per-connection",
+    `# addresses are not added to ${iface}: the kernel answers the router's neighbour`,
+    `# solicitations for them (proxy NDP; \`ip -6 neigh show proxy dev ${iface}\`).`,
+    "# Written by the agent at start when it differs; edits are overwritten.",
+  ];
+  let raDone = !acceptRa;
+  for (const s of egressSysctls(iface)) {
+    if (s.forwarding && !raDone) {
+      lines.push(`${sysctlName(acceptRaKey(iface))} = 2`);
+      raDone = true;
+    }
+    lines.push(`${sysctlName(s.key)} = ${s.want}`);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
 // ── state ────────────────────────────────────────────────────────────────
 
 // pool_idle_since: when the last per_connection port left a non-empty pool
@@ -291,7 +388,7 @@ function activeAddressesOf(s) {
   return out;
 }
 
-// Every address this module put on the NIC.
+// Every address this module provisions (a proxy entry each).
 function addressesOf(s) {
   const out = activeAddressesOf(s);
   for (const d of s.draining) out.add(d.addr);
@@ -309,6 +406,9 @@ function sanitizeState(raw) {
     const anchor = normalizeIpv6(v.anchor);
     if (!anchor) continue;
     const current = v.mode === "static" && v.current ? normalizeIpv6(v.current) : null;
+    // a static entry without a current address says nothing the anchor
+    // doesn't (files from before static-means-forget kept such entries)
+    if (v.mode === "static" && !current) continue;
     s.ports[String(port)] = { anchor, current, mode: v.mode };
   }
   s.pool = [...new Set((Array.isArray(raw.pool) ? raw.pool : []).map(normalizeIpv6).filter(Boolean))];
@@ -352,7 +452,7 @@ function planCall(state, { op, mode = null, ports, anchors }) {
 }
 
 // The state after a call and its response items. `freshByPort` / `freshPool`
-// hold only addresses that are really on the NIC; a port without one fails
+// hold only addresses that are really provisioned; a port without one fails
 // with address_add_failed (address_budget_exceeded when `refused` / the
 // `poolRefused` budget kept it from getting one) and keeps its old state.
 function applyCall(state, plan, ctx) {
@@ -384,9 +484,11 @@ function applyCall(state, plan, ctx) {
         if (addr) entry = { anchor: step.anchor, current: addr, mode: "static" };
         else item.error = refused.has(step.port) ? ERR_ADDRESS_BUDGET : ERR_ADDRESS_ADD_FAILED;
       } else if (op === "mode") {
+        // static: back to the anchor until the next rotate — the port has
+        // nothing left to remember, so the entry goes (like reset)
         if (mode === "per_connection" && next.pool.length === 0) {
           item.error = poolRefused ? ERR_ADDRESS_BUDGET : ERR_ADDRESS_ADD_FAILED;
-        } else entry = { anchor: step.anchor, current: null, mode };
+        } else if (mode === "per_connection") entry = { anchor: step.anchor, current: null, mode };
       }
       if (!item.error) {
         if (step.raw && step.raw.current) {
@@ -403,7 +505,7 @@ function applyCall(state, plan, ctx) {
   }
   // One draining address per port: a port retiring its current again ends
   // the older drain now (the GC deletes it), so frequent rotations (timer,
-  // rotation link) never pile addresses up on the NIC. Sessions older than
+  // rotation link) never pile proxy entries up. Sessions older than
   // the last rotation on that port are the ones cut.
   if (retired.length) {
     const ports = new Set(retired.map((r) => r.port));
@@ -472,9 +574,10 @@ function fitBudget(state, want, { max, nowMs }) {
   return { state: next, allowed, cut: victims.length };
 }
 
-// Startup, after the re-add: nft must never map to an address that is not on
-// the NIC (replies would go nowhere), so whatever could not be re-added is
-// forgotten — a port then leaves from its anchor.
+// Startup, after the re-add: nft must never map to an address nothing
+// answers for (no proxy entry, not on the NIC: replies would go nowhere), so
+// whatever could not be re-added is forgotten — a port then leaves from its
+// anchor. `present`: anything with has(addr).
 function dropMissing(state, present) {
   const next = cloneState(state);
   const lost = [];
@@ -515,20 +618,33 @@ function refreshPoolMembers(pool, size, fraction, fresh) {
   return { pool: next, retired: pool.filter((a) => !keep.has(a)) };
 }
 
-// GC: due draining addresses still on the NIC are deleted with the prefix
-// length they actually carry (/128 from us and the generator, /64 after the
-// boot restore). A protected address (an anchor, a current, a pool member) is
-// in use again: it leaves the draining list and is never deleted.
-function planGc(state, { nowMs, iface, protectedAddrs }) {
+// GC: a due draining address is deleted where it is provisioned — its proxy
+// entry (`proxies`: Set) and, for an address the version before proxy NDP
+// left on the NIC (`nic`: address -> the prefix length it carries there), the
+// NIC address too. A protected address (an anchor, a current, a pool member)
+// is in use again: it leaves the draining list and is never deleted. A due
+// address provisioned nowhere is just forgotten.
+function planGc(state, { nowMs, proxies, nic = new Map(), protectedAddrs }) {
   const keep = [];
   const deletes = [];
   for (const d of state.draining) {
     if (protectedAddrs.has(d.addr)) continue;
     if (Date.parse(d.until) > nowMs) { keep.push(d); continue; }
-    const plen = iface.get(d.addr);
-    if (plen !== undefined) deletes.push({ addr: d.addr, plen, entry: d });
+    const proxy = proxies.has(d.addr);
+    const plen = nic.get(d.addr);
+    if (proxy || plen !== undefined) deletes.push({ addr: d.addr, proxy, plen, entry: d });
   }
   return { keep, deletes };
+}
+
+// The `ip -6 -batch` lines that carry out planGc's deletes.
+function gcBatchLines(deletes, iface) {
+  const lines = [];
+  for (const d of deletes) {
+    if (d.proxy) lines.push(`neigh del proxy ${d.addr} dev ${iface}`);
+    if (d.plen !== undefined) lines.push(`address del ${d.addr}/${d.plen} dev ${iface}`);
+  }
+  return lines;
 }
 
 // ── nft text ─────────────────────────────────────────────────────────────
@@ -564,8 +680,10 @@ function elementsBlock(list) {
 }
 
 // The whole table as one transaction: `add table` makes the `delete` safe on
-// a node that has none yet.
-function nftRebuildScript(state) {
+// a node that has none yet. `prefix`: the node's /64 text ("2001:db8::/64"),
+// for the forward guard (chain forward_guard; see the header).
+function nftRebuildScript(state, prefix) {
+  if (!parsePrefix(prefix)) throw new TypeError(`nftRebuildScript: bad /64 prefix ${prefix}`);
   const d = desiredNft(state);
   return [
     `add table ip6 ${TABLE}`,
@@ -586,6 +704,10 @@ function nftRebuildScript(state) {
     "\t\ttype nat hook postrouting priority srcnat; policy accept;",
     "\t\tip6 saddr @dyn_anchors goto dyn",
     "\t\tsnat to ip6 saddr map @static_egress",
+    "\t}",
+    "\tchain forward_guard {",
+    "\t\ttype filter hook forward priority filter; policy accept;",
+    `\t\tip6 daddr ${prefix} drop`,
     "\t}",
     "}",
     "",
@@ -764,6 +886,7 @@ function envFraction(raw, def) {
 
 function readConfig(env) {
   const dropin = String(env.EGRESS_NFT_DROPIN || "").trim();
+  const sysctlConf = String(env.EGRESS_SYSCTL_CONF || "").trim();
   return {
     proxyRoot: path.normalize(env.NODE_AGENT_PROXY_ROOT || DEFAULT_PROXY_ROOT),
     drainSec: envInt(env.EGRESS_DRAIN_SEC, 600, 0, MAX_DRAIN_SEC),
@@ -774,6 +897,10 @@ function readConfig(env) {
     prefix: String(env.NODE_EGRESS_PREFIX || "").trim() || null,
     // "off" = do not write the nftables.service drop-in (tests, non-systemd)
     nftDropin: dropin === "off" ? null : path.normalize(dropin || DEFAULT_NFT_DROPIN),
+    // "off" = do not persist the proxy-NDP sysctls (tests, the netns smoke)
+    sysctlConf: sysctlConf === "off" ? null : path.normalize(sysctlConf || DEFAULT_SYSCTL_CONF),
+    // where the sysctls are read and written; only tests point it elsewhere
+    procSys: path.normalize(String(env.EGRESS_PROC_SYS || "").trim() || DEFAULT_PROC_SYS),
   };
 }
 
@@ -816,8 +943,8 @@ function stderrOf(res) {
 // ── the service ──────────────────────────────────────────────────────────
 
 // Everything with a side effect goes through `run` (ip / nft / systemctl),
-// `writeState`, `now`, `randomBytes` and `findBin`, so tests drive the real
-// code against a fake host.
+// `writeState`, `now`, `randomBytes`, `findBin` and the EGRESS_PROC_SYS /
+// EGRESS_SYSCTL_CONF paths, so tests drive the real code against a fake host.
 function createEgressService({
   env = process.env,
   run = execCapture,
@@ -842,6 +969,11 @@ function createEgressService({
   let initPromise = null;
   let timers = null;
   let tmpSeq = 0;
+  // Addresses of the state still on the NIC from the version before proxy
+  // NDP (address -> prefix length): init could not move them (their proxy
+  // entry or their delete failed). They still work there; the GC deletes
+  // the NIC copy too once they are due. Rebuilt by every init.
+  let nicLeftovers = new Map();
 
   function markUnavailable(why) {
     if (why !== reason || ready) log.error(`[egress] unavailable: ${why}`);
@@ -912,12 +1044,15 @@ function createEgressService({
     return { ok: res.code === 0, detail: String(res.stderr || "").trim().slice(0, 300) || `exit ${res.code}` };
   }
 
-  // -force: one failed line (an address that is already there, at boot) must
-  // not stop the rest of the batch.
+  // -force: one failed line (a proxy entry that is already gone, a NIC
+  // address that is) must not stop the rest of the batch.
   function ipBatch(lines) {
     return runWithFile("ip", `${lines.join("\n")}\n`, "ip", ["-6", "-force", "-batch"], 120000);
   }
 
+  // The interface's own addresses (address -> prefix length): ~40 ms with
+  // 16k addresses, so only once per call — for the uniqueness of new
+  // addresses and for init's move off the NIC.
   async function listIface() {
     const res = await run("ip", ["-6", "-o", "addr", "show", "dev", iface], { timeoutMs: 30000 });
     if (res.code !== 0) throw new Error(`ip_addr_show_failed: ${stderrOf(res)}`);
@@ -926,19 +1061,114 @@ function createEgressService({
     return out;
   }
 
-  // Added BEFORE nft ever maps to them (ip_nonlocal_bind would hide a missing
-  // one until replies vanish). Returns the subset that is really there.
-  async function addAddresses(addrs) {
+  async function listProxies() {
+    const res = await run("ip", ["-6", "neigh", "show", "proxy", "dev", iface], { timeoutMs: 30000 });
+    if (res.code !== 0) throw new Error(`ip_neigh_show_failed: ${stderrOf(res)}`);
+    return parseNeighProxy(res.stdout);
+  }
+
+  function proxyAddLines(addrs) {
+    return addrs.map((a) => `neigh add proxy ${a} dev ${iface}`);
+  }
+
+  // Provisioned BEFORE nft ever maps to them (an address nobody answers for
+  // swallows every reply). Adding an entry that exists succeeds. Returns the
+  // subset that is really there.
+  async function addProxies(addrs) {
     if (addrs.length === 0) return new Set();
-    const res = await ipBatch(addrs.map((a) => `address add ${a} dev ${iface} nodad`));
+    const res = await ipBatch(proxyAddLines(addrs));
     if (res.code === 0) return new Set(addrs);
-    log.error(`[egress] ip address add: ${stderrOf(res)}`);
+    log.error(`[egress] ip neigh add proxy: ${stderrOf(res)}`);
     try {
-      const list = await listIface();
+      const list = await listProxies();
       return new Set(addrs.filter((a) => list.has(a)));
     } catch {
       return new Set();
     }
+  }
+
+  // Proxy NDP (egressSysctls), read from and written to /proc/sys. Only what
+  // differs is written: writing forwarding=1, even over a 1, makes the kernel
+  // drop at once every default route learned from router advertisements on
+  // an interface whose accept_ra is not 2 — and with forwarding on,
+  // accept_ra=1 ignores advertisements. So an egress interface that takes
+  // RAs now (accept_ra=1, not forwarding yet) is switched to accept_ra=2
+  // BEFORE any forwarding write (accept_ra 0 — static, or a userspace RA
+  // client such as systemd-networkd — is left alone, and so is an interface
+  // that already forwards: it ignores RAs today). Each write is read back.
+  // Returns { ok, changed: ["name=value"], pinnedRa } or { ok: false,
+  // reason }.
+  function ensureSysctls() {
+    const file = (key) => path.join(cfg.procSys, ...key);
+    const read = (key) => fs.readFileSync(file(key), "utf-8").trim();
+    const changed = [];
+    let pinnedRa = false;
+    const set = (key, value) => {
+      fs.writeFileSync(file(key), `${value}\n`);
+      const got = read(key);
+      if (got !== value) throw new Error(`${sysctlName(key)} reads ${got} after writing ${value}`);
+      changed.push(`${sysctlName(key)}=${value}`);
+    };
+    try {
+      const ifaceForwarding = ["net", "ipv6", "conf", iface, "forwarding"];
+      let takesRa = read(acceptRaKey(iface)) === "1" && read(ifaceForwarding) !== "1";
+      for (const { key, want, forwarding } of egressSysctls(iface)) {
+        if (read(key) === want) continue;
+        if (forwarding && takesRa) {
+          set(acceptRaKey(iface), "2");
+          pinnedRa = true;
+          takesRa = false;
+        }
+        set(key, want);
+      }
+    } catch (err) {
+      return { ok: false, reason: `sysctl_failed: ${errText(err)}`, changed };
+    }
+    return { ok: true, changed, pinnedRa };
+  }
+
+  // sysctlConfText in EGRESS_SYSCTL_CONF, written only when missing or
+  // different. The accept_ra line, once the agent needed it, is kept.
+  function persistSysctls(pinnedRa) {
+    const file = cfg.sysctlConf;
+    if (!file) return { changed: false, skipped: "off" };
+    if (!fs.existsSync(path.dirname(file))) return { changed: false, skipped: "no_sysctl_d" };
+    let current = null;
+    try { current = fs.readFileSync(file, "utf-8"); } catch {}
+    const raLine = `${sysctlName(acceptRaKey(iface))} = 2`;
+    const acceptRa = pinnedRa || (current !== null && current.split("\n").includes(raLine));
+    const text = sysctlConfText(iface, { acceptRa });
+    if (current === text) return { changed: false };
+    writeFileAtomic(file, text);
+    log.log(`[egress] wrote ${file}`);
+    return { changed: true };
+  }
+
+  // Upgrade from the version that put these addresses on the NIC: each one
+  // already got its proxy entry (init's re-add), and only then leaves the NIC,
+  // deleted with the prefix length it carries — so a port never loses its
+  // address in between and nothing is left twice. An anchor is never
+  // deleted; an address whose proxy entry is missing stays on the NIC (it
+  // works there). Returns how many left; the rest go to nicLeftovers.
+  async function moveOffNic(addrs, nic, proxies, anchors) {
+    const onNic = addrs.filter((a) => nic.has(a) && !anchors.has(a));
+    const moving = onNic.filter((a) => proxies.has(a));
+    let still = nic;
+    if (moving.length) {
+      const res = await ipBatch(moving.map((a) => `address del ${a}/${nic.get(a)} dev ${iface}`));
+      if (res.code === 0) {
+        const gone = new Set(moving);
+        still = new Map([...nic].filter(([a]) => !gone.has(a)));
+      } else {
+        log.error(`[egress] ip address del (move to proxy NDP): ${stderrOf(res)}`);
+        try { still = await listIface(); } catch { still = nic; }
+      }
+    }
+    nicLeftovers = new Map(onNic.filter((a) => still.has(a)).map((a) => [a, still.get(a)]));
+    const moved = onNic.length - nicLeftovers.size;
+    if (moved) log.log(`[egress] moved ${moved} address(es) off ${iface} to proxy NDP`);
+    if (nicLeftovers.size) log.error(`[egress] ${nicLeftovers.size} address(es) still on ${iface}; the GC deletes them once drained`);
+    return moved;
   }
 
   function persist(s) {
@@ -984,12 +1214,12 @@ function createEgressService({
     return { ok: true, iface: dev, prefix: prefixFromGroups(ipv6Groups(first.addr)) };
   }
 
-  // Startup: load → drop ports whose cfg/anchor is gone → re-add the current
-  // and pool addresses (one batch) → rebuild the table. Draining addresses are
-  // not re-added: after a reboot no session is left on them, and after a plain
-  // restart they are still on the NIC (the listing keeps those for the GC).
-  // A node without nft NAT stays up with the module unavailable; the GC tick
-  // retries.
+  // Startup: proxy-NDP sysctls (set, verified, persisted) → load → drop ports
+  // whose cfg/anchor is gone → re-add the proxy entry of every current, pool
+  // and draining address (one -force batch; after a plain restart they are
+  // all still there) → move the ones an older version left on the NIC off it
+  // → rebuild the table. A node without nft NAT (or whose sysctls cannot be
+  // set) stays up with the module unavailable; the GC tick retries.
   function init() {
     if (ready) return Promise.resolve(true);
     if (initPromise) return initPromise;
@@ -999,6 +1229,15 @@ function createEgressService({
       if (!found.ok) return markUnavailable(found.reason);
       iface = found.iface;
       prefix = found.prefix;
+      const sys = ensureSysctls();
+      if (!sys.ok) return markUnavailable(sys.reason);
+      if (sys.changed.length) log.log(`[egress] set ${sys.changed.join(" ")}`);
+      try {
+        persistSysctls(sys.pinnedRa);
+      } catch (err) {
+        // the running kernel has them; the next start writes the file again
+        log.error(`[egress] ${cfg.sysctlConf}: ${errText(err)}`);
+      }
       let loaded;
       try {
         loaded = loadState();
@@ -1012,22 +1251,28 @@ function createEgressService({
       if (rec.dropped.length) log.log(`[egress] dropped ${rec.dropped.length} port(s) whose cfg/anchor is gone`);
       // A damaged file listing an anchor must not make us add (or later own) it.
       s.draining = s.draining.filter((d) => !index.all.has(d.addr));
-      const addrs = [...activeAddressesOf(s)];
-      if (addrs.length || s.draining.length) {
-        if (addrs.length) await ipBatch(addrs.map((a) => `address add ${a} dev ${iface} nodad`));
-        let present;
+      const addrs = addressesOf(s);
+      nicLeftovers = new Map();
+      if (addrs.length) {
+        let nic;
+        let proxies;
         try {
-          present = await listIface();
+          nic = await listIface();
+          await ipBatch(proxyAddLines(addrs));
+          proxies = await listProxies();
         } catch (err) {
           return markUnavailable(errText(err));
         }
+        await moveOffNic(addrs, nic, proxies, index.all);
+        // answered for: a proxy entry, or (not moved) still on the NIC
+        const present = new Set([...proxies, ...addrs.filter((a) => nic.has(a))]);
         const kept = dropMissing(s, present);
         if (kept.lost.length) {
           log.error(`[egress] ${kept.lost.length} address(es) not re-added; their ports leave from the anchor`);
         }
         s = kept.state;
       }
-      const res = await applyNft(nftRebuildScript(s));
+      const res = await applyNft(nftRebuildScript(s, prefix.text));
       if (!res.ok) return markUnavailable(`nft_failed: ${res.detail}`);
       state = s;
       diskText = loaded.text;
@@ -1051,17 +1296,21 @@ function createEgressService({
   }
 
   // Fresh addresses for a change: generated against everything already in
-  // use, journaled as draining-now BEFORE `ip` runs (a crash after the add
-  // leaves them for the GC instead of leaking them), then added.
+  // use (the NIC's addresses, every proxy entry on the interface, the cfg
+  // anchors, the state), journaled as draining-now BEFORE `ip` runs (a crash
+  // after the add leaves them for the GC instead of leaking them), then
+  // provisioned as proxy entries.
   async function provision(before, count, cfgAnchors, nowMs) {
-    let list;
+    let nic;
+    let proxies;
     try {
-      list = await listIface();
+      nic = await listIface();
+      proxies = await listProxies();
     } catch (err) {
       log.error(`[egress] ${errText(err)}`);
       return { journal: null, fresh: [], present: new Set() };
     }
-    const taken = new Set([...list.keys(), ...cfgAnchors, ...addressesOf(before)]);
+    const taken = new Set([...nic.keys(), ...proxies, ...cfgAnchors, ...addressesOf(before)]);
     for (const e of Object.values(before.ports)) taken.add(e.anchor);
     const fresh = generateAddresses(prefix, count, taken, randomBytes);
     const journal = cloneState(before);
@@ -1071,7 +1320,7 @@ function createEgressService({
     } catch (err) {
       throw new EgressUnavailableError(`state_write_failed: ${errText(err)}`);
     }
-    return { journal, fresh, present: await addAddresses(fresh) };
+    return { journal, fresh, present: await addProxies(fresh) };
   }
 
   // nft first, then the file. A failed nft leaves the kernel as it was (each
@@ -1089,11 +1338,11 @@ function createEgressService({
       let res = await applyNft(script);
       if (!res.ok) {
         log.error(`[egress] nft delta refused (${res.detail}); rebuilding the table`);
-        res = await applyNft(nftRebuildScript(next));
+        res = await applyNft(nftRebuildScript(next, prefix.text));
       }
       if (!res.ok) {
         log.error(`[egress] nft rebuild failed: ${res.detail}`);
-        await applyNft(nftRebuildScript(fallback));
+        await applyNft(nftRebuildScript(fallback, prefix.text));
         state = fallback;
         return { ok: false, detail: res.detail };
       }
@@ -1102,7 +1351,7 @@ function createEgressService({
       persist(next);
     } catch (err) {
       if (script !== null) {
-        const rb = await applyNft(nftRebuildScript(fallback));
+        const rb = await applyNft(nftRebuildScript(fallback, prefix.text));
         if (!rb.ok) {
           log.error(`[egress] nft rollback after a failed state write failed: ${rb.detail}`);
           state = next;
@@ -1151,7 +1400,8 @@ function createEgressService({
       op, mode, freshByPort, freshPool, refused, poolRefused: poolWant > 0 && poolCount === 0, nowMs, drainSec,
     });
     // Whatever was generated but is not in use (a failed add the listing may
-    // have missed) drains now: the GC removes it if it is on the NIC after all.
+    // have missed) drains now: the GC removes its proxy entry if it exists
+    // after all.
     const used = new Set(addressesOf(next));
     for (const a of prov.fresh) if (!used.has(a)) addDraining(next, a, nowMs);
     const outcome = await commit(before, next, prov.journal || before);
@@ -1214,8 +1464,42 @@ function createEgressService({
     const res = await run("nft", ["list", "chain", "ip6", TABLE, "post"], { timeoutMs: 30000 });
     if (res.code === 0) return;
     log.error(`[egress] table ip6 ${TABLE} is gone (${stderrOf(res)}); rebuilding it`);
-    const rb = await applyNft(nftRebuildScript(state));
+    const rb = await applyNft(nftRebuildScript(state, prefix.text));
     if (!rb.ok) log.error(`[egress] nft rebuild failed: ${rb.detail}`);
+  }
+
+  // Proxy NDP can vanish under us too: the kernel drops a device's proxy
+  // entries when it goes down (and on a carrier loss), and a re-created
+  // interface starts with proxy_ndp off. Nothing would answer for those
+  // addresses then and every reply to a rotated port would be lost, so the
+  // tick re-checks the sysctls and the entries of every current, pool and not
+  // yet due draining address (one listing, only while there is one) and puts
+  // back what is missing. Returns the listing (with what was re-added) for
+  // the GC, or null.
+  async function ensureProxyNdp(nowMs) {
+    const want = new Set(activeAddressesOf(state));
+    for (const d of state.draining) if (Date.parse(d.until) > nowMs) want.add(d.addr);
+    if (want.size === 0) return null;
+    const sys = ensureSysctls();
+    if (!sys.ok) log.error(`[egress] ${sys.reason}`);
+    if (sys.changed.length) log.error(`[egress] proxy-NDP sysctls had changed; set ${sys.changed.join(" ")}`);
+    let have;
+    try {
+      have = await listProxies();
+    } catch (err) {
+      log.error(`[egress] ${errText(err)}`);
+      return null;
+    }
+    const missing = [...want].filter((a) => !have.has(a));
+    if (missing.length === 0) return have;
+    log.error(`[egress] ${missing.length} proxy entr${missing.length === 1 ? "y" : "ies"} missing on ${iface}; re-adding`);
+    const res = await ipBatch(proxyAddLines(missing));
+    if (res.code !== 0) {
+      log.error(`[egress] ip neigh add proxy: ${stderrOf(res)}`);
+      return null;
+    }
+    for (const a of missing) have.add(a);
+    return have;
   }
 
   function gcTick() {
@@ -1224,6 +1508,7 @@ function createEgressService({
       if (!ready) return { deleted: 0 };
       await ensureTable();
       const nowMs = now();
+      let proxies = await ensureProxyNdp(nowMs);
       const idle = retireIdlePool(state, { nowMs, idleSec: cfg.poolRefreshSec, drainSec: cfg.drainSec });
       if (idle) {
         log.log(`[egress] per-connection pool idle for ${cfg.poolRefreshSec}s: ${state.pool.length} address(es) drain`);
@@ -1231,9 +1516,8 @@ function createEgressService({
       }
       if (state.draining.length === 0) return { deleted: 0 };
       if (!state.draining.some((d) => Date.parse(d.until) <= nowMs)) return { deleted: 0 };
-      let list;
       try {
-        list = await listIface();
+        if (!proxies) proxies = await listProxies();
       } catch (err) {
         log.error(`[egress] gc: ${errText(err)}`);
         return { deleted: 0 };
@@ -1243,18 +1527,28 @@ function createEgressService({
         protectedAddrs.add(e.anchor);
         if (e.current) protectedAddrs.add(e.current);
       }
-      const plan = planGc(state, { nowMs, iface: list, protectedAddrs });
-      let still = new Map();
+      const plan = planGc(state, { nowMs, proxies, nic: nicLeftovers, protectedAddrs });
+      // what is still there after the batch (nothing, when it succeeded)
+      let stillProxied = new Set();
+      let stillNic = new Map();
       if (plan.deletes.length) {
-        const res = await ipBatch(plan.deletes.map((d) => `address del ${d.addr}/${d.plen} dev ${iface}`));
+        const res = await ipBatch(gcBatchLines(plan.deletes, iface));
         if (res.code !== 0) {
-          try { still = await listIface(); } catch { still = list; }
+          log.error(`[egress] gc: ${stderrOf(res)}`);
+          try { stillProxied = await listProxies(); } catch { stillProxied = proxies; }
+          if (plan.deletes.some((d) => d.plen !== undefined)) {
+            try { stillNic = await listIface(); } catch { stillNic = nicLeftovers; }
+          }
         }
       }
+      const left = (d) => (d.proxy && stillProxied.has(d.addr)) || (d.plen !== undefined && stillNic.has(d.addr));
+      for (const d of plan.deletes) {
+        if (d.plen !== undefined && !stillNic.has(d.addr)) nicLeftovers.delete(d.addr);
+      }
       const next = cloneState(state);
-      next.draining = [...plan.keep, ...plan.deletes.filter((d) => still.has(d.addr)).map((d) => d.entry)];
+      next.draining = [...plan.keep, ...plan.deletes.filter(left).map((d) => d.entry)];
       await commit(state, next, state);
-      return { deleted: plan.deletes.filter((d) => !still.has(d.addr)).length };
+      return { deleted: plan.deletes.filter((d) => !left(d)).length };
     });
   }
 
@@ -1451,6 +1745,9 @@ module.exports = {
   parseCfgAnchors,
   parseDefaultRouteDev,
   parseIpAddrShow,
+  parseNeighProxy,
+  egressSysctls,
+  sysctlConfText,
   emptyState,
   sanitizeState,
   serializeState,
@@ -1463,6 +1760,7 @@ module.exports = {
   poolRefreshNeed,
   refreshPoolMembers,
   planGc,
+  gcBatchLines,
   desiredNft,
   nftRebuildScript,
   nftDiffScript,
