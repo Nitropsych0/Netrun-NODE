@@ -179,3 +179,32 @@ test("POST /generate lifts the firewall blocks of ITS batch (and its http mirror
   const st = JSON.parse(fs.readFileSync(process.env.NODE_AGENT_FIREWALL_STATE_FILE, "utf-8"));
   assert.deepStrictEqual(st.ghostPorts, [40000], "the persisted ghosts keep 40000");
 });
+
+test("a failed /generate parks ITS attempt: the 3proxy it started is stopped, the cfg becomes .cfg.failed, start-up script + address list go; an older cfg is never touched", { timeout: 60_000 }, async () => {
+  const cfg = path.join(PROXY_ROOT, "3proxy", "3proxy_25000.cfg");
+  const gen = path.join(TMP, "fake_generator_writes.sh");
+  fs.writeFileSync(
+    gen,
+    `#!/bin/bash
+# --random --skip-self-check --proxies-type
+printf 'daemon\\nflush\\nsocks -6 -a -p25000 -i45.32.10.20 -e2001:db8::25\\n' > '${cfg}'
+echo '#!/bin/bash' > '${PROXY_ROOT}/proxy-startup_25000.sh'
+echo '2001:db8::25' > '${PROXY_ROOT}/ipv6_25000.list'
+(exec -a "${PROXY_ROOT}/3proxy/bin/3proxy ${cfg}" sleep 300) </dev/null >/dev/null 2>&1 &
+sleep 0.3
+exit 3
+`,
+    { mode: 0o755 }
+  );
+  const r = await request(PORT, "POST", "/generate", { jobId: "park-1", generatorScript: gen, startPort: 25000, proxyCount: 1, proxiesType: "socks5", timeoutSec: 30 });
+  await settled();
+  assert.strictEqual(r.json.error, "generator_exit_3", JSON.stringify(r.json));
+  assert.ok(!fs.existsSync(cfg), "cfg parked");
+  assert.ok(fs.existsSync(`${cfg}.failed`), "kept as .cfg.failed");
+  assert.ok(!fs.existsSync(path.join(PROXY_ROOT, "proxy-startup_25000.sh")), "start-up script removed");
+  assert.ok(!fs.existsSync(path.join(PROXY_ROOT, "ipv6_25000.list")), "address list removed");
+  const left = require("child_process").spawnSync("pgrep", ["-f", "3proxy_25000\\.cfg$"]).stdout.toString().trim();
+  assert.strictEqual(left, "", "the attempt's process is gone");
+  // The lift test's 18100 attempt failed too, but its cfg predates the generator run: never parked.
+  assert.ok(!fs.existsSync(path.join(PROXY_ROOT, "3proxy", "3proxy_18100.cfg.failed")), "an older cfg is never parked");
+});

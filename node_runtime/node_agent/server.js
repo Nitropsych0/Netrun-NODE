@@ -850,6 +850,81 @@ async function occupiedBatchPorts(params) {
   return { ok: true, ports: selectOccupiedBatchPorts(text, params, { httpsFront }) };
 }
 
+// Audit N2 follow-up — a /generate that ended `failed` AFTER its generator
+// wrote the cfg used to leave that batch running: 1500 proxies the orchestrator
+// never recorded (it released the range), ~145 MB of kernel memory, started
+// again at every boot by the restore, its anchors left on the NIC. Only a cfg
+// written by THIS attempt (mtime >= the generator start) and only processes
+// started after it are touched — an older process on that cfg (another batch
+// the sweep could not kill) makes it leave everything alone. The cfg becomes
+// 3proxy_<p>.cfg.failed (never restored, kept for forensics); the start-up
+// script and the address list go; the anchors are left to the supervisor's
+// orphan GC. NODE_AGENT_PARK_FAILED_ATTEMPTS=0: off.
+// `ps -o etime` ([[dd-]hh:]mm:ss — procps and BSD ps alike) -> seconds | null.
+function parseEtime(text) {
+  const m = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(String(text || ""));
+  if (!m) return null;
+  return Number(m[1] || 0) * 86400 + Number(m[2] || 0) * 3600 + Number(m[3]) * 60 + Number(m[4]);
+}
+
+async function processAgeSec(pid) {
+  const r = await runCommand("ps", ["-o", "etime=", "-p", String(pid)], { timeoutSec: 8 });
+  return r && r.ok ? parseEtime(r.stdout) : null;
+}
+
+async function parkFailedAttempt(startPort, sinceMs) {
+  if (!hygieneLib.envSwitch(process.env.NODE_AGENT_PARK_FAILED_ATTEMPTS)) return { parked: false, reason: "disabled" };
+  const sp = toPositiveInt(startPort, 0);
+  if (!sp || !sinceMs) return { parked: false, reason: "no_attempt" };
+  const cfgPath = buildCfgPathForStartPort(sp);
+  let st;
+  try {
+    st = await fsp.stat(cfgPath);
+  } catch (_error) {
+    return { parked: false, reason: "no_cfg" };
+  }
+  if (st.mtimeMs < sinceMs - 2000) return { parked: false, reason: "cfg_not_written_by_this_attempt" };
+  return withProcessLock(async () => {
+    const pg = await runCommand("pgrep", ["-f", `3proxy_${sp}\\.cfg$`], { timeoutSec: 8 });
+    const pids = String((pg && pg.stdout) || "").split(/\s+/).filter((x) => /^\d+$/.test(x)).map(Number);
+    const maxAgeSec = (Date.now() - sinceMs) / 1000 + 2;
+    for (const pid of pids) {
+      const age = await processAgeSec(pid);
+      if (age === null || age > maxAgeSec) return { parked: false, reason: "older_process", pid, ageSec: age };
+    }
+    const kill = await deprovision.killCfgProcess(sp);
+    if (kill.stillAlive) return { parked: false, reason: "still_running", killed: kill.killed };
+    await fsp.rename(cfgPath, `${cfgPath}.failed`);
+    for (const f of [buildStartupScriptPath(sp), buildIpv6ListPath(sp), path.join(PROXY_ROOT, `running_server_${sp}.info`)]) {
+      await safeUnlink(f);
+    }
+    return { parked: true, killed: kill.killed, cfg: `${path.basename(cfgPath)}.failed` };
+  });
+}
+
+// Anchors of the parked pay-per-GB cfgs (*.cfg.disabled): the orphan GC keeps
+// them (an enable restores the cfg and needs its addresses). null = unreadable.
+async function readDisabledCfgAnchors() {
+  let names;
+  try {
+    names = await fsp.readdir(PROXY_CFG_ROOT);
+  } catch (_error) {
+    return null;
+  }
+  const out = new Set();
+  for (const name of names) {
+    if (!/^3proxy_\d+\.cfg\.disabled$/.test(name)) continue;
+    let text;
+    try {
+      text = await fsp.readFile(path.join(PROXY_CFG_ROOT, name), "utf-8");
+    } catch (_error) {
+      return null;
+    }
+    for (const m of text.matchAll(/\s-e([0-9A-Fa-f:]+)/g)) out.add(m[1]);
+  }
+  return out;
+}
+
 function buildCfgPathForStartPort(startPort) {
   return path.join(PROXY_CFG_ROOT, `3proxy_${startPort}.cfg`);
 }
@@ -3096,6 +3171,7 @@ async function handleGenerate(req, res) {
   const credentialsPath = buildCredentialsListPath(params.startPort);
   let credentialsFileCreated = false;
   let jobReady = false;
+  let generatorStartedMs = 0; // set right before the generator runs
 
   try {
     await fsp.mkdir(jobDir, { recursive: true });
@@ -3387,6 +3463,7 @@ async function handleGenerate(req, res) {
       NODE_AGENT_MAP_CSV_PATH: mapCsvPath,
     };
 
+    generatorStartedMs = Date.now();
     const runResult = await runGenerator({
       scriptPath,
       args: effectiveArgs,
@@ -3634,6 +3711,15 @@ async function handleGenerate(req, res) {
       },
     });
   } finally {
+    // Audit N2 follow-up — a failed attempt leaves no running batch behind.
+    if (!jobReady && generatorStartedMs && jobMeta && jobMeta.status === "failed") {
+      try {
+        const parked = await parkFailedAttempt(params.startPort, generatorStartedMs);
+        if (parked.parked || parked.reason === "older_process") console.warn("[generate] failed attempt", { jobId, start_port: params.startPort, ...parked });
+      } catch (parkError) {
+        console.warn("[generate] parking the failed attempt failed", parkError && parkError.message ? parkError.message : String(parkError));
+      }
+    }
     // Audit N2 review — a ready batch is supervised at once (see markServing).
     if (jobReady) {
       try {
@@ -3868,6 +3954,9 @@ const supervisor = supervisorLib.createSupervisor({
   spawnCfg: (cfgPath) => proxySpawn.spawn3proxyCfg(cfgPath, { bin: path.join(PROXY_CFG_ROOT, "bin", "3proxy") }),
   isGenerationBusy: generationBusy,
   processLock: withProcessLock,
+  // Audit N2 follow-up — the orphan-anchor GC's keep-lists.
+  ownedAddresses: () => egress.ownedAddresses(),
+  readDisabledAnchors: readDisabledCfgAnchors,
 });
 
 // The live generation lock record (null when none / stale), for firewall.js.
@@ -4438,6 +4527,7 @@ module.exports = {
   firewall,
   generationBatchPorts,
   selectOccupiedBatchPorts,
+  parseEtime,
   evaluateProductProfileContract,
   buildProfileDiagnostics,
   nodeTuningStatus,

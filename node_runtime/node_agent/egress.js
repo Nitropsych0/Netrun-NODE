@@ -1887,6 +1887,11 @@ function createEgressService({
     view,
     handleHttp,
     isAvailable: () => ready,
+    // Audit N2 follow-up — every address this module provisions (currents,
+    // pool, draining) or still has on the NIC (leftovers of the NIC era): the
+    // supervisor's orphan-anchor GC never deletes one. null until init has
+    // run (the GC then deletes nothing).
+    ownedAddresses: () => (ready ? new Set([...addressesOf(state), ...nicLeftovers.keys()]) : null),
     // exit_guard: EGRESS_EXIT_GUARD; primary: what chain exit_guard lets in
     status: () => ({
       available: ready, reason, iface, prefix: prefix ? prefix.text : null, exit_guard: cfg.exitGuard, primary: primary.slice(),
@@ -1908,6 +1913,7 @@ module.exports = {
   createEgressService,
   start: () => defaultService().start(),
   isAvailable: () => defaultService().isAvailable(),
+  ownedAddresses: () => defaultService().ownedAddresses(),
   handleHttp: (...args) => defaultService().handleHttp(...args),
   forgetPorts: (ports) => defaultService().forgetPorts(ports),
   // exported for unit tests (pure, no fs / exec)

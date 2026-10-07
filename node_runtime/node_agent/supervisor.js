@@ -63,6 +63,20 @@
 //   IPv6 only: in dualstack egress (-64) IPv4 destinations leave from the
 //   node's single IPv4, which unbound and the agent share (audit FP-02).
 //
+//   deletes orphan anchors (NETRUN_ANCHOR_GC, default on): a regenerated,
+//   failed or deprovisioned batch's anchors used to stay on the NIC until a
+//   reboot, and every `ip address` operation costs O(addresses on the NIC) —
+//   on 2026-10-07 Chicago carried 48k addresses for 18k live anchors (~280 ms
+//   per operation, generations failed their egress check). An orphan is a
+//   global nodad address on the egress interface, not tentative, inside a /64
+//   of a live cfg anchor, that no *.cfg / *.cfg.disabled lists and the
+//   rotation module does not own (egress.ownedAddresses: currents, pool,
+//   draining, NIC leftovers). It must stay an orphan for
+//   NODE_AGENT_ANCHOR_GC_MIN_AGE_SEC (600) before it is deleted, at most
+//   NODE_AGENT_ANCHOR_GC_BATCH (500) per tick, under the process lock and
+//   never while a generation holds its lock. Nothing is deleted when the cfg
+//   inventory lists no anchor at all, or the rotation state is unknown.
+//
 // Status: GET /health `supervisor`, and NODE_AGENT_SUPERVISOR_STATUS_FILE
 // (/run/netrun/supervisor.json). NODE_AGENT_SUPERVISOR=0 turns it all off.
 
@@ -82,6 +96,8 @@ const DEFAULT_MAX_RESPAWNS_PER_HOUR = 5;
 const DEFAULT_SETTLE_SEC = 120;
 const DEFAULT_READD_BATCH = 2000;
 const DEFAULT_DEPRECATE_BATCH = 2000;
+const DEFAULT_GC_BATCH = 500;
+const DEFAULT_GC_MIN_AGE_SEC = 600;
 const HOUR_MS = 3600_000;
 const IFA_F_NODAD = 0x02;
 const IFA_F_DEPRECATED = 0x20;
@@ -140,6 +156,9 @@ function readSettings(env = process.env, settingOpts = {}) {
     deprecateAnchors: settingOn("NETRUN_ANCHOR_DEPRECATE", true, { env, ...settingOpts }),
     readdBatch: intEnv(env.NODE_AGENT_ANCHOR_READD_BATCH, DEFAULT_READD_BATCH, 1),
     deprecateBatch: intEnv(env.NODE_AGENT_ANCHOR_DEPRECATE_BATCH, DEFAULT_DEPRECATE_BATCH, 1),
+    gcOrphans: settingOn("NETRUN_ANCHOR_GC", true, { env, ...settingOpts }),
+    gcBatch: intEnv(env.NODE_AGENT_ANCHOR_GC_BATCH, DEFAULT_GC_BATCH, 1),
+    gcMinAgeSec: intEnv(env.NODE_AGENT_ANCHOR_GC_MIN_AGE_SEC, DEFAULT_GC_MIN_AGE_SEC, 0),
     iface: String(env.NETRUN_IPV6_IFACE || "").trim() || null,
   };
 }
@@ -250,6 +269,45 @@ function readdBatchText(addrs, iface, { deprecate = true } = {}) {
   return addrs.map((a) => `address add ${a}/128 dev ${iface} nodad${lft}`).join("\n") + "\n";
 }
 
+// Orphan anchors on the egress interface (see the header): { orphans, due,
+// skipped }. keepHex: hex of every address that must stay (the *.cfg.disabled
+// anchors, the rotation module's). since: Map hex -> first seen as an orphan
+// (updated here; entries that are no orphans any more are dropped).
+function planOrphanGc(cfgs, rows, { iface, keepHex = new Set(), nowMs, minAgeMs, since }) {
+  const live = new Set();
+  for (const c of Array.isArray(cfgs) ? cfgs : []) {
+    for (const a of c.egress || []) {
+      const hex = cfgStatus.ipv6ToHex(a);
+      if (hex) live.add(hex);
+    }
+  }
+  if (!iface) return { orphans: [], due: [], skipped: "no_iface" };
+  if (live.size === 0) {
+    since.clear();
+    return { orphans: [], due: [], skipped: "no_cfg_anchors" };
+  }
+  const prefixes = new Set([...live].map((h) => h.slice(0, 16)));
+  const orphans = [];
+  for (const [hex, r] of rows) {
+    if (r.ifname !== iface || r.scope !== 0) continue;
+    if (!(r.flags & IFA_F_NODAD) || (r.flags & IFA_F_TENTATIVE)) continue;
+    if (!prefixes.has(hex.slice(0, 16)) || live.has(hex) || keepHex.has(hex)) continue;
+    orphans.push({ hex, addr: hexToIpv6(hex), plen: r.plen, ifname: r.ifname });
+  }
+  const now = new Set(orphans.map((o) => o.hex));
+  for (const h of [...since.keys()]) if (!now.has(h)) since.delete(h);
+  const due = [];
+  for (const o of orphans) {
+    if (!since.has(o.hex)) since.set(o.hex, nowMs);
+    if (nowMs - since.get(o.hex) >= minAgeMs) due.push(o);
+  }
+  return { orphans, due, skipped: null };
+}
+
+function gcBatchText(items) {
+  return items.map((i) => `address del ${i.addr}/${i.plen} dev ${i.ifname}`).join("\n") + "\n";
+}
+
 function deprecateBatchText(items) {
   return items.map((i) => `address change ${i.addr}/${i.plen} dev ${i.ifname} nodad valid_lft forever preferred_lft 0`).join("\n") + "\n";
 }
@@ -341,6 +399,9 @@ function createSupervisor({
   exists = fs.existsSync,
   isGenerationBusy = async () => false,
   processLock = (fn) => fn(),
+  // Orphan-anchor GC inputs; either missing (null) = the GC deletes nothing.
+  ownedAddresses = null, // async () => Set of addresses (text) | null (unknown)
+  readDisabledAnchors = null, // async () => Set of anchor addresses (text) of *.cfg.disabled
   now = () => Date.now(),
   log = console,
   ifInet6Path = "/proc/net/if_inet6",
@@ -357,6 +418,7 @@ function createSupervisor({
   const forgotten = new Map();
   let forgetEpoch = 0;
   let orphansHeldLogged = false; // the "no preferred primary" warning, once per process
+  const orphanSince = new Map(); // orphan anchor hex -> first seen (ms)
   // The batches seen serving since boot, the respawn history of the last hour
   // and the failed marks survive an agent restart (a watchdog restart, an OOM
   // kill, a deploy): the status file lives on /run (tmpfs), so a reboot starts
@@ -401,6 +463,10 @@ function createSupervisor({
     anchorsPendingDeprecate: null,
     anchorsExpected: null,
     orphanAnchorsDeprecated: 0,
+    orphanAnchors: null,
+    orphanAnchorsRemoved: 0,
+    lastGcAt: null,
+    gcSkipped: null,
     preferredNodad: null,
     preferredNonNodad: null,
     iface: null,
@@ -590,7 +656,8 @@ function createSupervisor({
   }
 
   async function addressPhase(cfgs) {
-    if (!settings.readdAnchors && !settings.deprecateAnchors) return "anchors_off";
+    const gcOn = settings.gcOrphans && typeof ownedAddresses === "function" && typeof readDisabledAnchors === "function";
+    if (!settings.readdAnchors && !settings.deprecateAnchors && !gcOn) return "anchors_off";
     let rows;
     try {
       rows = parseIfInet6Rows(await readFile(ifInet6Path));
@@ -647,7 +714,60 @@ function createSupervisor({
     } else {
       stats.anchorsPendingDeprecate = null;
     }
+    if (settings.gcOrphans) await gcPhase(cfgs, rows, iface);
     return outcome;
+  }
+
+  // Orphan anchors (see the header). Never throws; the reason it deleted
+  // nothing goes to /health supervisor.gcSkipped.
+  async function gcPhase(cfgs, rows, iface) {
+    const skip = (why) => {
+      stats.gcSkipped = why;
+      return why;
+    };
+    if (typeof ownedAddresses !== "function" || typeof readDisabledAnchors !== "function") return skip("not_wired");
+    let owned;
+    let parked;
+    try {
+      owned = await ownedAddresses();
+      parked = await readDisabledAnchors();
+    } catch (err) {
+      return skip(`inputs_failed: ${(err && err.message) || err}`);
+    }
+    if (!owned) return skip("rotation_state_unknown");
+    if (!parked) return skip("disabled_cfgs_unreadable");
+    const keepHex = new Set();
+    for (const a of [...owned, ...parked]) {
+      const h = cfgStatus.ipv6ToHex(a);
+      if (h) keepHex.add(h);
+    }
+    const plan = planOrphanGc(cfgs, rows, {
+      iface,
+      keepHex,
+      nowMs: now(),
+      minAgeMs: settings.gcMinAgeSec * 1000,
+      since: orphanSince,
+    });
+    stats.orphanAnchors = plan.orphans.length;
+    if (plan.skipped) return skip(plan.skipped);
+    const take = plan.due.slice(0, settings.gcBatch);
+    if (take.length === 0) return skip(null);
+    // Under the process lock (a /generate waits for it at its start) and
+    // never while a generation holds its lock.
+    const res = await processLock(async () => {
+      if (await busy()) return null;
+      return ipBatch(gcBatchText(take), "gc");
+    });
+    if (!res) return skip("generation_in_progress");
+    for (const o of take) orphanSince.delete(o.hex);
+    stats.orphanAnchorsRemoved += take.length;
+    stats.orphanAnchors = Math.max(0, plan.orphans.length - take.length);
+    stats.lastGcAt = iso();
+    log.log(
+      `[supervisor] removed ${take.length} orphan anchor(s) from ${iface} (listed by no cfg, not the rotation's), ` +
+        `${stats.orphanAnchors} left; ip -batch exit ${res.code}, e.g. ${take.slice(0, 3).map((o) => o.addr).join(", ")}`
+    );
+    return skip(null);
   }
 
   // One write at a time (the tick, a respawn and forget() all write it);
@@ -821,6 +941,8 @@ module.exports = {
   readBootTimeMs,
   readdBatchText,
   deprecateBatchText,
+  planOrphanGc,
+  gcBatchText,
   IFA_F_DEPRECATED,
   IFA_F_NODAD,
 };

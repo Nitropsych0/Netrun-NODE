@@ -113,7 +113,7 @@ test("planAnchors: re-add only addresses of a /64 the node has; deprecate only n
 });
 
 // A fake node: cfg dir on disk, ps / ss / systemctl / ip answered from state.
-function fakeNode(name, { cfgs = {}, env = {}, nowMs = 10_000_000, bootTimeMs = () => Date.now() } = {}) {
+function fakeNode(name, { cfgs = {}, env = {}, nowMs = 10_000_000, bootTimeMs = () => Date.now(), gc = null } = {}) {
   const dir = path.join(TMP, name, "3proxy");
   fs.mkdirSync(dir, { recursive: true });
   for (const [file, text] of Object.entries(cfgs)) {
@@ -167,6 +167,7 @@ function fakeNode(name, { cfgs = {}, env = {}, nowMs = 10_000_000, bootTimeMs = 
     now: () => host.nowMs,
     log: quietLog,
     bootTimeMs, // default: every fixture cfg (mtime 1970) predates the boot
+    ...(gc ? { ownedAddresses: async () => gc.owned(), readDisabledAnchors: async () => gc.disabled() } : {}),
   });
   return { dir, host, supervisor, statusPath };
 }
@@ -565,4 +566,102 @@ test("tick: orphan anchors deprecated in the same batch; /health preferredNodad 
   assert.strictEqual(st.orphanAnchorsDeprecated, 1);
   assert.strictEqual(st.preferredNodad, 0);
   assert.strictEqual(st.preferredNonNodad, 1);
+});
+
+// ── orphan-anchor GC (audit N2 follow-up) ─────────────────────────────────
+
+test("planOrphanGc: only nodad, non-tentative addresses of the egress iface inside a live anchor /64, listed by no cfg and not kept, after the minimum age", () => {
+  const rows = sup.parseIfInet6Rows(
+    [
+      inet6Line("2001:db8:0:1:5400:6ff:febe:b5cf", { plen: 64, flags: 0x00 }), // primary (no nodad)
+      inet6Line("2001:db8:0:1::a"), // live anchor
+      inet6Line("2001:db8:0:1::e"), // orphan
+      inet6Line("2001:db8:0:1::f", { flags: 0xa2 }), // orphan, deprecated: still an orphan
+      inet6Line("2001:db8:0:1::7", { flags: 0xc2 }), // tentative
+      inet6Line("2001:db8:0:1::d"), // a *.cfg.disabled anchor (kept)
+      inet6Line("2001:db8:0:1::99"), // the rotation's leftover on the NIC (kept)
+      inet6Line("2001:db8:0:2::1"), // another /64: no live anchor there
+      inet6Line("2001:db8:0:1::5", { ifname: "wg0" }), // another interface
+    ].join("\n")
+  );
+  const keepHex = new Set(["2001:db8:0:1::d", "2001:db8:0:1::99"].map((a) => cfgStatus.ipv6ToHex(a)));
+  const since = new Map();
+  const cfgs = [{ egress: ["2001:db8:0:1::a"] }];
+  let p = sup.planOrphanGc(cfgs, rows, { iface: "enp1s0", keepHex, nowMs: 1000, minAgeMs: 600_000, since });
+  assert.deepStrictEqual(p.orphans.map((o) => o.addr).sort(), ["2001:db8:0:1:0:0:0:e", "2001:db8:0:1:0:0:0:f"]);
+  assert.deepStrictEqual(p.due, [], "first sighting: not due yet");
+  p = sup.planOrphanGc(cfgs, rows, { iface: "enp1s0", keepHex, nowMs: 601_000, minAgeMs: 600_000, since });
+  assert.deepStrictEqual(p.due.map((o) => o.addr).sort(), ["2001:db8:0:1:0:0:0:e", "2001:db8:0:1:0:0:0:f"]);
+  assert.strictEqual(sup.gcBatchText(p.due.slice(0, 1)).trim().startsWith("address del 2001:db8:0:1:0:0:0:"), true);
+  // A cfg lists ::e again (a regeneration took it back): no orphan any more, its clock resets.
+  p = sup.planOrphanGc([{ egress: ["2001:db8:0:1::a", "2001:db8:0:1::e"] }], rows, { iface: "enp1s0", keepHex, nowMs: 602_000, minAgeMs: 600_000, since });
+  assert.deepStrictEqual(p.due.map((o) => o.addr), ["2001:db8:0:1:0:0:0:f"]);
+  assert.ok(!since.has(cfgStatus.ipv6ToHex("2001:db8:0:1::e")));
+  // No live anchor at all (an empty / failed inventory read): nothing is ever an orphan.
+  p = sup.planOrphanGc([], rows, { iface: "enp1s0", keepHex, nowMs: 900_000, minAgeMs: 0, since });
+  assert.deepStrictEqual([p.orphans, p.due, p.skipped], [[], [], "no_cfg_anchors"]);
+  assert.strictEqual(since.size, 0);
+});
+
+test("tick: orphan anchors are deleted after the minimum age, in batches, never the rotation's / a disabled cfg's; /health counters", async () => {
+  const owned = new Set(["2001:db8:0:1::99"]);
+  const { host, supervisor } = fakeNode("gc", {
+    cfgs: { "3proxy_18100.cfg": CFG(18100, "2001:db8:0:1::a") },
+    env: { NETRUN_ANCHOR_DEPRECATE: "0", NODE_AGENT_ANCHOR_GC_BATCH: "1" },
+    gc: { owned: () => owned, disabled: () => new Set(["2001:db8:0:1::d"]) },
+  });
+  host.listening = new Set([18100]);
+  host.ifInet6 = [
+    inet6Line("2001:db8:0:1:5400:6ff:febe:b5cf", { plen: 64, flags: 0x00 }),
+    inet6Line("2001:db8:0:1::a"),
+    inet6Line("2001:db8:0:1::e"),
+    inet6Line("2001:db8:0:1::f"),
+    inet6Line("2001:db8:0:1::d"),
+    inet6Line("2001:db8:0:1::99"),
+  ].join("\n");
+  await supervisor.tick();
+  assert.deepStrictEqual(host.batches.filter((b) => b.includes("address del")), [], "first sighting: nothing deleted");
+  assert.strictEqual(supervisor.status().orphanAnchors, 2);
+  host.nowMs += 601_000;
+  await supervisor.tick();
+  let dels = host.batches.filter((b) => b.includes("address del"));
+  assert.strictEqual(dels.length, 1);
+  assert.strictEqual(dels[0].trim().split("\n").length, 1, "NODE_AGENT_ANCHOR_GC_BATCH=1");
+  assert.ok(/address del 2001:db8:0:1:0:0:0:[ef]\/128 dev enp1s0/.test(dels[0]), dels[0]);
+  await supervisor.tick();
+  dels = host.batches.filter((b) => b.includes("address del")).join("");
+  assert.ok(!/:a\/|:d\/|:99\/|b5cf/.test(dels), `never a live / disabled / rotation / primary address: ${dels}`);
+  assert.strictEqual(supervisor.status().orphanAnchorsRemoved, 2);
+  // A generation holds the lock: nothing.
+  host.ifInet6 += `\n${inet6Line("2001:db8:0:1::77")}`;
+  host.nowMs += 601_000;
+  await supervisor.tick(); // first sighting of ::77
+  host.nowMs += 601_000;
+  host.busy = true;
+  const before = host.batches.length;
+  await supervisor.tick();
+  assert.strictEqual(host.batches.length, before, "no ip -batch while a generation holds its lock");
+});
+
+test("tick: the GC deletes nothing while the rotation state is unknown, the disabled cfgs are unreadable, or it is not wired / switched off", async () => {
+  const lines = [inet6Line("2001:db8:0:1::a"), inet6Line("2001:db8:0:1::e")].join("\n");
+  const cases = [
+    { name: "gc-owned-null", gc: { owned: () => null, disabled: () => new Set() }, env: {}, skipped: "rotation_state_unknown" },
+    { name: "gc-disabled-null", gc: { owned: () => new Set(), disabled: () => null }, env: {}, skipped: "disabled_cfgs_unreadable" },
+    { name: "gc-not-wired", gc: null, env: {}, skipped: "not_wired" },
+    { name: "gc-off", gc: { owned: () => new Set(), disabled: () => new Set() }, env: { NETRUN_ANCHOR_GC: "0" }, skipped: null },
+  ];
+  for (const c of cases) {
+    const { host, supervisor } = fakeNode(c.name, {
+      cfgs: { "3proxy_18100.cfg": CFG(18100, "2001:db8:0:1::a") },
+      env: { NETRUN_ANCHOR_DEPRECATE: "0", NODE_AGENT_ANCHOR_GC_MIN_AGE_SEC: "0", ...c.env },
+      gc: c.gc,
+    });
+    host.listening = new Set([18100]);
+    host.ifInet6 = lines;
+    await supervisor.tick();
+    await supervisor.tick();
+    assert.deepStrictEqual(host.batches.filter((b) => b.includes("address del")), [], c.name);
+    assert.strictEqual(supervisor.status().gcSkipped, c.skipped, c.name);
+  }
 });

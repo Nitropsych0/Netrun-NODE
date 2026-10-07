@@ -144,6 +144,30 @@ Every `NODE_AGENT_SUPERVISOR_INTERVAL_SEC` (60; first run after
 `NODE_AGENT_SUPERVISOR=0` turns it off. `netrun-ipv6-restore.sh` now exits 1 (loudly)
 when it finds no IPv6 interface instead of exiting 0.
 
+### Orphan anchors and failed attempts (incident 2026-10-07)
+
+A regenerated, failed or deprovisioned batch's anchors used to stay on the NIC
+until a reboot. Every `ip address` operation costs O(addresses on the NIC): on
+2026-10-07 Chicago carried 48k addresses for 18k live anchors (~280 ms per
+operation), so new batches took 11+ min and failed their IPv6 egress check.
+
+- **Orphan GC** (supervisor, `NETRUN_ANCHOR_GC`, default on): deletes a global
+  `nodad` address of the egress interface, not tentative, inside a /64 of a live
+  cfg anchor, that no `*.cfg` / `*.cfg.disabled` lists and the rotation module
+  does not own (currents, pool, draining, NIC leftovers). It must be an orphan
+  for `NODE_AGENT_ANCHOR_GC_MIN_AGE_SEC` (600) first; at most
+  `NODE_AGENT_ANCHOR_GC_BATCH` (500) per tick, under the process lock, never
+  during a generation. Nothing is deleted while the cfg inventory lists no
+  anchor, the rotation state is unknown, or the disabled cfgs are unreadable
+  (`/health supervisor.gcSkipped`). Counters: `orphanAnchors`,
+  `orphanAnchorsRemoved`, `lastGcAt`. The primary (no `nodad`) is never touched.
+- **Failed attempts** (`NODE_AGENT_PARK_FAILED_ATTEMPTS`, default on): a
+  `/generate` that ends `failed` after its generator wrote the cfg stops the
+  3proxy it started (only processes younger than the generator run — an older
+  one means another batch, and nothing is touched), renames the cfg to
+  `3proxy_<p>.cfg.failed` (never restored at boot) and removes its start-up
+  script and address list; its anchors go with the orphan GC.
+
 ### Node-originated traffic leaves from the primary IPv6 (FP-01)
 
 Every anchor is added with `preferred_lft 0` (generator, boot restore, supervisor; the
