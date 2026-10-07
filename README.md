@@ -235,7 +235,8 @@ curl "http://127.0.0.1:8085/egress?ports=32001,32002"
 ```
 
 Mutations answer 200 `{ok, items:[{port, ok, anchor, mode, old_ipv6, new_ipv6, error}]}`:
-`mode` is `static` / `per_connection` / `null` after the call, `new_ipv6` is the egress
+`mode` is `static` (a rotated address) / `per_connection` / `null` (the anchor — `mode
+static` without a rotation leaves no entry, like `reset`) after the call, `new_ipv6` is the egress
 of new connections (`null` = the anchor, `"pool"` = per connection), `old_ipv6` the same
 before the call, `error` one of `port_not_found`, `anchor_not_found`,
 `address_add_failed`, `address_budget_exceeded` (the node is at

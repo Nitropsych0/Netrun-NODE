@@ -286,7 +286,8 @@ test("mode static / reset; the last per_connection port leaves the pool idle, no
     { pool: [P1, P2], pool_refreshed_at: iso(NOW - 1000) }
   );
   const one = call(before, "mode", [30000], { mode: "static", drainSec: 0 });
-  assert.deepStrictEqual(one.items[0], { port: 30000, ok: true, anchor: A, mode: "static", old_ipv6: "pool", new_ipv6: null, error: null });
+  assert.deepStrictEqual(one.items[0], { port: 30000, ok: true, anchor: A, mode: null, old_ipv6: "pool", new_ipv6: null, error: null });
+  assert.strictEqual(one.state.ports["30000"], undefined, "static without an address forgets the port");
   assert.deepStrictEqual(one.state.pool, [P1, P2], "30001 still uses the pool");
 
   const two = call(one.state, "reset", [30001, 30002, 31000, 39999], { drainSec: 0 });
@@ -296,7 +297,7 @@ test("mode static / reset; the last per_connection port leaves the pool idle, no
     [31000, true, null, null, null, null], // never had state: reset is idempotent
     [39999, true, null, null, null, null], // no cfg either
   ]);
-  assert.deepStrictEqual(two.state.ports, { 30000: { anchor: A, current: null, mode: "static" } });
+  assert.deepStrictEqual(two.state.ports, {});
   assert.deepStrictEqual(two.state.pool, [P1, P2], "kept: a switch back reuses it");
   assert.strictEqual(two.state.pool_refreshed_at, iso(NOW - 1000));
   assert.strictEqual(two.state.pool_idle_since, iso(NOW));

@@ -406,6 +406,9 @@ function sanitizeState(raw) {
     const anchor = normalizeIpv6(v.anchor);
     if (!anchor) continue;
     const current = v.mode === "static" && v.current ? normalizeIpv6(v.current) : null;
+    // a static entry without a current address says nothing the anchor
+    // doesn't (files from before static-means-forget kept such entries)
+    if (v.mode === "static" && !current) continue;
     s.ports[String(port)] = { anchor, current, mode: v.mode };
   }
   s.pool = [...new Set((Array.isArray(raw.pool) ? raw.pool : []).map(normalizeIpv6).filter(Boolean))];
@@ -481,9 +484,11 @@ function applyCall(state, plan, ctx) {
         if (addr) entry = { anchor: step.anchor, current: addr, mode: "static" };
         else item.error = refused.has(step.port) ? ERR_ADDRESS_BUDGET : ERR_ADDRESS_ADD_FAILED;
       } else if (op === "mode") {
+        // static: back to the anchor until the next rotate — the port has
+        // nothing left to remember, so the entry goes (like reset)
         if (mode === "per_connection" && next.pool.length === 0) {
           item.error = poolRefused ? ERR_ADDRESS_BUDGET : ERR_ADDRESS_ADD_FAILED;
-        } else entry = { anchor: step.anchor, current: null, mode };
+        } else if (mode === "per_connection") entry = { anchor: step.anchor, current: null, mode };
       }
       if (!item.error) {
         if (step.raw && step.raw.current) {

@@ -487,7 +487,7 @@ test("per_connection: lazy pool of EGRESS_POOL_SIZE, dyn set, back to static, id
 
   await svc.setMode([30000, 30001], "static", { drainSec: 0 });
   assert.deepStrictEqual(svc.snapshot().pool, s1.pool, "30002 still uses the pool");
-  assert.deepStrictEqual(svc.view([30000]).items, [{ port: 30000, anchor: ANCHOR[30000], current: null, mode: "static" }]);
+  assert.deepStrictEqual(svc.view([30000]).items, [{ port: 30000, anchor: ANCHOR[30000], current: null, mode: null }]);
   assertConsistent(host, svc, root, "static");
 
   clock.t += 5000;
