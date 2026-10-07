@@ -566,4 +566,13 @@ else
   echo "skip: no real haproxy (NETRUN_TEST_HAPROXY) — section 8"
 fi
 
+# A fresh box's unattended-upgrades holds the dpkg lock at first boot: every
+# apt-get in the setup waits for it (Johannesburg, 2026-10-08: HTTPS setup failed).
+apt_lines="$(grep -E '^[^#]*apt-get ' "$HTTPS" || true)"
+[ -n "$apt_lines" ] || fail "netrun-https.sh: no apt-get found (test out of date?)"
+if printf '%s\n' "$apt_lines" | grep -v 'DPkg::Lock::Timeout' | grep -q .; then
+  printf '%s\n' "$apt_lines"; fail "netrun-https.sh: apt-get without -o DPkg::Lock::Timeout"
+fi
+ok "setup: every apt-get waits for the dpkg lock (unattended-upgrades at first boot)"
+
 echo "test_https_hostnames.sh — all $PASS checks passed"

@@ -1235,7 +1235,14 @@ cmd_units() {
 
 cmd_setup() {
   export DEBIAN_FRONTEND=noninteractive
-  command -v haproxy >/dev/null 2>&1 || { apt-get update -q >/dev/null; apt-get install -y -q haproxy >/dev/null; }
+  # A fresh box runs unattended-upgrades at first boot: wait for the dpkg lock
+  # (up to NETRUN_APT_LOCK_WAIT_SEC, 600) instead of failing at once — that
+  # left an auto-bought node without the HTTPS frontend (Johannesburg, 2026-10-08).
+  local lockwait="${NETRUN_APT_LOCK_WAIT_SEC:-600}"
+  command -v haproxy >/dev/null 2>&1 || {
+    apt-get -o DPkg::Lock::Timeout="$lockwait" update -q >/dev/null
+    apt-get -o DPkg::Lock::Timeout="$lockwait" install -y -q haproxy >/dev/null
+  }
   install_lego
   install -m 0755 "$0" "$SELF" 2>/dev/null || true
   install -d -m 0755 "$FRONTEND_DIR"
