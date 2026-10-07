@@ -732,11 +732,37 @@ haproxy_check_crt() {
   return 1
 }
 
+# The running haproxy master's command line ("" when unknown).
+haproxy_master_cmdline() {
+  local pid
+  pid="$(systemctl show -p MainPID --value haproxy 2>/dev/null || true)"
+  case "$pid" in ''|0|*[!0-9]*) return 0 ;; esac
+  [ -r "/proc/$pid/cmdline" ] || return 0
+  tr '\0' ' ' < "/proc/$pid/cmdline"
+}
+
+# A reload re-executes the master with ITS OWN argv: a haproxy that was
+# started before the netrun drop-in (EXTRAOPTS -f $FRONTEND_DIR) existed —
+# `apt-get install haproxy` starts it at once on a fresh box — never loads the
+# frontends, however often it is reloaded (Johannesburg, 2026-10-08: every
+# HTTP port down after the setup moved the listeners behind it). Such a master
+# is restarted once instead; never while the drop-in is missing (that would
+# restart it on every sync).
 reload_haproxy() {
   haproxy_check_crt "$FRONTEND_DIR" || die "haproxy config check failed"
   if systemctl is-active --quiet haproxy; then
-    systemctl reload haproxy
+    local cmdline
+    cmdline="$(haproxy_master_cmdline)"
+    if [ -n "$cmdline" ] && ! printf '%s' "$cmdline" | grep -qF -- "$FRONTEND_DIR" \
+       && grep -qsF -- "$FRONTEND_DIR" "$SYSTEMD_DIR/haproxy.service.d/netrun.conf"; then
+      log "haproxy runs without $FRONTEND_DIR (started before the netrun drop-in) — restarting it once"
+      systemctl daemon-reload
+      systemctl restart haproxy
+    else
+      systemctl reload haproxy
+    fi
   else
+    systemctl daemon-reload
     systemctl enable --now haproxy >/dev/null
   fi
 }
@@ -1251,6 +1277,11 @@ cmd_setup() {
   write_base_config
   # Certificate first: the sync timer fires as soon as it is enabled.
   issue_or_renew
+  # The units and haproxy's drop-in (EXTRAOPTS -f $FRONTEND_DIR) BEFORE the
+  # first sync: its reload then sees a master started without the frontends
+  # (apt-get started it) and restarts it once. The timers are enabled last.
+  write_units
+  systemctl daemon-reload
   # An unverified first reload must not keep the timers (the retry) away.
   cmd_sync || log "WARNING: first sync not verified — the sync timer retries"
   install_units

@@ -566,6 +566,35 @@ else
   echo "skip: no real haproxy (NETRUN_TEST_HAPROXY) — section 8"
 fi
 
+# A haproxy master started before the netrun drop-in (apt-get starts it on a
+# fresh box) never loads $FRONTEND_DIR on reload: restart it once, never in a
+# loop when the drop-in is missing (Johannesburg, 2026-10-08).
+(
+  eval "$(sed -n '/^reload_haproxy() {/,/^}/p' "$HTTPS")"
+  log() { :; }; die() { echo "DIE $*"; exit 3; }
+  haproxy_check_crt() { return 0; }
+  CALLS="$TMP/reload_calls"
+  systemctl() { if [ "${1:-} ${2:-}" = "is-active --quiet" ]; then return 0; fi; echo "$*" >> "$CALLS"; }
+  FRONTEND_DIR=/etc/haproxy/netrun.d
+  SYSTEMD_DIR="$TMP/sysd"; mkdir -p "$SYSTEMD_DIR/haproxy.service.d"
+  printf '[Service]\nEnvironment="EXTRAOPTS=-S /run/haproxy-master.sock -f /etc/haproxy/netrun.d"\n' > "$SYSTEMD_DIR/haproxy.service.d/netrun.conf"
+  : > "$CALLS"; haproxy_master_cmdline() { echo "/usr/sbin/haproxy -Ws -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid"; }
+  reload_haproxy
+  [ "$(tr '\n' '|' < "$CALLS")" = "daemon-reload|restart haproxy|" ] || { cat "$CALLS"; echo "no restart for a master without the frontends"; exit 1; }
+  : > "$CALLS"; haproxy_master_cmdline() { echo "/usr/sbin/haproxy -Ws -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/netrun.d"; }
+  reload_haproxy
+  [ "$(tr '\n' '|' < "$CALLS")" = "reload haproxy|" ] || { cat "$CALLS"; echo "a healthy master must only be reloaded"; exit 1; }
+  rm -f "$SYSTEMD_DIR/haproxy.service.d/netrun.conf"
+  : > "$CALLS"; haproxy_master_cmdline() { echo "/usr/sbin/haproxy -Ws -f /etc/haproxy/haproxy.cfg"; }
+  reload_haproxy
+  [ "$(tr '\n' '|' < "$CALLS")" = "reload haproxy|" ] || { cat "$CALLS"; echo "no drop-in: never a restart loop"; exit 1; }
+) || fail "reload_haproxy: restart a master started without the frontend dir"
+body="$(sed -n '/^cmd_setup() {/,/^}/p' "$HTTPS")"
+wu="$(printf '%s\n' "$body" | grep -n '^  write_units$' | head -1 | cut -d: -f1)"
+cs="$(printf '%s\n' "$body" | grep -n 'cmd_sync' | head -1 | cut -d: -f1)"
+[ -n "$wu" ] && [ -n "$cs" ] && [ "$wu" -lt "$cs" ] || fail "cmd_setup: the units / haproxy drop-in must be written before the first sync"
+ok "haproxy started before the drop-in is restarted once (never looped); setup writes the drop-in before the first sync"
+
 # A fresh box's unattended-upgrades holds the dpkg lock at first boot: every
 # apt-get in the setup waits for it (Johannesburg, 2026-10-08: HTTPS setup failed).
 apt_lines="$(grep -E '^[^#]*apt-get ' "$HTTPS" || true)"
