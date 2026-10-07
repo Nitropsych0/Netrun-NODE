@@ -53,6 +53,21 @@ Expected health state:
 }
 ```
 
+Wave FLEET-HEALTH additive fields (every older field is unchanged):
+
+| Field | Meaning |
+|---|---|
+| `cfgs` | `[{startPort, count, listening, pid}]` per active `3proxy_<start>.cfg` (`*.cfg.disabled` excluded). `listening` = the cfg's FIRST socks port is bound (after a `/deprovision` rewrite the file's start port may no longer be served); `null` when the port probe failed. `pid` = its 3proxy or `null`. At most 500 items (`cfgsTotal`, `cfgsTruncated`). |
+| `cfgsDown` | how many cfgs are not listening (`null` = unknown) |
+| `cfgsWithoutProcess` | `[{startPort, cfgPath}]` — cfgs with no 3proxy process (from the cfg files on disk; `/reconcile` is no longer needed for this) |
+| `ipv6Addresses` | `{ok, expected, present, missing, missingSample, source, checkedAt, ttlSec}` — distinct `-e` addresses of the active cfgs vs those the kernel holds (`/proc/net/if_inet6`, any interface); recomputed at most every `NODE_AGENT_IPV6_COVERAGE_TTL_SEC` (60) |
+| `cfgsError` | why the cfg directory could not be read, else `null` |
+
+`proxyReady` / `proxyReadiness` probe each instance on the same first socks port.
+The agent binds `NODE_AGENT_HOST` (default `0.0.0.0`; the unit template has always
+set it, nothing read it, so it used to answer on `[::]` = every customer exit IPv6).
+`NODE_AGENT_HOST=::` restores the old bind.
+
 ## Self-describe (for orchestrator enroll)
 
 ```bash
@@ -90,7 +105,92 @@ bash scripts/apply_capacity_tuning.sh --apply    # sysctl range, unbound reload,
 ```
 
 Tests: `bash scripts/test_apply_capacity_tuning.sh`, `bash scripts/test_capacity_18k_node.sh`,
-`bash node_runtime/soft/generator/test_capacity_18k.sh`, `cd node_runtime/node_agent && node --test`.
+`bash scripts/test_fleet_health_node.sh`, `bash node_runtime/soft/generator/test_capacity_18k.sh`,
+`bash node_runtime/soft/generator/test_fleet_health.sh`, `cd node_runtime/node_agent && node --test`.
+
+### Conntrack ceiling that survives reboots
+
+`net.netfilter.*` keys exist only once `nf_conntrack` is loaded, and `systemd-sysctl`
+runs early in boot, before nftables loads the module lazily — so the
+`nf_conntrack_max = 1048576` in `99-netrun.conf` was skipped at every reboot and the
+kernel default won (65536 on a 1–4 GB box; the live Chicago node ran with 65536).
+`install_node_v2.sh` / `node_followup_v2.sh` now write
+`/etc/modules-load.d/netrun-conntrack.conf` (`nf_conntrack`, loaded before
+`systemd-sysctl`, which is ordered `After=systemd-modules-load.service`) and
+`/etc/udev/rules.d/90-netrun-conntrack.rules` (re-applies `net.netfilter.*` whenever the
+module loads), and size the value by RAM: one entry per 8 KB, rounded down to a power
+of two, 65536..1048576 (`NETRUN_CONNTRACK_MAX` overrides). An entry is ~300–350 B of
+slab, so a full table stays under ~4 % of RAM — 2c/4GB → **262144** (~85 MB only when
+full; ~130k concurrent proxied flows incl. TIME_WAIT, each flow = client leg + upstream
+leg). The hash keeps the kernel default (65536 buckets): 4 entries per bucket when full.
+
+Existing nodes (opt-in, NOT in the default step list; never lowers a higher runtime
+value, never flushes):
+
+```bash
+bash scripts/apply_capacity_tuning.sh --only conntrack            # dry-run
+bash scripts/apply_capacity_tuning.sh --apply --only conntrack    # [--conntrack-max N]
+```
+
+The `nf_conntrack_tcp_timeout_established = 7200` already in `99-netrun.conf` also
+starts to apply at boot (it was skipped too); 3proxy closes idle connections after
+1800 s, so no proxied connection is affected.
+
+## /generate: explicit credentials, reclaim list (Wave FLEET-HEALTH)
+
+Optional request fields (absent = exactly the old behaviour):
+
+- `credentials`: one entry per proxy, in port order — `"login:password"` strings or
+  `[login, password]` pairs, each part `[A-Za-z0-9]{1,32}`, logins unique, length =
+  `proxyCount`; otherwise **400 `invalid_credentials`**. Under the generation lock the
+  agent writes `random_users_<startPort>.list` atomically (tmp + fsync + rename, mode
+  0600), which the generator reuses instead of drawing random ones. A file that already
+  exists with OTHER content → **409 `credentials_conflict`** (same content = fine,
+  idempotent retry); so does reusing an already-running batch whose credentials differ.
+  A file this request created is removed again when the job fails before a cfg exists.
+  Only the count is logged / stored in `job.json`.
+- `freshAddresses: true`: deletes `ipv6_<startPort>.list` before the generator runs (no
+  stale address list is reused).
+- `reclaimStartPorts: [int]`: start ports of released batches the agent may kill if one
+  of their 3proxy still listens inside the new socks / http range. With the field
+  present (even `[]`) kill-on-rebind is strict: an overlapping 3proxy whose start port
+  is not listed is never killed — the job answers 200
+  `{success:false, status:"failed", error:"ports_in_use", detail:[{startPort, pid, cfg}]}`
+  and nothing is touched. Malformed → 400 `invalid_reclaim_start_ports`. Without the
+  field (older orchestrators) the old kill-everything-overlapping behaviour stays,
+  unless `NODE_AGENT_REBIND_POLICY=refuse`.
+
+Every batch kill-on-rebind tears down now loses ALL its per-start-port files (cfg,
+`cfg.disabled`, `proxy-startup_<p>.sh`, `ipv6_<p>.list`, `random_users_<p>.list`,
+`running_server_<p>.info`) and its egress rotation state — before, the pid→cfg lookup
+ran after the kill (no file was ever removed), and a later batch at that start port
+reused the old addresses AND the old credentials.
+
+Job directories: `/opt/netrun/jobs` keeps the newest `NODE_AGENT_JOBS_KEEP` (200; 0 =
+off) plus the running generation's, any queued/running job updated within 30 min and
+the newest ready job of every start port that still has a cfg (the "reuse a running
+instance" path). Pruned after each generation and a minute after start.
+
+## Accounting robustness (Wave FLEET-HEALTH)
+
+- The `nft -j list counters` dump runs with a 20 s timeout
+  (`NODE_AGENT_NFT_DUMP_TIMEOUT_MS`; was execCapture's 5 s SIGKILL) and is parsed ONCE
+  per poll cycle into `Map(port → counters)`; every 100-port chunk is served from it.
+- Opt-in `NETRUN_ACCOUNTING_MATCH_IPV4=1` in `/etc/netrun/netrun.env` (`KEY=VALUE`
+  lines, read by the generator and by `netrun-https`; an environment variable of the same
+  name wins, for one-off runs — do not set it only in the agent unit, the 5-min sync
+  would converge the rule back; default 0): the two counter map rules also match the
+  public IPv4 —
+  `iifname != "lo" ip daddr <v4> counter name tcp dport map @cmap_in` /
+  `oifname != "lo" ip saddr <v4> counter name tcp sport map @cmap_out` — so an
+  upstream leg whose ephemeral port equals a proxy port is never billed to that proxy
+  (the overlap that `ip_local_port_range 10000 65000` caused). New nodes get it from the
+  generator's first batch; existing nodes converge with `netrun-https accounting` (also
+  run by every `netrun-https sync`): only the rule is replaced by handle — counters and
+  map elements (the billing values) are untouched; setting it back to 0 converges back.
+  In the dualstack egress mode an IPv4 upstream leg also leaves from the public IPv4, so
+  there the ephemeral range below 8100 (`apply_capacity_tuning.sh --only sysctl`) remains
+  the guard.
 
 ## Pay-per-GB endpoints (Wave B-8.1)
 

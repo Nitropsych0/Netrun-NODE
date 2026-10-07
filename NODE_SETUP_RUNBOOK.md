@@ -50,7 +50,7 @@ REMOTE
 |---|---|
 | `disable_ufw` (apt purge) | UFW при boot ставит default-deny → блокирует 8085 + proxy-порты. Убираем навсегда. |
 | `pin_dns_resolvers` + `chattr +i` | Vultr regional DNS ненадёжен (особенно Mumbai). Пинимся на 1.1.1.1/8.8.8.8, лочим immutable. |
-| `configure_sysctl` | `pid_max=4M`, `threads-max=4M`, `nf_conntrack_max=1M`, `somaxconn=8192` в `99-netrun.conf`. Дефолтные 65536 не держат 4000+ 3proxy → fork EAGAIN. **Делает `modprobe nf_conntrack` перед `sysctl -p`** (на чистой ноде модуль не загружен). **Плюс пишет `98-netrun-ipv6.conf`** (DAD off + `mld_max_msf=1`) — снижает MLD-нагрузку от тысяч IPv6; имя 98- чтобы `node_followup_v2.sh` (перезаписывает только 99-) его не затирал. |
+| `configure_sysctl` | `pid_max=4M`, `threads-max=4M`, `somaxconn=8192` в `99-netrun.conf`; `nf_conntrack_max` по RAM (1 запись на 8 КБ, степень двойки, 65536..1048576: 2c/4GB → 262144, ~85 МБ при полной таблице) + `/etc/modules-load.d/netrun-conntrack.conf` и udev-правило `90-netrun-conntrack.rules`, чтобы значение переживало reboot (раньше `systemd-sysctl` отрабатывал до загрузки `nf_conntrack` и ядро оставляло дефолт 65536). Дефолтные 65536 не держат 4000+ 3proxy → fork EAGAIN. **Делает `modprobe nf_conntrack` перед `sysctl -p`** (на чистой ноде модуль не загружен). **Плюс пишет `98-netrun-ipv6.conf`** (DAD off + `mld_max_msf=1`) — снижает MLD-нагрузку от тысяч IPv6; имя 98- чтобы `node_followup_v2.sh` (перезаписывает только 99-) его не затирал. |
 | `install_trend_monitor` | `/opt/netrun/scripts/trend_monitor.sh` + cron `*/5` (`/etc/cron.d/netrun-trend-monitor`) — логгер метрик в `/var/log/netrun-trend.log` (см. §5). Раньше ручной шаг. |
 | `configure_file_limits` | `nofile=1M`, `nproc=unlimited` + `DefaultTasksMax=infinity` в `/etc/systemd/system.conf.d/`. |
 | `install_systemd_service` | node-agent на :8085 **с drop-in override** `/etc/systemd/system/netrun-node-agent.service.d/99-netrun-limits.conf` → `TasksMax=infinity` (НЕ через sed — он ломается на `\n`). |
@@ -75,7 +75,7 @@ echo "/health:    $(curl -s -m 5 -o /dev/null -w %{http_code} http://127.0.0.1:8
 echo "TasksMax:   $(systemctl show netrun-node-agent -p TasksMax --value)"
 echo "symlink:    $(readlink /root/proxyserver || echo NOT-A-SYMLINK)"
 echo "pid_max:    $(cat /proc/sys/kernel/pid_max)"
-echo "conntrack:  $(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+echo "conntrack:  $(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null) (boot: $(cat /etc/modules-load.d/netrun-conntrack.conf 2>/dev/null | grep -c '^nf_conntrack$'))"
 echo "watchdog:   $(systemctl is-active netrun-watchdog.timer)"
 echo "restore:    $(systemctl is-enabled netrun-3proxy-restore.service)"
 echo "ufw:        $(command -v ufw >/dev/null && echo PRESENT-BAD || echo absent-ok)"
@@ -88,7 +88,7 @@ REMOTE
 TasksMax:   infinity
 symlink:    /opt/netrun/proxyserver
 pid_max:    4194304
-conntrack:  1048576
+conntrack:  262144 (boot: 1)      # 2c/4GB; 131072 на 2 GB, 524288 на 8 GB
 watchdog:   active
 restore:    enabled
 ufw:        absent-ok

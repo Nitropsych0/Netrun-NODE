@@ -22,6 +22,8 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-netrun.conf"
 SYSCTL_IPV6_FILE="/etc/sysctl.d/98-netrun-ipv6.conf"
 LIMITS_FILE="/etc/security/limits.d/99-netrun.conf"
+CONNTRACK_MODULES_FILE="/etc/modules-load.d/netrun-conntrack.conf"
+CONNTRACK_UDEV_RULE="/etc/udev/rules.d/90-netrun-conntrack.rules"
 RESOLV_CONF="/etc/resolv.conf"
 RESTORE_SERVICE_NAME="netrun-3proxy-restore"
 RESTORE_SERVICE_FILE="/etc/systemd/system/${RESTORE_SERVICE_NAME}.service"
@@ -153,6 +155,57 @@ install_runtime_files() {
   chmod +x "$NETRUN_HOME/scripts/"*.sh
 }
 
+# Wave FLEET-HEALTH — conntrack ceiling sized by RAM and applied at EVERY boot.
+# The net.netfilter.* keys exist only once nf_conntrack is loaded, and
+# systemd-sysctl runs early in boot, before nftables loads the module lazily:
+# the 99-netrun.conf value was skipped at each reboot and the kernel default
+# won (65536 on a 1-4 GB box — the live Chicago node ran with 65536 although
+# this installer had set 1048576). Fix: load nf_conntrack from modules-load.d
+# (systemd-sysctl.service is ordered After=systemd-modules-load.service) and a
+# udev rule that re-applies net.netfilter.* whenever the module is (re)loaded.
+# Value: one entry per 8 KB of RAM, rounded down to a power of two, clamped to
+# 65536..1048576 (NETRUN_CONNTRACK_MAX overrides). An entry is ~300-350 B of
+# slab (nf_conn + NAT/acct extensions), so a FULL table stays under ~4 % of
+# RAM: 2c/4GB (MemTotal ~3.8 GiB) -> 262144 = ~85 MB worst case, 4x the boot
+# default, ~130k concurrent proxied flows (client + upstream leg, TIME_WAIT
+# included) vs the 2k-7k active connections an 18k node is sized for. The
+# hash keeps the kernel default (65536 buckets at 1-4 GB): 4 entries per
+# bucket when full, the historical kernel ratio. Memory is only used by live
+# entries; the ceiling only decides when the kernel starts dropping new flows.
+conntrack_max_for_mem_kb() {
+  local kb="${1:-0}" v=65536
+  case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+  while [ "$v" -lt 1048576 ] && [ $((v * 2)) -le $((kb / 8)) ]; do v=$((v * 2)); done
+  echo "$v"
+}
+
+# KEY VALUE into $SYSCTL_FILE: replaced in place or appended (other lines kept).
+set_sysctl_kv() {
+  local key="$1" value="$2" ek tmp
+  ek="$(printf '%s' "$key" | sed 's/[.]/\\./g')"
+  if grep -Eq "^[[:space:]]*${ek}[[:space:]]*=" "$SYSCTL_FILE"; then
+    tmp="$(mktemp)"
+    sed -E "s|^[[:space:]]*${ek}[[:space:]]*=.*$|${key} = ${value}|" "$SYSCTL_FILE" > "$tmp" && cat "$tmp" > "$SYSCTL_FILE"
+    rm -f "$tmp"
+  else
+    printf '%s = %s\n' "$key" "$value" >> "$SYSCTL_FILE"
+  fi
+}
+
+configure_conntrack_persistence() {
+  local mem_kb max
+  mem_kb="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || true)"
+  max="${NETRUN_CONNTRACK_MAX:-$(conntrack_max_for_mem_kb "$mem_kb")}"
+  log "conntrack: nf_conntrack_max = $max (MemTotal ${mem_kb:-?} kB), module loaded at boot before systemd-sysctl"
+  mkdir -p "$(dirname "$CONNTRACK_MODULES_FILE")" "$(dirname "$CONNTRACK_UDEV_RULE")"
+  printf '# NETRUN — load conntrack before systemd-sysctl so net.netfilter.* in /etc/sysctl.d apply at boot\nnf_conntrack\n' \
+    > "$CONNTRACK_MODULES_FILE"
+  printf '# NETRUN — re-apply net.netfilter.* sysctls whenever nf_conntrack is (re)loaded\nACTION=="add", SUBSYSTEM=="module", KERNEL=="nf_conntrack", RUN+="/usr/lib/systemd/systemd-sysctl --prefix=/net/netfilter"\n' \
+    > "$CONNTRACK_UDEV_RULE"
+  udevadm control --reload >/dev/null 2>&1 || true
+  set_sysctl_kv net.netfilter.nf_conntrack_max "$max"
+}
+
 # === CHANGE 1: kernel.pid_max + threads-max added ===
 configure_sysctl() {
   log "Configuring sysctl (IPv6 forwarding + raised kernel pid/thread limits)"
@@ -175,7 +228,8 @@ kernel.pid_max = 4194304
 kernel.threads-max = 4194304
 
 # === Connection tuning ===
-net.netfilter.nf_conntrack_max = 1048576
+# net.netfilter.nf_conntrack_max is appended below by
+# configure_conntrack_persistence (RAM-sized; module loaded at boot).
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.ipv4.tcp_max_syn_backlog = 8192
 net.core.somaxconn = 8192
@@ -220,6 +274,7 @@ net.ipv6.conf.all.accept_dad = 0
 net.ipv6.conf.default.accept_dad = 0
 net.ipv6.mld_max_msf = 1
 EOF
+  configure_conntrack_persistence
   # Strip any legacy tcp_timestamps line from /etc/sysctl.conf — old generator
   # wrote =0 there, which is processed AFTER sysctl.d and would override our =1.
   if [ -f /etc/sysctl.conf ]; then

@@ -12,8 +12,15 @@ const egressMode = require("./egress_mode.js");
 const deprovision = require("./deprovision.js");
 const egress = require("./egress.js");
 const loadSampler = require("./load_sampler.js").createSampler();
+const cfgStatus = require("./cfg_status.js");
+const jobRetention = require("./job_retention.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
+// Wave FLEET-HEALTH (RES-10) — bind address. The unit template has always set
+// NODE_AGENT_HOST=0.0.0.0 but nothing read it, so the agent listened on [::]
+// and answered on every customer exit IPv6 of the box. The orchestrator
+// reaches nodes at http://<IPv4>:8085; NODE_AGENT_HOST=:: restores the old bind.
+const LISTEN_HOST = String(process.env.NODE_AGENT_HOST || "0.0.0.0").trim() || "0.0.0.0";
 const API_KEY = String(process.env.NODE_AGENT_API_KEY || "").trim();
 const DEFAULT_TIMEOUT_SEC = Number(process.env.NODE_AGENT_DEFAULT_TIMEOUT_SEC || 900);
 const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
@@ -22,6 +29,18 @@ const LOCK_FILENAME = ".generation.lock";
 const LOG_TAIL_LIMIT = 12000;
 const RESPONSE_TAIL_LIMIT = 2000;
 const DEFAULT_STALE_JOB_SEC = Math.max(60, Number(process.env.NODE_AGENT_STALE_JOB_SEC || 1800));
+// Wave FLEET-HEALTH — job directories kept under JOBS_ROOT (job_retention.js);
+// 0 disables pruning.
+const JOBS_KEEP = jobRetention.keepFromEnv(process.env.NODE_AGENT_JOBS_KEEP);
+// Wave FLEET-HEALTH (RES-12) — kill-on-rebind for callers that do not send
+// reclaimStartPorts (older orchestrators): "kill" (default, the historical
+// behaviour: every overlapping 3proxy is killed) or "refuse" (fail the job with
+// ports_in_use instead). A request WITH reclaimStartPorts is always strict.
+const REBIND_POLICY = String(process.env.NODE_AGENT_REBIND_POLICY || "kill").trim().toLowerCase() === "refuse"
+  ? "refuse"
+  : "kill";
+// Wave FLEET-HEALTH (RES-10) — /health ipv6Addresses is recomputed at most this often.
+const IPV6_COVERAGE_TTL_MS = Math.max(5000, Number(process.env.NODE_AGENT_IPV6_COVERAGE_TTL_SEC || 60) * 1000);
 // Wave NODE-GENLOCK-HARDENING — a generation lock older than this is treated
 // as abandoned (the generating process died without releasing it, or the lock
 // file was left empty/corrupt by a crash mid-write). Generation jobs are short,
@@ -740,6 +759,141 @@ function buildStartupScriptPath(startPort) {
   return path.join(PROXY_ROOT, `proxy-startup_${startPort}.sh`);
 }
 
+// The generator's per-start-port credential and address lists
+// (proxyyy_automated.sh: random_users_<start>.list / ipv6_<start>.list, under
+// ~/proxyserver = PROXY_ROOT). It REUSES either file when it exists.
+function buildCredentialsListPath(startPort) {
+  return path.join(PROXY_ROOT, `random_users_${startPort}.list`);
+}
+
+function buildIpv6ListPath(startPort) {
+  return path.join(PROXY_ROOT, `ipv6_${startPort}.list`);
+}
+
+// Wave FLEET-HEALTH (FO-06) — explicit per-port credentials for /generate
+// (clone a batch onto another node with the same logins/passwords). Accepts
+// an array of "login:password" strings or [login, password] pairs, one per
+// proxy in port order. Each part is [A-Za-z0-9]{1,32} (the generator's own
+// alphabet; no ':' so its `IFS=: read` split stays exact), logins unique.
+// undefined/null = field absent (today's behaviour). Pure + exported.
+const CREDENTIAL_PART_RE = /^[A-Za-z0-9]{1,32}$/;
+
+function parseCredentialsField(raw, proxyCount) {
+  if (raw === undefined || raw === null) {
+    return { ok: true, provided: false, lines: null };
+  }
+  const bad = (reason) => ({ ok: false, provided: true, error: "invalid_credentials", reason });
+  if (!Array.isArray(raw)) return bad("not_an_array");
+  if (raw.length !== proxyCount) return bad(`count_mismatch:${raw.length}!=${proxyCount}`);
+  const lines = [];
+  const logins = new Set();
+  for (let i = 0; i < raw.length; i += 1) {
+    const item = raw[i];
+    let login;
+    let password;
+    if (typeof item === "string") {
+      const parts = item.split(":");
+      if (parts.length !== 2) return bad(`malformed_item:${i}`);
+      [login, password] = parts;
+    } else if (Array.isArray(item) && item.length === 2 && typeof item[0] === "string" && typeof item[1] === "string") {
+      [login, password] = item;
+    } else {
+      return bad(`malformed_item:${i}`);
+    }
+    if (!CREDENTIAL_PART_RE.test(login) || !CREDENTIAL_PART_RE.test(password)) return bad(`bad_charset_or_length:${i}`);
+    if (logins.has(login)) return bad(`duplicate_login:${i}`);
+    logins.add(login);
+    lines.push(`${login}:${password}`);
+  }
+  return { ok: true, provided: true, lines };
+}
+
+function credentialLinesOf(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+// "absent" | "same" | "different" for the credentials file vs the wanted lines.
+async function credentialsFileState(filePath, lines) {
+  let text;
+  try {
+    text = await fsp.readFile(filePath, "utf-8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return "absent";
+    throw error;
+  }
+  const have = credentialLinesOf(text);
+  if (have.length !== lines.length) return "different";
+  for (let i = 0; i < lines.length; i += 1) {
+    if (have[i] !== lines[i]) return "different";
+  }
+  return "same";
+}
+
+// tmp file (0600) + fsync + rename + directory fsync: the generator either sees
+// no file or the whole list, never a torn one.
+async function writeCredentialsFile(filePath, lines) {
+  const dir = path.dirname(filePath);
+  await fsp.mkdir(dir, { recursive: true });
+  const tmp = path.join(dir, `.${path.basename(filePath)}.tmp-${process.pid}-${Date.now()}`);
+  const handle = await fsp.open(tmp, "wx", 0o600);
+  try {
+    await handle.writeFile(`${lines.join("\n")}\n`, "utf-8");
+    await handle.chmod(0o600);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await fsp.rename(tmp, filePath);
+  } catch (error) {
+    await safeUnlink(tmp).catch(() => {});
+    throw error;
+  }
+  try {
+    const dh = await fsp.open(dir, "r");
+    try {
+      await dh.sync();
+    } finally {
+      await dh.close();
+    }
+  } catch (_error) {
+    // directory fsync is best-effort (not supported everywhere)
+  }
+}
+
+// Wave FLEET-HEALTH (RES-12) — `reclaimStartPorts`: start ports of batches the
+// orchestrator released (and may therefore be killed if they still listen in
+// the new range). Absent = legacy caller. Pure + exported.
+function parseReclaimStartPorts(raw) {
+  if (raw === undefined || raw === null) return { ok: true, provided: false, ports: [] };
+  if (!Array.isArray(raw)) return { ok: false, provided: true, error: "invalid_reclaim_start_ports" };
+  const ports = [];
+  for (const value of raw) {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+      return { ok: false, provided: true, error: "invalid_reclaim_start_ports" };
+    }
+    ports.push(n);
+  }
+  return { ok: true, provided: true, ports: [...new Set(ports)] };
+}
+
+// Socks credentials of a reused job's items in port order equal the wanted lines?
+function reusedItemsMatchCredentials(items, startPort, lines) {
+  const byPort = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || (item.protocol && item.protocol !== "socks5")) continue;
+    byPort.set(Number(item.port), `${item.login}:${item.password}`);
+  }
+  for (let i = 0; i < lines.length; i += 1) {
+    if (byPort.get(startPort + i) !== lines[i]) return false;
+  }
+  return true;
+}
+
 async function runCommand(command, args, options = {}) {
   const cwd = options.cwd || process.cwd();
   const timeoutSec = Math.max(1, Number(options.timeoutSec || 10));
@@ -1018,6 +1172,59 @@ function selectGenerationRebindPids(ssText, newStart, newCount, options = {}) {
   return Array.from(pids).sort((a, b) => a - b);
 }
 
+// Wave FLEET-HEALTH (RES-12) — every file the generator keys by start port.
+// /deprovision drops the same set (deprovision.js, whole-batch path). A batch
+// that is torn down for a rebind must lose ALL of them: a stale ipv6_<p>.list /
+// random_users_<p>.list makes the next generate at that start port silently
+// REUSE the old addresses AND the old logins/passwords (resold credentials).
+function perStartPortFiles(startPort) {
+  const sp = toPositiveInt(startPort, 0);
+  if (!sp) return [];
+  const cfg = buildCfgPathForStartPort(sp);
+  return [
+    cfg,
+    `${cfg}.disabled`,
+    buildStartupScriptPath(sp),
+    buildIpv6ListPath(sp),
+    buildCredentialsListPath(sp),
+    path.join(PROXY_ROOT, `running_server_${sp}.info`),
+  ];
+}
+
+// Wave FLEET-HEALTH (RES-12) — which stale 3proxy pids a rebind may kill.
+// pids = the 3proxy pids listening inside the new socks/http ranges
+// (selectGenerationRebindPids); instances = collectRunningInstances() taken
+// BEFORE any signal (a killed process is gone from ps, which is why the old
+// post-kill lookup never cleaned a single file).
+//   strict (the request carried reclaimStartPorts, or NODE_AGENT_REBIND_POLICY
+//   =refuse): a pid is killed only when its cfg start port is listed; anything
+//   else is a conflict and NOTHING is killed.
+//   legacy (no reclaimStartPorts, default policy "kill"): every pid is killed,
+//   as before.
+// Pure + exported for unit tests.
+function planRebindKills({ pids, instances, reclaimStartPorts, strict = false }) {
+  const byPid = new Map();
+  for (const inst of Array.isArray(instances) ? instances : []) {
+    if (inst && Number.isInteger(inst.pid)) byPid.set(inst.pid, inst);
+  }
+  const allowed = new Set(
+    (Array.isArray(reclaimStartPorts) ? reclaimStartPorts : []).map((p) => toPositiveInt(p, 0)).filter((p) => p > 0)
+  );
+  const kill = [];
+  const conflicts = [];
+  for (const pid of Array.isArray(pids) ? pids : []) {
+    const inst = byPid.get(pid);
+    const startPort = inst ? toPositiveInt(inst.startPort, 0) || null : null;
+    const cfg = inst && inst.cfgPath ? inst.cfgPath : null;
+    if (!strict || (startPort !== null && allowed.has(startPort))) {
+      kill.push({ pid, startPort, cfgPath: cfg });
+    } else {
+      conflicts.push({ startPort, pid, cfg });
+    }
+  }
+  return { kill, conflicts };
+}
+
 // Wave KILL-ON-REBIND — before a /generate, tear down any *stale* 3proxy
 // daemon that currently holds a TCP port the new generation is about to bind.
 // Two daemons on the same port → kernel SO_REUSEPORT load-balances accept()
@@ -1026,11 +1233,17 @@ function selectGenerationRebindPids(ssText, newStart, newCount, options = {}) {
 //
 // Normal operation (allocator climbs monotonically, never reuses a port) → no
 // listener overlaps the new range → this is a complete no-op.
-async function killOverlappingListeners({ newStart, newCount }) {
+//
+// Wave FLEET-HEALTH (RES-12) — a DB/node port mismatch (manual edit, wiped DB
+// on re-register) used to make this silently kill a batch of up to 1500 SOLD
+// proxies. With `strict` (see planRebindKills) only the orchestrator-listed
+// start ports are reclaimed; any other overlap refuses the generation with
+// `ports_in_use` + [{startPort, pid, cfg}] and kills nothing.
+async function killOverlappingListeners({ newStart, newCount, reclaimStartPorts = null, strict = false }) {
   const start = toPositiveInt(newStart, 0);
   const count = toPositiveInt(newCount, 0);
   if (!start || !count) {
-    return { ok: true, killedPids: [], targetRangeLow: 0, targetRangeHigh: 0 };
+    return { ok: true, killedPids: [], targetRangeLow: 0, targetRangeHigh: 0, conflicts: [] };
   }
 
   // socks range [start .. start+count-1] and the paired dual-mode http range
@@ -1065,22 +1278,43 @@ async function killOverlappingListeners({ newStart, newCount }) {
   }
 
   if (!ssOk) {
-    // Never block a generation because ss failed — proceed without killing.
+    // Never block a generation because ss failed — proceed without killing
+    // (the generator's own port pre-check still refuses a bound port).
     console.warn(
       "[kill-on-rebind] ss failed; proceeding WITHOUT killing overlapping listeners",
       { targetRangeLow, targetRangeHigh }
     );
-    return { ok: false, killedPids: [], targetRangeLow, targetRangeHigh };
+    return { ok: false, killedPids: [], targetRangeLow, targetRangeHigh, conflicts: [] };
   }
 
   const candidatePids = selectGenerationRebindPids(ssText, start, count);
   if (candidatePids.length === 0) {
     // Normal case: nothing overlaps → complete no-op.
-    return { ok: true, killedPids: [], targetRangeLow, targetRangeHigh };
+    return { ok: true, killedPids: [], targetRangeLow, targetRangeHigh, conflicts: [] };
+  }
+
+  // pid → cfg BEFORE any signal: after the kill the processes are gone from ps.
+  const running = await collectRunningInstances();
+  const plan = planRebindKills({
+    pids: candidatePids,
+    instances: running.ok ? running.instances : [],
+    reclaimStartPorts,
+    strict,
+  });
+  if (plan.conflicts.length > 0) {
+    return {
+      ok: false,
+      refused: true,
+      error: "ports_in_use",
+      killedPids: [],
+      targetRangeLow,
+      targetRangeHigh,
+      conflicts: plan.conflicts,
+    };
   }
 
   // SIGTERM the candidates, give them ~1500ms, then SIGKILL survivors.
-  for (const pid of candidatePids) {
+  for (const { pid } of plan.kill) {
     try {
       process.kill(pid, "SIGTERM");
     } catch (_error) {
@@ -1089,7 +1323,7 @@ async function killOverlappingListeners({ newStart, newCount }) {
   }
   await sleep(1500);
   const killedPids = [];
-  for (const pid of candidatePids) {
+  for (const { pid } of plan.kill) {
     if (isProcessAlive(pid)) {
       try {
         process.kill(pid, "SIGKILL");
@@ -1100,48 +1334,54 @@ async function killOverlappingListeners({ newStart, newCount }) {
     killedPids.push(pid);
   }
 
-  // Cross-ref killed pids to their cfg paths and remove the now-stale generated
-  // files (cfg + startup script) using the file's own path helpers. If a cfg
-  // path is unknown we only log it for manual cleanup.
-  try {
-    const running = await collectRunningInstances();
-    if (running.ok) {
-      const cfgByPid = new Map();
-      for (const inst of running.instances) {
-        if (inst && Number.isInteger(inst.pid)) {
-          cfgByPid.set(inst.pid, inst);
-        }
+  // Remove every per-start-port file of each torn-down batch (cfg, disabled
+  // cfg, startup script, ipv6 list, credentials list, info file) and forget the
+  // egress rotation state of its ports. Only when the running cfg path is the
+  // canonical one for its start port, so an unrelated path is never deleted.
+  const cleanedStartPorts = [];
+  const seenStart = new Set();
+  for (const { pid, startPort, cfgPath } of plan.kill) {
+    if (!startPort || !cfgPath) {
+      if (cfgPath) {
+        console.warn("[kill-on-rebind] killed pid with cfg but no start port; manual cleanup", { pid, cfgPath });
       }
-      for (const pid of killedPids) {
-        const inst = cfgByPid.get(pid);
-        const cfgPath = inst && inst.cfgPath ? inst.cfgPath : "";
-        const stalePort = inst ? toPositiveInt(inst.startPort, 0) : 0;
-        if (cfgPath && stalePort > 0) {
-          // Reconstruct via the canonical helpers so we never delete an
-          // unrelated path; only remove when it matches the parsed cfg.
-          const expectedCfg = buildCfgPathForStartPort(stalePort);
-          if (path.normalize(expectedCfg) === path.normalize(cfgPath)) {
-            await safeUnlink(expectedCfg);
-            await safeUnlink(buildStartupScriptPath(stalePort));
-          } else {
-            console.warn(
-              "[kill-on-rebind] stale cfg path mismatch; left for manual cleanup",
-              { pid, cfgPath, stalePort }
-            );
-          }
-        } else if (cfgPath) {
-          console.warn(
-            "[kill-on-rebind] killed pid with cfg but no start port; manual cleanup",
-            { pid, cfgPath }
-          );
-        }
+      continue;
+    }
+    if (seenStart.has(startPort)) continue;
+    seenStart.add(startPort);
+    const expectedCfg = buildCfgPathForStartPort(startPort);
+    if (path.normalize(expectedCfg) !== path.normalize(cfgPath)) {
+      console.warn("[kill-on-rebind] stale cfg path mismatch; left for manual cleanup", { pid, cfgPath, startPort });
+      continue;
+    }
+    let ports = [];
+    try {
+      const text = await fsp.readFile(expectedCfg, "utf-8");
+      for (const m of text.matchAll(/^socks\b.*?-p(\d+)\b/gm)) ports.push(Number(m[1]));
+    } catch (_error) {
+      ports = [];
+    }
+    try {
+      for (const filePath of perStartPortFiles(startPort)) {
+        await safeUnlink(filePath);
+      }
+      cleanedStartPorts.push(startPort);
+    } catch (error) {
+      console.warn("[kill-on-rebind] per-port file cleanup failed", {
+        startPort,
+        error: error && error.message ? error.message : String(error),
+      });
+    }
+    if (ports.length > 0 && egress && typeof egress.forgetPorts === "function") {
+      try {
+        await egress.forgetPorts(ports);
+      } catch (_error) {
+        // best effort, as in /deprovision
       }
     }
-  } catch (_error) {
-    // Best-effort cleanup; killing already succeeded.
   }
 
-  return { ok: true, killedPids, targetRangeLow, targetRangeHigh };
+  return { ok: true, killedPids, targetRangeLow, targetRangeHigh, conflicts: [], cleanedStartPorts };
 }
 
 function buildInstanceSummary(instances) {
@@ -1236,6 +1476,22 @@ function computeProxyReadiness(instances, listeningPorts, portsOk = true) {
     instancesListening: listening,
     listeningPortCount: portSet.size,
   };
+}
+
+// Wave FLEET-HEALTH (RES-10) — exact-port probe for many ports: one `ss`
+// per chunk keeps each filter expression and each output small (a node with
+// legacy per-port cfgs has thousands of start ports). Same {ok, error, ports}.
+const LISTEN_PROBE_CHUNK = 256;
+async function listListeningExactPorts(ports) {
+  const list = [...new Set((ports || []).map((p) => toPositiveInt(p, 0)).filter((p) => p > 0 && p <= 65535))];
+  if (list.length <= LISTEN_PROBE_CHUNK) return listListeningTcpPorts(list.length > 0 ? { ports: list } : undefined);
+  const out = new Set();
+  for (let i = 0; i < list.length; i += LISTEN_PROBE_CHUNK) {
+    const part = await listListeningTcpPorts({ ports: list.slice(i, i + LISTEN_PROBE_CHUNK) });
+    if (!part.ok) return { ok: false, error: part.error, ports: out };
+    for (const p of part.ports) out.add(p);
+  }
+  return { ok: true, error: null, ports: out };
 }
 
 async function listListeningTcpPorts(range) {
@@ -2485,6 +2741,34 @@ async function handleGenerate(req, res) {
     });
     return;
   }
+  // Wave FLEET-HEALTH (FO-06) — optional explicit credentials (+ fresh
+  // addresses). Validated before the lock; never logged (count only).
+  const credentialsParse = parseCredentialsField(body.credentials, params.proxyCount);
+  if (!credentialsParse.ok) {
+    sendJson(res, 400, {
+      success: false,
+      status: "failed",
+      error: "invalid_credentials",
+      detail: credentialsParse.reason,
+      jobId,
+    });
+    return;
+  }
+  const credentialLines = credentialsParse.provided ? credentialsParse.lines : null;
+  const freshAddresses = toBool(body.freshAddresses ?? body.fresh_addresses, false);
+  // Wave FLEET-HEALTH (RES-12) — reclaimable start ports; their presence (even
+  // an empty list) switches kill-on-rebind to refuse-unless-listed.
+  const reclaimParse = parseReclaimStartPorts(body.reclaimStartPorts ?? body.reclaim_start_ports);
+  if (!reclaimParse.ok) {
+    sendJson(res, 400, {
+      success: false,
+      status: "failed",
+      error: reclaimParse.error,
+      jobId,
+    });
+    return;
+  }
+  const rebindStrict = reclaimParse.provided || REBIND_POLICY === "refuse";
   console.log(
     "[node-agent] generation request job_id=%s start_port=%s proxy_count=%s fingerprint_profile_version=%s "
     + "intended_client_os_profile=%s actual_client_profile=%s effective_client_os_profile=%s "
@@ -2543,16 +2827,49 @@ async function handleGenerate(req, res) {
   // work: tear down stale 3proxy daemons holding ports this run will bind, so
   // the kernel never SO_REUSEPORT-balances accept() across a stale + fresh
   // listener (~50% connection-refused). No-op when nothing overlaps.
+  //
+  // Wave FLEET-HEALTH (RES-12) — in strict mode a 3proxy of a start port the
+  // orchestrator did not list is never killed: the job fails with ports_in_use.
+  if (credentialLines) {
+    console.log("[node-agent] generation job_id=%s explicit credentials count=%s", jobId, credentialLines.length);
+  }
   try {
     const rebindResult = await killOverlappingListeners({
       newStart: params.startPort,
       newCount: params.proxyCount,
+      reclaimStartPorts: reclaimParse.ports,
+      strict: rebindStrict,
     });
     console.log("[kill-on-rebind]", {
       jobId,
       start_port: params.startPort,
+      strict: rebindStrict,
       ...rebindResult,
     });
+    if (rebindResult && rebindResult.refused) {
+      await releaseGenerationLock(lockPath, lockAttempt.lockRecord.ownerToken);
+      sendJson(res, 200, {
+        success: false,
+        status: "failed",
+        jobId,
+        error: "ports_in_use",
+        generatedCount: 0,
+        detail: rebindResult.conflicts,
+        profile: profileDiagnostics,
+        diagnostics: {
+          ...withProfileDiagnostics(
+            {
+              errorReason: "ports_in_use",
+              detail: rebindResult.conflicts,
+              targetRangeLow: rebindResult.targetRangeLow,
+              targetRangeHigh: rebindResult.targetRangeHigh,
+            },
+            profileDiagnostics
+          ),
+        },
+      });
+      return;
+    }
   } catch (rebindError) {
     // Never block a generation on the safety sweep.
     console.warn("[kill-on-rebind] sweep error; proceeding with generation", {
@@ -2581,6 +2898,12 @@ async function handleGenerate(req, res) {
   };
 
   let jobMeta = null;
+  // Wave FLEET-HEALTH (FO-06) — did THIS request create the credentials file,
+  // and did the job end ready? (A file we created for a job that never got a
+  // cfg is removed again, so a retry with other credentials is not wedged.)
+  const credentialsPath = buildCredentialsListPath(params.startPort);
+  let credentialsFileCreated = false;
+  let jobReady = false;
 
   try {
     await fsp.mkdir(jobDir, { recursive: true });
@@ -2636,6 +2959,11 @@ async function handleGenerate(req, res) {
         providedMapCsvPath: body.mapCsvPath ?? null,
         fingerprintProfileVersion: profileDiagnostics.fingerprint_profile_version || null,
         profileSelectionSource: profileDiagnostics.profile_selection_source || null,
+        // Wave FLEET-HEALTH (FO-06 / RES-12) — counts and flags only, never the
+        // credentials themselves.
+        credentialsCount: credentialLines ? credentialLines.length : null,
+        freshAddresses,
+        reclaimStartPorts: reclaimParse.provided ? reclaimParse.ports : null,
       },
       lock: {
         file: lockPath,
@@ -2645,6 +2973,30 @@ async function handleGenerate(req, res) {
       result: {},
     };
     await writeJobMetadata(metadataPath, jobMeta);
+
+    // Wave FLEET-HEALTH (FO-06) — the generator reuses an existing
+    // random_users_<start>.list, so a file with OTHER credentials would win over
+    // the request: refuse instead of silently serving different logins.
+    if (credentialLines && (await credentialsFileState(credentialsPath, credentialLines)) === "different") {
+      markJobStatus(jobMeta, "failed", { error: "credentials_conflict" });
+      await writeJobMetadata(metadataPath, jobMeta);
+      sendJson(res, 409, {
+        success: false,
+        status: "failed",
+        jobId,
+        runId,
+        error: "credentials_conflict",
+        generatedCount: 0,
+        output: outputPaths,
+        profile: profileDiagnostics,
+        diagnostics: {
+          ...withProfileDiagnostics({ errorReason: "credentials_conflict", checks: {} }, profileDiagnostics),
+        },
+        jobDir,
+        statusHistory: jobMeta.statusHistory,
+      });
+      return;
+    }
 
     const instanceStateBefore = await collectRunningInstances();
     if (instanceStateBefore.ok) {
@@ -2681,7 +3033,33 @@ async function handleGenerate(req, res) {
       }
       if (matches.length === 1) {
         const reused = await findLatestReadyJobForStartPort(params.startPort);
+        if (
+          credentialLines
+          && reused && Array.isArray(reused.items) && reused.items.length > 0
+          && !reusedItemsMatchCredentials(reused.items, params.startPort, credentialLines)
+        ) {
+          markJobStatus(jobMeta, "failed", { error: "credentials_conflict", reusedFromJobId: reused.meta.jobId || null });
+          await writeJobMetadata(metadataPath, jobMeta);
+          sendJson(res, 409, {
+            success: false,
+            status: "failed",
+            jobId,
+            runId,
+            error: "credentials_conflict",
+            generatedCount: 0,
+            output: outputPaths,
+            details: { runningInstance: matches[0], reusedFromJobId: reused.meta.jobId || null },
+            profile: profileDiagnostics,
+            diagnostics: {
+              ...withProfileDiagnostics({ errorReason: "credentials_conflict", checks: {} }, profileDiagnostics),
+            },
+            jobDir,
+            statusHistory: jobMeta.statusHistory,
+          });
+          return;
+        }
         if (reused && Array.isArray(reused.items) && reused.items.length > 0) {
+          jobReady = true;
           markJobStatus(jobMeta, "ready", {
             reusedExistingInstance: true,
             reusedFromJobId: reused.meta.jobId || null,
@@ -2764,6 +3142,17 @@ async function handleGenerate(req, res) {
     });
     jobMeta.generator.effectiveArgs = effectiveArgs;
     await writeJobMetadata(metadataPath, jobMeta);
+
+    // Wave FLEET-HEALTH (FO-06) — hand the generator the explicit credentials
+    // (it only creates random_users_<start>.list when the file is missing) and,
+    // on request, drop a stale address list so it draws fresh addresses.
+    if (credentialLines && (await credentialsFileState(credentialsPath, credentialLines)) === "absent") {
+      await writeCredentialsFile(credentialsPath, credentialLines);
+      credentialsFileCreated = true;
+    }
+    if (freshAddresses) {
+      await safeUnlink(buildIpv6ListPath(params.startPort));
+    }
 
     markJobStatus(jobMeta, "running");
     await writeJobMetadata(metadataPath, jobMeta);
@@ -2980,6 +3369,7 @@ async function handleGenerate(req, res) {
       return;
     }
 
+    jobReady = true;
     markJobStatus(jobMeta, "ready", {
       exitCode: runResult.exitCode,
       itemsCount: generatedCount,
@@ -3052,8 +3442,52 @@ async function handleGenerate(req, res) {
       },
     });
   } finally {
+    if (credentialsFileCreated && !jobReady) {
+      try {
+        if (!(await fileExists(cfgPath))) await safeUnlink(credentialsPath);
+      } catch (_error) {
+        // best effort
+      }
+    }
     await releaseGenerationLock(lockPath, lockAttempt.lockRecord.ownerToken);
+    scheduleJobPrune();
   }
+}
+
+// Wave FLEET-HEALTH — bounded retention of JOBS_ROOT (job_retention.js). One
+// prune at a time; runs after every generation and once after start-up.
+let jobPruneInFlight = null;
+function scheduleJobPrune() {
+  if (!(JOBS_KEEP > 0) || jobPruneInFlight) return jobPruneInFlight;
+  jobPruneInFlight = (async () => {
+    try {
+      const lockState = await classifyGenerationLock(path.join(JOBS_ROOT, LOCK_FILENAME));
+      const lockJobId = lockState.parsed && !lockState.stale ? String(lockState.parsed.jobId || "") || null : null;
+      const result = await jobRetention.pruneJobDirs({
+        jobsRoot: JOBS_ROOT,
+        cfgDir: PROXY_CFG_ROOT,
+        keep: JOBS_KEEP,
+        staleMs: DEFAULT_STALE_JOB_SEC * 1000,
+        lockJobId,
+      });
+      if (result.removed.length > 0 || !result.ok) {
+        console.log(
+          "[node-agent] job retention: scanned=%s removed=%s kept=%s%s",
+          result.scanned,
+          result.removed.length,
+          result.kept,
+          result.ok ? "" : ` error=${result.error}`
+        );
+      }
+      return result;
+    } catch (error) {
+      console.warn("[node-agent] job retention failed:", error && error.message ? error.message : String(error));
+      return null;
+    } finally {
+      jobPruneInFlight = null;
+    }
+  })();
+  return jobPruneInFlight;
 }
 
 async function buildJobStatusResponse(jobId) {
@@ -3219,6 +3653,14 @@ async function handleReconcile(req, res) {
   });
 }
 
+// Wave FLEET-HEALTH (RES-10) — active cfg files (parsed once per mtime) and
+// the 60 s IPv6 address-coverage probe built on them.
+const cfgInventory = cfgStatus.createCfgInventory({ cfgDir: PROXY_CFG_ROOT });
+const ipv6Coverage = cfgStatus.createCoverageProbe({
+  ttlMs: IPV6_COVERAGE_TTL_MS,
+  readCfgs: () => cfgInventory.read(),
+});
+
 async function handleHealth(req, res) {
   await fsp.mkdir(JOBS_ROOT, { recursive: true });
   const lockPath = path.join(JOBS_ROOT, LOCK_FILENAME);
@@ -3236,22 +3678,49 @@ async function handleHealth(req, res) {
   // keeps `ss` output tiny: a full dump of a busy node (socks + http + HTTPS
   // frontend listeners) blows past runCommand's 500KB tail cap, and the
   // truncated list made live instances read as «not listening».
-  const startPorts = instances
-    .map((inst) => toPositiveInt(inst && inst.startPort, 0))
-    .filter((port) => port > 0);
-  const [ipv6Check, dnsCheck, listenState] = await Promise.all([
+  //
+  // Wave FLEET-HEALTH (RES-10) — a cfg is probed on its FIRST socks port, not
+  // on the start port in its file name: a /deprovision rewrite can drop the
+  // start port's block while the batch keeps serving the rest (the start port
+  // then never listens and the batch read as "not ready" forever).
+  const inventory = await cfgInventory.read();
+  const probeByStart = new Map();
+  for (const c of inventory.cfgs) {
+    if (c.probePort) probeByStart.set(c.startPort, c.probePort);
+  }
+  const probeOf = (startPort) => probeByStart.get(startPort) || startPort;
+  const readinessInstances = instances.map((inst) => {
+    const sp = toPositiveInt(inst && inst.startPort, 0);
+    return sp > 0 ? { ...inst, startPort: probeOf(sp) } : inst;
+  });
+  const probePorts = new Set();
+  for (const inst of readinessInstances) {
+    const p = toPositiveInt(inst && inst.startPort, 0);
+    if (p > 0) probePorts.add(p);
+  }
+  for (const c of inventory.cfgs) probePorts.add(probeOf(c.startPort));
+  const [ipv6Check, dnsCheck, listenState, ipv6Addresses] = await Promise.all([
     checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
     checkDns(5000),
-    listListeningTcpPorts(startPorts.length > 0 ? { ports: startPorts } : undefined),
+    listListeningExactPorts([...probePorts]),
+    ipv6Coverage.get(),
   ]);
   // Wave NODE-GENLOCK-HARDENING — 3proxy readiness, additive. Lets the
   // orchestrator distinguish "agent up but 3proxy not listening yet" (fresh
   // boot — do NOT mass-invalidate proxies) from "agent up and serving".
   const proxyReadiness = computeProxyReadiness(
-    instances,
+    readinessInstances,
     listenState.ports,
     listenState.ok
   );
+  // Wave FLEET-HEALTH (RES-10) — per-cfg view (+ cfgs with no 3proxy process,
+  // folded in from /reconcile so the orchestrator never needs that call).
+  const cfgView = cfgStatus.computeCfgStatus({
+    cfgs: inventory.cfgs,
+    instances,
+    listeningPorts: listenState.ports,
+    portsOk: listenState.ok && inventory.ok,
+  });
   const success = Boolean(instancesState.ok);
   const status = success ? "ready" : "failed";
   const ipv6 = {
@@ -3299,6 +3768,18 @@ async function handleHealth(req, res) {
     dns: dnsCheck,
     // Wave NODE-LOAD-GUARD — additive; the guard itself polls GET /load.
     load: loadSampler.snapshot(),
+    // Wave FLEET-HEALTH (RES-10) — additive. cfgs: every active 3proxy cfg
+    // (listening = its first socks port is bound; null when the port probe
+    // failed); cfgsDown: how many are not listening (null = unknown);
+    // ipv6Addresses: distinct cfg -e addresses vs those the kernel holds
+    // (cached ttlSec); cfgsWithoutProcess: cfgs with no 3proxy process.
+    cfgs: cfgView.cfgs,
+    cfgsTotal: cfgView.cfgsTotal,
+    cfgsTruncated: cfgView.cfgsTruncated,
+    cfgsDown: cfgView.cfgsDown,
+    cfgsWithoutProcess: cfgView.cfgsWithoutProcess,
+    cfgsError: inventory.ok ? null : inventory.error || "cfg_read_failed",
+    ipv6Addresses: { ...ipv6Addresses, ttlSec: Math.round(IPV6_COVERAGE_TTL_MS / 1000) },
   });
 }
 
@@ -3536,12 +4017,22 @@ const server = http.createServer(async (req, res) => {
 // tests can ``require`` this module and exercise the pure helpers below
 // without starting a listener. Behaviour when launched directly (the
 // node-agent process) is unchanged.
+// Wave FLEET-HEALTH (RES-10) — bind PORT on LISTEN_HOST (NODE_AGENT_HOST,
+// default 0.0.0.0). Exported so a test can assert the arguments with a fake.
+function listenAgent(srv = server, onListening = () => {}) {
+  return srv.listen(PORT, LISTEN_HOST, onListening);
+}
+
 if (require.main === module) {
   loadSampler.start();
-  server.listen(PORT, () => {
+  listenAgent(server, () => {
     console.log(
-      `[node-agent] listening on :${PORT}, jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}`
+      `[node-agent] listening on ${LISTEN_HOST}:${PORT}, jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}, jobs_keep=${JOBS_KEEP}, rebind_policy=${REBIND_POLICY}`
     );
+    // Wave FLEET-HEALTH — trim the job-directory backlog once, a minute after
+    // start (the live node carried 1500 of them).
+    const pruneTimer = setTimeout(() => scheduleJobPrune(), 60_000);
+    if (typeof pruneTimer.unref === "function") pruneTimer.unref();
     // PERGB-NFT-ENFORCE — a reboot clears the in-memory nft block set and
     // respawns every 3proxy from cfg; re-assert the persisted pay-per-GB blocks
     // so depleted accounts don't silently come back online until next topup.
@@ -3590,4 +4081,20 @@ module.exports = {
   // Wave IPV6-ROTATION — the HTTP server itself (it only listens when run as
   // the entrypoint), so tests can drive the /egress routes end to end.
   server,
+  // Wave FLEET-HEALTH — exported for unit tests.
+  listenAgent,
+  LISTEN_HOST,
+  planRebindKills,
+  perStartPortFiles,
+  killOverlappingListeners,
+  parseCredentialsField,
+  credentialsFileState,
+  writeCredentialsFile,
+  buildCredentialsListPath,
+  buildIpv6ListPath,
+  parseReclaimStartPorts,
+  reusedItemsMatchCredentials,
+  scheduleJobPrune,
+  JOBS_KEEP,
+  REBIND_POLICY,
 };

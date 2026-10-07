@@ -91,7 +91,6 @@ log "Applying kernel sysctl tweaks (merge into /etc/sysctl.d/99-netrun.conf)"
 merge_sysctl_conf /etc/sysctl.d/99-netrun.conf \
   "kernel.pid_max=4194304" \
   "kernel.threads-max=4194304" \
-  "net.netfilter.nf_conntrack_max=1048576" \
   "net.netfilter.nf_conntrack_tcp_timeout_established=7200" \
   "net.core.somaxconn=8192" \
   "net.ipv4.tcp_max_syn_backlog=8192" \
@@ -99,6 +98,30 @@ merge_sysctl_conf /etc/sysctl.d/99-netrun.conf \
   "net.ipv6.ip_nonlocal_bind=1" \
   "net.ipv6.conf.all.forwarding=1" \
   "net.ipv6.conf.default.forwarding=1"
+
+# Wave FLEET-HEALTH — conntrack: RAM-sized ceiling that survives reboots (same
+# logic as install_node_v2.sh configure_conntrack_persistence; see there).
+# nf_conntrack is loaded from modules-load.d BEFORE systemd-sysctl, and a udev
+# rule re-applies net.netfilter.* whenever the module is (re)loaded — without
+# that the persisted value was skipped at boot and the kernel default (65536
+# at 1-4 GB) won. One entry per 8 KB RAM, power of two, 65536..1048576
+# (NETRUN_CONNTRACK_MAX overrides): 2c/4GB -> 262144 (~85 MB when full).
+conntrack_max_for_mem_kb() {
+  local kb="${1:-0}" v=65536
+  case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+  while [ "$v" -lt 1048576 ] && [ $((v * 2)) -le $((kb / 8)) ]; do v=$((v * 2)); done
+  echo "$v"
+}
+CONNTRACK_MAX="${NETRUN_CONNTRACK_MAX:-$(conntrack_max_for_mem_kb "$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || true)")}"
+log "Conntrack: nf_conntrack_max=$CONNTRACK_MAX, nf_conntrack loaded at boot before systemd-sysctl"
+mkdir -p /etc/modules-load.d /etc/udev/rules.d
+printf '# NETRUN — load conntrack before systemd-sysctl so net.netfilter.* in /etc/sysctl.d apply at boot\nnf_conntrack\n' \
+  > /etc/modules-load.d/netrun-conntrack.conf
+printf '# NETRUN — re-apply net.netfilter.* sysctls whenever nf_conntrack is (re)loaded\nACTION=="add", SUBSYSTEM=="module", KERNEL=="nf_conntrack", RUN+="/usr/lib/systemd/systemd-sysctl --prefix=/net/netfilter"\n' \
+  > /etc/udev/rules.d/90-netrun-conntrack.rules
+udevadm control --reload >/dev/null 2>&1 || true
+merge_sysctl_conf /etc/sysctl.d/99-netrun.conf "net.netfilter.nf_conntrack_max=$CONNTRACK_MAX"
+modprobe nf_conntrack 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-netrun.conf >/dev/null 2>&1 || warn "sysctl -p had warnings (likely nf_conntrack module not loaded yet — applied on next boot)"
 
 log "Applying ulimit raises (/etc/security/limits.d/99-netrun.conf)"

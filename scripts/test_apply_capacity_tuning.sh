@@ -126,8 +126,16 @@ cat > "$BIN/sysctl" <<EOF
 #!/usr/bin/env bash
 echo "sysctl \$*" >> "$CALLS"
 if [ "\$1" = "-w" ]; then
-  v="\${2#*=}"; printf '%s\t%s\n' "\${v%% *}" "\${v##* }" > "\$NETRUN_TUNE_ROOT/proc/sys/net/ipv4/ip_local_port_range"
+  k="\${2%%=*}"; v="\${2#*=}"
+  case "\$k" in
+    net.ipv4.ip_local_port_range) printf '%s\t%s\n' "\${v%% *}" "\${v##* }" > "\$NETRUN_TUNE_ROOT/proc/sys/net/ipv4/ip_local_port_range" ;;
+    net.netfilter.nf_conntrack_max) [ "\${SYSCTL_CT_FAIL:-0}" = 1 ] && exit 1; echo "\$v" > "\$NETRUN_TUNE_ROOT/proc/sys/net/netfilter/nf_conntrack_max" ;;
+  esac
 fi
+EOF
+cat > "$BIN/udevadm" <<EOF
+#!/usr/bin/env bash
+echo "udevadm \$*" >> "$CALLS"
 EOF
 cat > "$BIN/systemctl" <<EOF
 #!/usr/bin/env bash
@@ -153,12 +161,17 @@ chmod +x "$BIN"/*
 new_root() {
   local r="$TMP/root.$1"
   rm -rf "$r"
-  mkdir -p "$r/proc/sys/net/ipv4" "$r/etc/sysctl.d" "$r/etc/unbound/unbound.conf.d" \
+  mkdir -p "$r/proc/sys/net/ipv4" "$r/proc/sys/net/netfilter" "$r/etc/sysctl.d" "$r/etc/unbound/unbound.conf.d" \
     "$r/opt/netrun/proxyserver/3proxy" "$r/opt/netrun/scripts" "$r/opt/netrun/jobs" "$r/etc/systemd/system" "$r/run"
   printf '10000\t65000\n' > "$r/proc/sys/net/ipv4/ip_local_port_range"
+  printf 'MemTotal:        3911456 kB\nMemFree:          301234 kB\n' > "$r/proc/meminfo"
+  echo 65536 > "$r/proc/sys/net/netfilter/nf_conntrack_max"
+  echo 1234 > "$r/proc/sys/net/netfilter/nf_conntrack_count"
   cat > "$r/etc/sysctl.d/99-netrun.conf" <<'EOF'
 # NETRUN — raised limits for 4000+ concurrent 3proxy instances.
 kernel.pid_max = 4194304
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.ipv4.ip_local_port_range = 10000 65000
 net.ipv4.tcp_timestamps = 1
 net.ipv6.conf.all.accept_ra = 2
@@ -213,6 +226,7 @@ grep -qE 'ipv6restore +would-apply' "$TMP/out" || fail "dry-run: ipv6restore pla
 ! grep -qE '^(sysctl -w|systemctl|nft -f|unbound-checkconf)' "$CALLS" || { cat "$CALLS"; fail "dry-run ran a mutating command"; }
 grep -q 'audit: listeners >= 8100: 3proxy=4 haproxy=2 other=0' "$TMP/out" || { cat "$TMP/out"; fail "audit: proxy-range listener summary wrong"; }
 grep -q '8085 \* node' "$TMP/out" || fail "audit: agent :8085 not listed among node services"
+! grep -q 'conntrack' "$TMP/out" || fail "conntrack is opt-in: not part of the default step list"
 ok "dry-run is the default, plans all four steps and leaves every file untouched"
 
 # ── 2. --apply: every step, no 3proxy touched ─────────────────────
@@ -340,5 +354,70 @@ rc="$(run_tool "$R" --ephemeral-range 1024-8100)"; [ "$rc" = 1 ] || fail "range 
 rc="$(run_tool "$R" --frobnicate)"; [ "$rc" = 1 ] || fail "unknown flag accepted"
 rc="$(run_tool "$R" --help)"; [ "$rc" = 0 ] && grep -q 'Opt-in and idempotent' "$TMP/out" || fail "--help"
 ok "bad arguments are rejected"
+
+# ── 12. conntrack (opt-in): dry-run plans, changes nothing ────────
+CT_MOD_WANT="$(printf '%s\n' '# NETRUN — load conntrack before systemd-sysctl so net.netfilter.* in /etc/sysctl.d apply at boot' 'nf_conntrack')"
+CT_UDEV_WANT="$(printf '%s\n' '# NETRUN — re-apply net.netfilter.* sysctls whenever nf_conntrack is (re)loaded' 'ACTION=="add", SUBSYSTEM=="module", KERNEL=="nf_conntrack", RUN+="/usr/lib/systemd/systemd-sysctl --prefix=/net/netfilter"')"
+R="$(new_root ctdry)"
+before="$(snapshot "$R")"
+rc="$(run_tool "$R" --only conntrack)"
+[ "$rc" = 0 ] || { cat "$TMP/out"; fail "conntrack dry-run exit $rc"; }
+[ "$before" = "$(snapshot "$R")" ] || fail "conntrack dry-run modified the fixture root"
+grep -qE "conntrack +would-apply +nf_conntrack_max -> 262144 \(MemTotal 3911456 kB\); persisted '1048576', runtime '65536', in use 1234; do: modules-load udev-rule persist runtime-raise" "$TMP/out" \
+  || { cat "$TMP/out"; fail "conntrack dry-run plan"; }
+! grep -qE '^(sysctl -w|udevadm)' "$CALLS" || fail "conntrack dry-run ran a mutating command"
+ok "conntrack: opt-in step; dry-run sizes 2c/4GB to 262144 and changes nothing"
+
+# ── 13. conntrack --apply: boot files + persisted value + runtime raise; rerun ok ─
+R="$(new_root ctapply)"
+rc="$(run_tool "$R" --apply --only conntrack)"
+[ "$rc" = 0 ] || { cat "$TMP/out"; fail "conntrack apply exit $rc"; }
+[ "$(cat "$R/etc/modules-load.d/netrun-conntrack.conf")" = "$CT_MOD_WANT" ] || fail "modules-load file content"
+[ "$(cat "$R/etc/udev/rules.d/90-netrun-conntrack.rules")" = "$CT_UDEV_WANT" ] || fail "udev rule content"
+grep -qx 'net.netfilter.nf_conntrack_max = 262144' "$R/etc/sysctl.d/99-netrun.conf" || fail "value not persisted"
+[ "$(grep -c nf_conntrack_max "$R/etc/sysctl.d/99-netrun.conf")" = 1 ] || fail "duplicate nf_conntrack_max lines"
+grep -qx 'net.netfilter.nf_conntrack_tcp_timeout_established = 7200' "$R/etc/sysctl.d/99-netrun.conf" || fail "other netfilter line lost"
+[ "$(cat "$R/proc/sys/net/netfilter/nf_conntrack_max")" = 262144 ] || fail "runtime not raised"
+grep -qx 'sysctl -w net.netfilter.nf_conntrack_max=262144' "$CALLS" || fail "no sysctl -w"
+grep -qx 'udevadm control --reload' "$CALLS" || fail "udev rules not reloaded"
+! grep -qiE '3proxy|^nft|systemctl' "$CALLS" || { cat "$CALLS"; fail "conntrack step touched something else"; }
+rc="$(run_tool "$R" --apply --only conntrack)"
+[ "$rc" = 0 ] && grep -qE '\] conntrack +ok ' "$TMP/out" || { cat "$TMP/out"; fail "conntrack rerun not ok"; }
+! grep -q 'sysctl -w' "$CALLS" || fail "conntrack rerun mutated again"
+ok "conntrack --apply: modules-load + udev rule + 99-netrun.conf 262144 + runtime raised; rerun is a no-op"
+
+# ── 14. conntrack never lowers a higher runtime value; module not loaded ─
+R="$(new_root cthigh)"
+echo 1048576 > "$R/proc/sys/net/netfilter/nf_conntrack_max"
+rc="$(run_tool "$R" --apply --only conntrack)"
+[ "$rc" = 0 ] || { cat "$TMP/out"; fail "conntrack high exit $rc"; }
+[ "$(cat "$R/proc/sys/net/netfilter/nf_conntrack_max")" = 1048576 ] || fail "runtime was lowered"
+! grep -q 'sysctl -w' "$CALLS" || fail "sysctl -w called to lower"
+grep -q 'left as is' "$TMP/out" || fail "high runtime note"
+grep -qx 'net.netfilter.nf_conntrack_max = 262144' "$R/etc/sysctl.d/99-netrun.conf" || fail "target not persisted (high runtime)"
+R="$(new_root ctnomod)"
+rm -f "$R/proc/sys/net/netfilter/nf_conntrack_max" "$R/proc/sys/net/netfilter/nf_conntrack_count"
+rc="$(run_tool "$R" --apply --only conntrack)"
+[ "$rc" = 0 ] || { cat "$TMP/out"; fail "conntrack no-module exit $rc"; }
+grep -q 'module not loaded now' "$TMP/out" || fail "no-module note"
+[ -f "$R/etc/modules-load.d/netrun-conntrack.conf" ] || fail "no-module: boot file missing"
+! grep -q 'sysctl -w' "$CALLS" || fail "no-module: sysctl -w called"
+ok "conntrack: a higher runtime value is never lowered; without the module only boot files are written"
+
+# ── 15. conntrack: --conntrack-max, unreadable MemTotal, sysctl failure ─
+R="$(new_root ctover)"
+rc="$(run_tool "$R" --apply --only conntrack --conntrack-max 524288)"
+[ "$rc" = 0 ] && [ "$(cat "$R/proc/sys/net/netfilter/nf_conntrack_max")" = 524288 ] || { cat "$TMP/out"; fail "--conntrack-max override"; }
+rc="$(run_tool "$R" --only conntrack --conntrack-max 1000)"; [ "$rc" = 1 ] || fail "--conntrack-max below 65536 accepted"
+rc="$(run_tool "$R" --only conntrack --conntrack-max lots)"; [ "$rc" = 1 ] || fail "--conntrack-max non-numeric accepted"
+R="$(new_root ctnomem)"
+rm -f "$R/proc/meminfo"
+rc="$(run_tool "$R" --apply --only conntrack)"
+[ "$rc" = 2 ] && grep -qE 'conntrack +REFUSED .*MemTotal' "$TMP/out" || { cat "$TMP/out"; fail "no MemTotal must refuse"; }
+[ ! -f "$R/etc/modules-load.d/netrun-conntrack.conf" ] || fail "refused step wrote files"
+R="$(new_root ctfail)"
+rc="$(PATH="$BIN:$PATH" NETRUN_TUNE_ROOT="$R" SYSCTL_CT_FAIL=1 bash "$SCRIPT" --apply --only conntrack > "$TMP/out" 2>&1; echo $?)"
+[ "$rc" = 1 ] && grep -qE 'conntrack +FAILED' "$TMP/out" || { cat "$TMP/out"; fail "sysctl -w failure must be FAILED"; }
+ok "conntrack: --conntrack-max override/validation; no MemTotal refuses (exit 2); sysctl failure reports FAILED"
 
 echo "test_apply_capacity_tuning.sh — all $PASS checks passed"

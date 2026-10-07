@@ -1197,6 +1197,33 @@ function setup_nftables_edge_normalization() {
   nft list ruleset > /etc/nftables.conf 2>/dev/null || true
 }
 
+# Wave FLEET-HEALTH (SPD-05) — a node setting: the environment wins, then
+# ${NETRUN_ENV_FILE:-/etc/netrun/netrun.env} (KEY=VALUE lines), then the default.
+function netrun_setting() {
+  local key="$1" def="$2" v="${!1:-}" f="${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}"
+  if [ -z "$v" ] && [ -r "$f" ]; then
+    v="$(awk -v k="$key" '{ sub(/^[ \t]+/, "") } index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { gsub(/^["\047 \t]+|["\047 \t\r]+$/, "", v); print v }' "$f")"
+  fi
+  printf '%s' "${v:-$def}"
+}
+
+# Wave FLEET-HEALTH (SPD-05) — the counter maps are keyed by PORT only, so an
+# upstream leg whose ephemeral port equals a proxy port is metered to that
+# proxy (its _out = billable download) whenever ip_local_port_range overlaps
+# the listeners (old nodes: 10000-65000). Clients only ever reach the public
+# IPv4 (socks -i<ipv4>, http through haproxy on it; loopback legs excluded), so
+# with NETRUN_ACCOUNTING_MATCH_IPV4=1 the two map rules match only packets to /
+# from that address. Prints the extra match for chain $1 (input|output) and
+# address $2, or nothing (= today's port-only rule). Existing nodes migrate with
+# `netrun-https accounting` (same setting).
+function accounting_client_match() {
+  local chain="$1" ip="$2"
+  [ "$(netrun_setting NETRUN_ACCOUNTING_MATCH_IPV4 0)" = 1 ] || return 0
+  is_valid_ip "$ip" || return 0
+  [ "$ip" != "127.0.0.1" ] || return 0
+  if [ "$chain" = input ]; then echo "iifname != lo ip daddr $ip"; else echo "oifname != lo ip saddr $ip"; fi
+}
+
 function setup_nftables_counters() {
   echo "   Setting up nftables traffic counters for all proxies"
   echo "   Using nftables for better performance and scalability"
@@ -1248,8 +1275,13 @@ function setup_nftables_counters() {
   # map-rules are ensured once here; the per-port loop below only adds map ELEMENTS.
   nft add map inet proxy_accounting cmap_in  '{ type inet_service : counter ; }' 2>/dev/null || true
   nft add map inet proxy_accounting cmap_out '{ type inet_service : counter ; }' 2>/dev/null || true
-  nft list chain inet proxy_accounting input  2>/dev/null | grep -q 'map @cmap_in'  || nft add rule inet proxy_accounting input  counter name tcp dport map @cmap_in
-  nft list chain inet proxy_accounting output 2>/dev/null | grep -q 'map @cmap_out' || nft add rule inet proxy_accounting output counter name tcp sport map @cmap_out
+  local _acct_in_match _acct_out_match
+  _acct_in_match="$(accounting_client_match input "$backconnect_ipv4")"
+  _acct_out_match="$(accounting_client_match output "$backconnect_ipv4")"
+  # shellcheck disable=SC2086 # the match is a list of nft tokens
+  nft list chain inet proxy_accounting input  2>/dev/null | grep -q 'map @cmap_in'  || nft add rule inet proxy_accounting input  $_acct_in_match counter name tcp dport map @cmap_in
+  # shellcheck disable=SC2086
+  nft list chain inet proxy_accounting output 2>/dev/null | grep -q 'map @cmap_out' || nft add rule inet proxy_accounting output $_acct_out_match counter name tcp sport map @cmap_out
 
   echo "   Adding counter rules for $proxy_count proxies..."
   

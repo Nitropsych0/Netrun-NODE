@@ -19,6 +19,11 @@
 #   netrun-https sync    # idempotent: move HTTP listeners, (re)write frontends
 #   netrun-https renew   # timer: renew the certificate when due, reload haproxy
 #   netrun-https status  # short report
+#   netrun-https accounting  # only (re)write the two per-port counter map rules
+#
+# Settings (environment, else ${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}):
+#   NETRUN_ACCOUNTING_MATCH_IPV4=1  meter only client legs: the map rules also
+#     match `ip daddr|saddr <public IPv4>` (default 0 = port-only, as before).
 set -euo pipefail
 
 PROXY_DIR="${NETRUN_PROXY_DIR:-/opt/netrun/proxyserver/3proxy}"
@@ -33,6 +38,15 @@ SELF=/usr/local/sbin/netrun-https
 
 log() { printf '[netrun-https] %s\n' "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
+
+# KEY DEFAULT -> the environment wins, then $NETRUN_ENV_FILE (KEY=VALUE lines).
+netrun_setting() {
+  local key="$1" def="$2" v="${!1:-}" f="${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}"
+  if [ -z "$v" ] && [ -r "$f" ]; then
+    v="$(awk -v k="$key" '{ sub(/^[ \t]+/, "") } index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { gsub(/^["\047 \t]+|["\047 \t\r]+$/, "", v); print v }' "$f")"
+  fi
+  printf '%s' "${v:-$def}"
+}
 
 public_ipv4() {
   ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}'
@@ -189,15 +203,58 @@ reload_haproxy() {
 
 # The per-port counters (proxy_accounting cmap_in/cmap_out) must not see the
 # loopback leg haproxy → 3proxy, or every HTTP proxy byte is counted twice.
+#
+# Wave FLEET-HEALTH (SPD-05) — and, with NETRUN_ACCOUNTING_MATCH_IPV4=1, not an
+# upstream leg either: the maps are keyed by port only, so a 3proxy upstream
+# socket whose ephemeral port equals a proxy port was billed to that proxy
+# whenever ip_local_port_range overlapped the listeners. Clients only reach the
+# public IPv4, so the rules then also match `ip daddr|saddr <public IPv4>`.
+# Converges both ways (setting off -> the iifname-only rule of before); only
+# the map rule is replaced (`nft replace` by handle), counters and map
+# elements — the billing values — are untouched.
+
+# Handles of the `map @<map>` rules in an `nft -a list chain` dump (stdin) that
+# differ from the wanted form: <ifkey> != "lo", plus `ip <addrkey> <ip>` when ip
+# is set, and no `ip <addrkey>` at all when it is empty. Pure (tested).
+accounting_rules_to_fix() {
+  local map="$1" ifkey="$2" addrkey="$3" ip="${4:-}"
+  awk -v map="map @$map" -v ifk="$ifkey != \"lo\"" -v ak="ip $addrkey " -v ip="$ip" '
+    index($0, map) == 0 { next }
+    {
+      ok = index($0, ifk) > 0
+      if (ip != "") ok = ok && index($0, ak ip " ") > 0
+      else ok = ok && index($0, ak) == 0
+      if (!ok && match($0, /# handle [0-9]+/)) print substr($0, RSTART + 9, RLENGTH - 9)
+    }'
+}
+
 fix_accounting() {
-  local h
+  local h ip=""
   nft list table inet proxy_accounting >/dev/null 2>&1 || return 0
-  h="$(nft -a list chain inet proxy_accounting input | awk '/map @cmap_in/ && !/iifname/ {print $NF}')"
-  [ -z "$h" ] || nft replace rule inet proxy_accounting input handle "$h" \
-    iifname != "lo" counter name tcp dport map @cmap_in
-  h="$(nft -a list chain inet proxy_accounting output | awk '/map @cmap_out/ && !/oifname/ {print $NF}')"
-  [ -z "$h" ] || nft replace rule inet proxy_accounting output handle "$h" \
-    oifname != "lo" counter name tcp sport map @cmap_out
+  if [ "$(netrun_setting NETRUN_ACCOUNTING_MATCH_IPV4 0)" = 1 ]; then
+    ip="$(public_ipv4 || true)"
+    [ -n "$ip" ] || log "WARNING: NETRUN_ACCOUNTING_MATCH_IPV4=1 but no public IPv4 found — keeping port-only rules"
+  fi
+  for h in $(nft -a list chain inet proxy_accounting input | accounting_rules_to_fix cmap_in iifname daddr "$ip"); do
+    if [ -n "$ip" ]; then
+      nft replace rule inet proxy_accounting input handle "$h" \
+        iifname != "lo" ip daddr "$ip" counter name tcp dport map @cmap_in
+    else
+      nft replace rule inet proxy_accounting input handle "$h" \
+        iifname != "lo" counter name tcp dport map @cmap_in
+    fi
+  done
+  for h in $(nft -a list chain inet proxy_accounting output | accounting_rules_to_fix cmap_out oifname saddr "$ip"); do
+    if [ -n "$ip" ]; then
+      nft replace rule inet proxy_accounting output handle "$h" \
+        oifname != "lo" ip saddr "$ip" counter name tcp sport map @cmap_out
+    else
+      nft replace rule inet proxy_accounting output handle "$h" \
+        oifname != "lo" counter name tcp sport map @cmap_out
+    fi
+  done
+  # Always persisted (as before): the 5-min sync is also what snapshots the
+  # counter VALUES into /etc/nftables.conf for a reboot.
   nft list ruleset > /etc/nftables.conf
 }
 
@@ -338,5 +395,6 @@ case "${1:-}" in
   sync) cmd_sync ;;
   renew) cmd_renew ;;
   status) cmd_status ;;
-  *) echo "usage: $0 {setup|sync|renew|status}" >&2; exit 2 ;;
+  accounting) fix_accounting ;;
+  *) echo "usage: $0 {setup|sync|renew|status|accounting}" >&2; exit 2 ;;
 esac

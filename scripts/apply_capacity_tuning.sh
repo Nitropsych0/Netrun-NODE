@@ -42,6 +42,19 @@
 #   ipv6restore  /opt/netrun/scripts/netrun-ipv6-restore.sh -> the ip -batch +
 #                nodad version from deploy/node/netrun-ipv6-restore.sh. Only used
 #                at the next boot; NOT run now.
+#   conntrack    OPT-IN (not in the default step list: name it in --only).
+#                nf_conntrack_max sized by RAM (one entry per 8 KB, power of two,
+#                65536..1048576; 2c/4GB -> 262144, ~85 MB when full) and made to
+#                survive reboots: /etc/modules-load.d/netrun-conntrack.conf loads
+#                nf_conntrack BEFORE systemd-sysctl (which otherwise skips the
+#                net.netfilter.* keys — the live node fell back to 65536), a udev
+#                rule re-applies net.netfilter.* whenever the module loads, and
+#                the value is persisted in 99-netrun.conf. The runtime value is
+#                only ever RAISED (sysctl -w); a higher runtime value is left as is
+#                (the target applies from the next boot). Nothing is flushed, no
+#                connection is touched. NOTE: the 99-netrun.conf line
+#                nf_conntrack_tcp_timeout_established = 7200 also starts to apply
+#                at boot (harmless: 3proxy drops idle connections after 1800 s).
 #
 # Read-only listener audit (always printed): TCP listeners below 8100 and any
 # listener >= 8100 that is not 3proxy / haproxy (those would collide with
@@ -50,8 +63,10 @@
 # Options:
 #   --dry-run                 default; print what would be done
 #   --apply                   do it (root)
-#   --only LIST               comma list of: sysctl,unbound,nft,ipv6restore (default: all)
+#   --only LIST               comma list of: sysctl,unbound,nft,ipv6restore,conntrack
+#                             (default: sysctl,unbound,nft,ipv6restore — conntrack is opt-in)
 #   --ephemeral-range LO-HI   default 1024-8000
+#   --conntrack-max N         conntrack step target (default: sized by MemTotal)
 #   --allow-unbound-restart   last resort when unbound cannot be reloaded
 #   --ignore-genlock          run the nft step even if a generation lock exists
 #
@@ -60,7 +75,7 @@
 # config written but not reloaded); 1 = a step failed.
 #
 # Test hook: NETRUN_TUNE_ROOT=<dir> prefixes every file path (fixtures); the
-# commands (ss, nft, sysctl, systemctl, unbound-checkconf, unbound-control) are
+# commands (ss, nft, sysctl, systemctl, udevadm, unbound-checkconf, unbound-control) are
 # taken from PATH.
 set -uo pipefail
 
@@ -77,6 +92,16 @@ RESTORE_TARGET="$ROOT/opt/netrun/scripts/netrun-ipv6-restore.sh"
 RESTORE_UNIT="$ROOT/etc/systemd/system/netrun-ipv6-restore.service"
 RESTORE_SRC="${NETRUN_IPV6_RESTORE_SRC:-${SCRIPT_DIR:+$SCRIPT_DIR/../deploy/node/netrun-ipv6-restore.sh}}"
 LOCK_FILE="$ROOT/run/netrun-capacity-tuning.lock"
+MEMINFO="$ROOT/proc/meminfo"
+PROC_CT_MAX="$ROOT/proc/sys/net/netfilter/nf_conntrack_max"
+PROC_CT_COUNT="$ROOT/proc/sys/net/netfilter/nf_conntrack_count"
+CT_MODULES_FILE="$ROOT/etc/modules-load.d/netrun-conntrack.conf"
+CT_UDEV_RULE="$ROOT/etc/udev/rules.d/90-netrun-conntrack.rules"
+CT_MODULES_TEXT='# NETRUN — load conntrack before systemd-sysctl so net.netfilter.* in /etc/sysctl.d apply at boot
+nf_conntrack'
+CT_UDEV_TEXT='# NETRUN — re-apply net.netfilter.* sysctls whenever nf_conntrack is (re)loaded
+ACTION=="add", SUBSYSTEM=="module", KERNEL=="nf_conntrack", RUN+="/usr/lib/systemd/systemd-sysctl --prefix=/net/netfilter"'
+
 
 NFT_TABLE="proxy_accounting"
 PROXY_PORT_FLOOR=8100
@@ -89,6 +114,7 @@ EPH_LO=1024
 EPH_HI=8000
 ALLOW_UNBOUND_RESTART=0
 IGNORE_GENLOCK=0
+CT_MAX_OVERRIDE=""
 
 RC_REFUSED=0
 RC_FAILED=0
@@ -101,7 +127,7 @@ refused() { step_status "$1" "REFUSED" "$2"; RC_REFUSED=1; }
 failed() { step_status "$1" "FAILED" "$2"; RC_FAILED=1; }
 die() { log "ERROR: $*" >&2; exit 1; }
 
-usage() { sed -n '2,64p' "$0" 2>/dev/null; }
+usage() { sed -n '2,79p' "$0" 2>/dev/null; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -112,6 +138,8 @@ while [ $# -gt 0 ]; do
     --ephemeral-range) [ $# -ge 2 ] || die "--ephemeral-range needs LO-HI"; EPH_LO="${2%%[- ]*}"; EPH_HI="${2##*[- ]}"; shift ;;
     --allow-unbound-restart) ALLOW_UNBOUND_RESTART=1 ;;
     --ignore-genlock) IGNORE_GENLOCK=1 ;;
+    --conntrack-max) [ $# -ge 2 ] || die "--conntrack-max needs a number"; CT_MAX_OVERRIDE="$2"; shift ;;
+    --conntrack-max=*) CT_MAX_OVERRIDE="${1#--conntrack-max=}" ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -122,8 +150,12 @@ case "$EPH_LO$EPH_HI" in *[!0-9]*|"") die "--ephemeral-range must be LO-HI (inte
 [ "$EPH_LO" -ge 1024 ] && [ "$EPH_HI" -gt "$EPH_LO" ] && [ "$EPH_HI" -lt "$PROXY_PORT_FLOOR" ] \
   || die "--ephemeral-range: need 1024 <= LO < HI < $PROXY_PORT_FLOOR (the range must stay below every proxy listener)"
 for s in $(printf '%s' "$ONLY" | tr ',' ' '); do
-  case "$s" in sysctl|unbound|nft|ipv6restore) ;; *) die "--only: unknown step '$s'" ;; esac
+  case "$s" in sysctl|unbound|nft|ipv6restore|conntrack) ;; *) die "--only: unknown step '$s'" ;; esac
 done
+if [ -n "$CT_MAX_OVERRIDE" ]; then
+  case "$CT_MAX_OVERRIDE" in *[!0-9]*) die "--conntrack-max must be an integer" ;; esac
+  [ "$CT_MAX_OVERRIDE" -ge 65536 ] && [ "$CT_MAX_OVERRIDE" -le 4194304 ] || die "--conntrack-max: need 65536 <= N <= 4194304"
+fi
 want() { case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
 if [ "$MODE" = "apply" ] && [ -z "$ROOT" ] && [ "$(id -u)" -ne 0 ]; then
@@ -461,6 +493,88 @@ step_ipv6restore() {
   step_status ipv6restore applied "$RESTORE_TARGET = ip -batch + nodad version (next boot)"
 }
 
+# ── step: conntrack ceiling that survives reboots (opt-in) ─────────
+
+# MemTotal kB -> one entry per 8 KB, rounded down to a power of two, clamped
+# to 65536..1048576 (same formula as install_node_v2.sh / node_followup_v2.sh).
+conntrack_max_for_mem_kb() {
+  local kb="${1:-0}" v=65536
+  case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+  while [ "$v" -lt 1048576 ] && [ $((v * 2)) -le $((kb / 8)) ]; do v=$((v * 2)); done
+  echo "$v"
+}
+
+sysctl_file_key() { # KEY -> persisted value in $SYSCTL_FILE (last one wins), or empty
+  [ -f "$SYSCTL_FILE" ] || return 0
+  awk -F= -v k="$1" '{ key = $1; gsub(/[ \t]/, "", key) } key == k { v = $2 } END { gsub(/^[ \t]+|[ \t]+$/, "", v); print v }' "$SYSCTL_FILE"
+}
+
+# Write TEXT (plus a final newline) to FILE atomically.
+write_text_file() {
+  local file="$1" text="$2"
+  mkdir -p "$(dirname "$file")" || return 1
+  printf '%s\n' "$text" > "$file.new.$$" && mv -f "$file.new.$$" "$file"
+}
+
+step_conntrack() {
+  local mem_kb target persisted runtime count need=() overrides
+  mem_kb="$(awk '/^MemTotal:/ { print $2 }' "$MEMINFO" 2>/dev/null)"
+  if [ -n "$CT_MAX_OVERRIDE" ]; then
+    target="$CT_MAX_OVERRIDE"
+  elif [ -n "$mem_kb" ]; then
+    target="$(conntrack_max_for_mem_kb "$mem_kb")"
+  else
+    refused conntrack "cannot read MemTotal from $MEMINFO — pass --conntrack-max N"
+    return 0
+  fi
+  persisted="$(sysctl_file_key net.netfilter.nf_conntrack_max)"
+  runtime="$(cat "$PROC_CT_MAX" 2>/dev/null || true)"
+  count="$(cat "$PROC_CT_COUNT" 2>/dev/null || true)"
+
+  [ "$(cat "$CT_MODULES_FILE" 2>/dev/null)" = "$CT_MODULES_TEXT" ] || need+=("modules-load")
+  [ "$(cat "$CT_UDEV_RULE" 2>/dev/null)" = "$CT_UDEV_TEXT" ] || need+=("udev-rule")
+  [ "$persisted" = "$target" ] || need+=("persist")
+  if [ -n "$runtime" ] && [ "$runtime" -lt "$target" ] 2>/dev/null; then need+=("runtime-raise"); fi
+  if [ "${#need[@]}" -eq 0 ]; then
+    step_status conntrack ok "nf_conntrack_max $target persisted + loaded at boot (runtime ${runtime:-module not loaded}${count:+, in use $count})"
+    return 0
+  fi
+
+  # Later-sorting sysctl files would override the persisted value at boot.
+  overrides="$(grep -lE '^[[:space:]]*net\.netfilter\.nf_conntrack_max[[:space:]]*=' \
+      "$ROOT"/etc/sysctl.d/*.conf "$ROOT"/etc/sysctl.conf 2>/dev/null | grep -vF "$SYSCTL_FILE" | tr '\n' ' ')"
+
+  if [ "$MODE" = "dry-run" ]; then
+    step_status conntrack would-apply "nf_conntrack_max -> $target (MemTotal ${mem_kb:-?} kB${CT_MAX_OVERRIDE:+, --conntrack-max}); persisted '${persisted:-none}', runtime '${runtime:-module not loaded}'${count:+, in use $count}; do: ${need[*]}"
+    [ -z "$overrides" ] || log "  NOTE: also set in: $overrides (a later file wins at boot — review it)"
+    return 0
+  fi
+
+  write_text_file "$CT_MODULES_FILE" "$CT_MODULES_TEXT" || { failed conntrack "cannot write $CT_MODULES_FILE"; return 0; }
+  write_text_file "$CT_UDEV_RULE" "$CT_UDEV_TEXT" || { failed conntrack "cannot write $CT_UDEV_RULE"; return 0; }
+  udevadm control --reload >/dev/null 2>&1 || true
+  persist_sysctl_kv "$SYSCTL_FILE" "net.netfilter.nf_conntrack_max" "$target"
+  local now_note
+  if [ -z "$runtime" ]; then
+    now_note="module not loaded now: applies when it loads (udev rule) and at boot"
+  elif [ "$runtime" -lt "$target" ] 2>/dev/null; then
+    if ! sysctl -w "net.netfilter.nf_conntrack_max=$target" >/dev/null; then
+      failed conntrack "sysctl -w net.netfilter.nf_conntrack_max=$target failed (boot files written)"
+      return 0
+    fi
+    runtime="$(cat "$PROC_CT_MAX" 2>/dev/null || true)"
+    if [ "$runtime" != "$target" ]; then
+      failed conntrack "runtime value reads '$runtime' after sysctl -w (boot files written)"
+      return 0
+    fi
+    now_note="runtime raised to $target"
+  else
+    now_note="runtime $runtime >= target, left as is (target applies from the next boot)"
+  fi
+  step_status conntrack applied "nf_conntrack_max = $target in $SYSCTL_FILE + $CT_MODULES_FILE + $CT_UDEV_RULE; $now_note"
+  [ -z "$overrides" ] || log "  NOTE: also set in: $overrides (a later file wins at boot — review it)"
+}
+
 # ── main ──────────────────────────────────────────────────────────
 
 log "mode: $MODE | steps: $ONLY | ephemeral range target: $EPH_LO-$EPH_HI${ROOT:+ | root: $ROOT}"
@@ -470,6 +584,7 @@ want sysctl && step_sysctl
 want unbound && step_unbound
 want nft && step_nft
 want ipv6restore && step_ipv6restore
+want conntrack && step_conntrack
 
 if [ "$RC_FAILED" = 1 ]; then log "result: a step FAILED (see above)"; exit 1; fi
 if [ "$RC_REFUSED" = 1 ]; then log "result: a step was REFUSED by a safety check (nothing changed for it)"; exit 2; fi

@@ -150,12 +150,26 @@ async function findRunningPids(port) {
 // per-port delta math is unchanged.
 const COUNTERS_CACHE_GAP_MS = Number(process.env.NODE_AGENT_COUNTERS_CACHE_GAP_MS || 2000);
 const COUNTERS_CACHE_MAX_MS = Number(process.env.NODE_AGENT_COUNTERS_CACHE_MAX_MS || 8000);
-let _countersCache = { at: 0, items: null };
+// Wave FLEET-HEALTH (SPD-05) — the dump costs ~1.1 s at 12k counters and grows
+// to 36k counters on an 18k-proxy node; under generation load the old 5 s
+// execCapture default SIGKILLed it and the whole poll cycle failed. 20 s by
+// default, NODE_AGENT_NFT_DUMP_TIMEOUT_MS to tune (min 5 s).
+const NFT_DUMP_TIMEOUT_MS = Math.max(5000, Number(process.env.NODE_AGENT_NFT_DUMP_TIMEOUT_MS || 20000) || 20000);
+// The cache holds the dump already PARSED into Map(port -> {in, out, in6}):
+// every chunk of a cycle is a few Map lookups instead of a regex pass over all
+// 36k items (the old per-chunk rescan was O(chunks x counters) per cycle).
+let _countersCache = { at: 0, byPort: null };
 let _countersInFlight = null;
 let _lastCounterReqAt = 0;
+let _counterParseCount = 0;
+
+// Overridable exec seam for unit tests (asserts the dump timeout).
+let _dumpExec = execCapture;
 
 async function _fetchAllCounterItems() {
-  const result = await execCapture("nft", ["-j", "list", "counters", "table", "inet", NFT_TABLE]);
+  const result = await _dumpExec("nft", ["-j", "list", "counters", "table", "inet", NFT_TABLE], {
+    timeoutMs: NFT_DUMP_TIMEOUT_MS,
+  });
   if (result.code !== 0) {
     throw new NftablesError("nft_list_counters_failed", result.stderr || `exit ${result.code}`);
   }
@@ -171,21 +185,44 @@ async function _fetchAllCounterItems() {
 // Overridable fetcher seam for unit tests (default = real nft dump).
 let _counterItemsFetcher = _fetchAllCounterItems;
 
-async function _getCachedCounterItems() {
+// One pass over the dump: Map(port -> { in, out, in6 }) of our named counters.
+// Pure + exported for tests.
+function parseCounterItems(items) {
+  _counterParseCount += 1;
+  const byPort = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== "object") continue;
+    const counter = item.counter;
+    if (!counter || typeof counter !== "object") continue;
+    if (counter.family !== "inet" || counter.table !== NFT_TABLE) continue;
+    const m = COUNTER_NAME_RE.exec(String(counter.name || ""));
+    if (!m) continue;
+    const port = Number(m[1]);
+    let bucket = byPort.get(port);
+    if (!bucket) {
+      bucket = { in: 0, out: 0, in6: 0 };
+      byPort.set(port, bucket);
+    }
+    bucket[m[2]] = Number(counter.bytes) || 0;
+  }
+  return byPort;
+}
+
+async function _getCachedCounterMap() {
   const now = Date.now();
   const newCycle = now - _lastCounterReqAt > COUNTERS_CACHE_GAP_MS;
   _lastCounterReqAt = now;
   const fresh =
     !newCycle &&
-    _countersCache.items !== null &&
+    _countersCache.byPort !== null &&
     now - _countersCache.at < COUNTERS_CACHE_MAX_MS;
-  if (fresh) return _countersCache.items;
+  if (fresh) return _countersCache.byPort;
   if (_countersInFlight) return _countersInFlight;
   _countersInFlight = (async () => {
     try {
-      const items = await _counterItemsFetcher();
-      _countersCache = { at: Date.now(), items };
-      return items;
+      const byPort = parseCounterItems(await _counterItemsFetcher());
+      _countersCache = { at: Date.now(), byPort };
+      return byPort;
     } finally {
       _countersInFlight = null;
     }
@@ -195,12 +232,20 @@ async function _getCachedCounterItems() {
 
 // Test seam (Wave PERGB-METER-CACHE).
 function _resetCountersCache() {
-  _countersCache = { at: 0, items: null };
+  _countersCache = { at: 0, byPort: null };
   _countersInFlight = null;
   _lastCounterReqAt = 0;
+  _counterParseCount = 0;
 }
 function _setCounterItemsFetcher(fn) {
   _counterItemsFetcher = typeof fn === "function" ? fn : _fetchAllCounterItems;
+}
+// Test seams (Wave FLEET-HEALTH SPD-05).
+function _setDumpExec(fn) {
+  _dumpExec = typeof fn === "function" ? fn : execCapture;
+}
+function _counterParses() {
+  return _counterParseCount;
 }
 
 async function getCountersForPorts(ports) {
@@ -211,28 +256,12 @@ async function getCountersForPorts(ports) {
   );
   if (requested.size === 0) return {};
 
-  const items = await _getCachedCounterItems();
-
-  const buckets = new Map();
-  for (const item of items) {
-    if (!item || typeof item !== "object") continue;
-    const counter = item.counter;
-    if (!counter || typeof counter !== "object") continue;
-    if (counter.family !== "inet" || counter.table !== NFT_TABLE) continue;
-    const m = COUNTER_NAME_RE.exec(String(counter.name || ""));
-    if (!m) continue;
-    const port = Number(m[1]);
-    const kind = m[2];
-    if (!requested.has(port)) continue;
-    if (!buckets.has(port)) buckets.set(port, { in: 0, out: 0, in6: 0, present: false });
-    const bucket = buckets.get(port);
-    bucket.present = true;
-    bucket[kind] = Number(counter.bytes) || 0;
-  }
+  const byPort = await _getCachedCounterMap();
 
   const out = {};
-  for (const [port, b] of buckets) {
-    if (!b.present) continue;
+  for (const port of requested) {
+    const b = byPort.get(port);
+    if (!b) continue;
     // Wave PERGB-METER-FIX — _in = client->proxy upload, _out = proxy->client
     // download (BILLABLE), both family-agnostic (client-port rules). The legacy
     // v6-egress `in6` counter is retired (it captured ~0 under dual-stack); on a
@@ -595,6 +624,12 @@ module.exports = {
   // Metering-cache test hooks (accounting.meter_cache.test.js).
   _resetCountersCache,
   _setCounterItemsFetcher,
+  // Wave FLEET-HEALTH (SPD-05) — parse-once map + dump timeout seams.
+  parseCounterItems,
+  _fetchAllCounterItems,
+  _setDumpExec,
+  _counterParses,
+  NFT_DUMP_TIMEOUT_MS,
   _writeBlockedList,
   _httpFor,
   BLOCKED_LIST_FILE,
