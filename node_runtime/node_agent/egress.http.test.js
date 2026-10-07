@@ -3,8 +3,9 @@
 // Wave IPV6-ROTATION — the HTTP contract of /egress (status codes and body
 // shapes the orchestrator relies on), the server.js wiring (auth, 404
 // fall-through, /deprovision dropping egress state) and
-// /describe.supports.egress_rotation and the nftables.service boot drop-in.
-// `ip`, `nft`, `pgrep` and `systemctl` are stubs on PATH.
+// /describe.supports.egress_rotation, the nftables.service boot drop-in and
+// the persisted proxy-NDP sysctls. `ip`, `nft`, `pgrep` and `systemctl` are
+// stubs on PATH; /proc/sys is a fake tree (EGRESS_PROC_SYS).
 // Run with: node --test node_runtime/node_agent/egress.http.test.js
 
 const test = require("node:test");
@@ -20,12 +21,13 @@ const BIN = path.join(ROOT, "bin");
 const LOG = path.join(ROOT, "commands.log");
 fs.mkdirSync(BIN);
 fs.mkdirSync(path.join(ROOT, "3proxy"));
-// ip: one NIC with one global address; every batch succeeds.
+// ip: one NIC with one global address, no proxy entries; every batch succeeds.
 fs.writeFileSync(path.join(BIN, "ip"), `#!/bin/sh
 echo "ip $*" >> "${LOG}"
 case "$*" in
   "-6 route show default") echo "default via fe80::1 dev eth0 proto static metric 1024 pref medium" ;;
   "-6 -o addr show dev eth0"*) echo "2: eth0    inet6 2001:db8:1:2::1/64 scope global \\\\       valid_lft forever preferred_lft forever" ;;
+  "-6 neigh show proxy dev eth0") ;;
   "-6 -force -batch "*) cat "$4" >> "${LOG}" ;;
   *) exit 2 ;;
 esac
@@ -42,6 +44,20 @@ fs.writeFileSync(path.join(BIN, "systemctl"), `#!/bin/sh\necho "systemctl $*" >>
 fs.mkdirSync(path.join(ROOT, "systemd"));
 const DROPIN = path.join(ROOT, "systemd", "nftables.service.d", "netrun-egress.conf");
 process.env.EGRESS_NFT_DROPIN = DROPIN;
+// proxy-NDP sysctls: a fake /proc/sys, the file in a fake /etc/sysctl.d
+const PROC = path.join(ROOT, "proc");
+for (const [key, value] of [
+  ["net/ipv6/conf/all/forwarding", "1"], ["net/ipv6/conf/all/proxy_ndp", "0"],
+  ["net/ipv6/conf/eth0/forwarding", "1"], ["net/ipv6/conf/eth0/proxy_ndp", "0"],
+  ["net/ipv6/conf/eth0/accept_ra", "0"], ["net/ipv6/neigh/eth0/proxy_delay", "80"],
+]) {
+  fs.mkdirSync(path.dirname(path.join(PROC, key)), { recursive: true });
+  fs.writeFileSync(path.join(PROC, key), `${value}\n`);
+}
+fs.mkdirSync(path.join(ROOT, "sysctl.d"));
+const SYSCTL_CONF = path.join(ROOT, "sysctl.d", "99-netrun-egress.conf");
+process.env.EGRESS_PROC_SYS = PROC;
+process.env.EGRESS_SYSCTL_CONF = SYSCTL_CONF;
 process.env.PATH = `${BIN}:${process.env.PATH}`;
 process.env.NODE_AGENT_PROXY_ROOT = ROOT;
 process.env.NODE_AGENT_JOBS_ROOT = path.join(ROOT, "jobs");
@@ -134,7 +150,8 @@ test("after start: rotate / mode / reset / GET shapes over HTTP", async () => {
   assert.strictEqual((await buildDescribe({ egressRotation: eg.isAvailable() })).supports.egress_rotation, true);
 
   const log = fs.readFileSync(LOG, "utf-8");
-  assert.ok(log.includes(`address add ${a.new_ipv6} dev eth0 nodad`));
+  assert.ok(log.includes(`neigh add proxy ${a.new_ipv6} dev eth0\n`));
+  assert.ok(!log.includes("address add"), "nothing is added to the NIC");
   assert.ok(log.includes(`add element ip6 netrun_egress static_egress { ${ANCHOR_30000} : ${a.new_ipv6}`));
 
   const mode = await request("POST", "/egress/mode", { body: { ports: [31000], mode: "per_connection" } });
@@ -191,4 +208,15 @@ test("start() wrote the nftables.service drop-in with the absolute nft path, the
   assert.strictEqual(await started, true);
   assert.strictEqual(fs.readFileSync(DROPIN, "utf-8"), eg.nftDropinText(path.join(BIN, "nft")));
   assert.ok(fs.readFileSync(LOG, "utf-8").includes("systemctl daemon-reload"));
+});
+
+test("start() turned proxy NDP on for the default-route interface and persisted it; the table has the forward guard", async () => {
+  assert.strictEqual(await started, true);
+  const read = (key) => fs.readFileSync(path.join(PROC, key), "utf-8").trim();
+  assert.deepStrictEqual(
+    eg.egressSysctls("eth0").map((s) => read(s.key.join("/"))),
+    ["1", "1", "0", "1", "1"]
+  );
+  assert.strictEqual(fs.readFileSync(SYSCTL_CONF, "utf-8"), eg.sysctlConfText("eth0"));
+  assert.ok(fs.readFileSync(LOG, "utf-8").includes("\tchain forward_guard {\n\t\ttype filter hook forward priority filter; policy accept;\n\t\tip6 daddr 2001:db8:1:2::/64 drop\n"));
 });

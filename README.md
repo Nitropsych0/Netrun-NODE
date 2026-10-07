@@ -157,6 +157,8 @@ table ip6 netrun_egress {
   chain post { type nat hook postrouting priority srcnat; policy accept;
                ip6 saddr @dyn_anchors goto dyn
                snat to ip6 saddr map @static_egress }
+  chain forward_guard { type filter hook forward priority filter; policy accept;
+               ip6 daddr <the node's /64> drop }         # forward guard, see below
 }
 ```
 
@@ -165,10 +167,58 @@ sessions keep their address and other ports are never affected; pay-per-GB meter
 is keyed by the client-facing port and does not change. Every nft change is one
 `nft -f` transaction (an element delta; a full `add table` + `delete table` +
 definition rebuild if the kernel no longer matches), so the table is never half
-applied. A new address is the node's /64 + 64 random bits, added with
-`ip -6 -force -batch` (`address add <a> dev <if> nodad`) **before** nft maps to it.
-The agent creates the (empty) table when it starts; with nothing rotated it changes
-no packet.
+applied. A new address is the node's /64 + 64 random bits, never one already on the
+NIC, another proxy entry, an anchor or an address of the state. The agent creates the
+(empty) table when it starts; with nothing rotated it changes no packet.
+
+**Proxy NDP, not NIC addresses.** Rotated, pool and draining addresses are never put
+on the interface. Measured on a production node (Vultr, Ubuntu 24.04, kernel 6.8,
+~16k anchors on `enp1s0`): every `ip address add|del` costs the kernel O(n) there —
+1000 `address add … nodad` in one `ip -6 -batch` took ~35 s of kernel time, 200
+`address del` 4.4 s — so a 1000-port rotate went over the orchestrator's 30 s node
+timeout and creating the 1024-address per-connection pool took 35.8 s. Instead each
+address is a proxy neighbour entry, added **before** nft maps to it and deleted only by
+the GC after its drain, in one `ip -6 -force -batch` per operation:
+
+```text
+neigh add proxy <a> dev <if>      # 1000 in one batch: 0.37 s on that node
+neigh del proxy <a> dev <if>      # 1000: 0.19 s
+```
+
+The kernel then answers the router's neighbour solicitations for `<a>` with the
+node's MAC, and a reply to a NATed connection is de-NATed back to the anchor by
+conntrack in PREROUTING, before routing, so `<a>` never has to be a local address
+(verified end to end on that node: a real 3proxy port egressed from `<a>`). This needs
+on the egress interface (the agent sets them at start, writing only what differs, and
+keeps them in `/etc/sysctl.d/99-netrun-egress.conf`; the GC tick puts them back if
+they change):
+
+| sysctl | value | why |
+|---|---|---|
+| `net.ipv6.conf.<if>.proxy_ndp` | 1 | answer the router's (multicast) solicitations for the proxy entries |
+| `net.ipv6.conf.all.proxy_ndp` | 1 | the router's **unicast** reachability probes for an address are addressed to it, take the forwarding path, and `ip6_forward()` hands them to neighbour discovery only when the `all` value is on; without it every probe goes unanswered and the router drops and re-resolves the entry. Entries are per device, so nothing else is answered |
+| `net.ipv6.neigh.<if>.proxy_delay` | 0 | answer at once (the default delays the answer by up to 0.8 s) |
+| `net.ipv6.conf.all.forwarding`, `net.ipv6.conf.<if>.forwarding` | 1 | the kernel answers for proxy entries only on a forwarding interface, and `ip6_forward()` drops everything unless `all` forwards. The installers already set both; a `1` is never written over a `1` (any such write drops RA-learned default routes), and an interface that takes RAs (`accept_ra=1`, not forwarding yet) is switched to `accept_ra=2` first |
+
+**Forward guard.** With forwarding on and no local address, an unsolicited packet to a
+proxied address (a drained one, a scan; anything without a conntrack entry to de-NAT
+it) would be forwarded back out the on-link /64 and ping-pong with the router. The
+node forwards for nobody, so `chain forward_guard` drops every forwarded packet to the node's
+/64 (the prefix the module detected or `NODE_EGRESS_PREFIX`). Neighbour solicitations
+to a proxied address are handled before the forward hook and are not affected.
+Unlike anchors, rotated addresses therefore answer no ping and accept no inbound
+connection; the kernel may still send a rate-limited (1/s per destination) ICMPv6
+redirect for such a packet before the hook drops it.
+
+**Upgrade from the version that added NIC addresses.** At start the agent re-adds the
+proxy entry of every current, pool and draining address of its state in one batch,
+then deletes from the NIC each of them that is still there (with the prefix length it
+carries; never an anchor) — only once its proxy entry is in place, so no port loses its
+address in between, open connections included. Anything that cannot be moved stays on
+the NIC (it still works there) and the GC deletes both copies once it has drained.
+`address del` is the slow operation above (~22 ms per address next to 16k anchors), so
+this one-time move takes as long as the old version's addresses need — ~25 s for a
+1024-address pool plus a hundred rotated ports.
 
 All endpoints honour `X-API-KEY`; at most 1000 ports per call; a port is the SOCKS port.
 
@@ -196,23 +246,27 @@ state; `ok` is true only if every item is). `reset` is idempotent: a port withou
 (`idle_since`: when the last `per_connection` port left the pool, else `null`).
 400 `bad_request` on a malformed body or more than 1000 ports; 503
 `egress_unavailable` (with `detail`) when the module is not up (no nft / no NAT, no
-default IPv6 route, a bad `NODE_EGRESS_PREFIX`) or the state file cannot be written.
+default IPv6 route, a bad `NODE_EGRESS_PREFIX`, `sysctl_failed: …` when the proxy-NDP
+sysctls cannot be set) or the state file cannot be written.
 `/deprovision` also drops the egress state of the ports it removes.
 
 Environment (agent unit drop-in):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EGRESS_DRAIN_SEC` | 600 | how long a retired address stays on the NIC (default for `drain_sec`; always used for pool members) |
+| `EGRESS_DRAIN_SEC` | 600 | how long a retired address keeps its proxy entry (default for `drain_sec`; always used for pool members) |
 | `EGRESS_POOL_SIZE` | 1024 | node-wide per-connection pool, created when the first port enters `per_connection` |
 | `EGRESS_POOL_REFRESH_SEC` | 600 | pool refresh period; also how long a pool nobody uses is kept idle before it drains |
 | `EGRESS_POOL_REFRESH_FRACTION` | 0.25 | share of the pool (oldest first) replaced on each refresh |
-| `EGRESS_MAX_EXTRA_ADDRS` | 40000 | most current + pool + draining addresses the node holds (anchors not counted) |
+| `EGRESS_MAX_EXTRA_ADDRS` | 40000 | most current + pool + draining addresses (proxy entries) the node holds (anchors not counted) |
 | `NODE_EGRESS_PREFIX` | — | the /64 for new addresses (e.g. `2001:db8:1:2::/64`); default: the /64 of the first global address on the default-route IPv6 interface |
 | `EGRESS_NFT_DROPIN` | `/etc/systemd/system/nftables.service.d/netrun-egress.conf` | the boot drop-in below; `off` = do not write it |
+| `EGRESS_SYSCTL_CONF` | `/etc/sysctl.d/99-netrun-egress.conf` | where the proxy-NDP sysctls above are persisted (rewritten at start only when different); `off` = do not write it |
 
-Address count: every extra address is one more /128 (and MLD group) on a NIC that
-already carries up to ~18k anchors, so it is bounded whatever callers do:
+Address count: every extra address is one more proxy entry (and one more
+solicited-node multicast group — the kernel joins it so the router's solicitations
+reach the node) on an interface that already carries up to ~18k anchors, so it is
+bounded whatever callers do:
 - **one draining address per port**: rotating a port again (timer, rotation link, bot)
   ends the drain of its previous-but-one address at once, so a port holds at most its
   anchor, its current address and one draining address (sessions older than the
@@ -228,17 +282,19 @@ already carries up to ~18k anchors, so it is bounded whatever callers do:
 
 Addresses and reboots: the state lives in `$PROXY_ROOT/egress_state.json` (atomic
 tmp+fsync+rename, written before a call answers). Retired addresses drain and a 30 s
-GC deletes them with the prefix length they actually carry (`/128`, or `/64` after the
-boot restore); an anchor, a current or a pool address is never deleted. The same tick
-checks that the table still exists (`nft list chain ip6 netrun_egress post`, only while
-something is mapped) and rebuilds it from the state after an `nft flush ruleset` or a
-`systemctl restart nftables`. The kernel forgets the added addresses and the table on
-reboot, and `netrun-ipv6-restore` only knows the cfgs' `-e` anchors: the **agent**
-re-adds the current and pool addresses of its state in one `ip -batch` and rebuilds the
-table when it starts, dropping ports whose cfg block or anchor is gone (an address that
-cannot be re-added is forgotten: that port leaves from its anchor until it is rotated
-again). Draining addresses are not re-added (no session survives a reboot; after a plain
-agent restart they are still on the NIC and the GC deletes them).
+GC deletes their proxy entries in one batch; an anchor, a current or a pool address is
+never deleted. The same tick checks that the table still exists (`nft list chain ip6
+netrun_egress post`, only while something is mapped) and rebuilds it from the state
+after an `nft flush ruleset` or a `systemctl restart nftables`, and — while the state
+holds an address — re-checks the sysctls and lists the proxy entries
+(`ip -6 neigh show proxy dev <if>`), re-adding any that vanished (the kernel drops a
+device's proxy entries when it goes down, and a re-created interface starts with
+`proxy_ndp` off). The kernel forgets proxy entries and the table on reboot, and
+`netrun-ipv6-restore` only knows the cfgs' `-e` anchors: the **agent** re-adds the
+proxy entries of its state's current, pool and draining addresses in one `ip -batch`
+and rebuilds the table when it starts, dropping ports whose cfg block or anchor is
+gone (an address that cannot be re-added is forgotten: that port leaves from its anchor
+until it is rotated again).
 
 Boot: the generator, `/deprovision`, `netrun-harden`, `netrun-https` and the install
 scripts save the whole ruleset (`nft list ruleset > /etc/nftables.conf`), this table
@@ -252,31 +308,49 @@ ExecStartPost=-/usr/sbin/nft delete table ip6 netrun_egress
 ```
 
 Rotated ports then leave from their anchors until the agent's start-up rebuild (a few
-seconds). `install_node_v2.sh` and `node_followup_v2.sh` install it, and the agent
+seconds; the proxy entries come back in the same start-up). `install_node_v2.sh` and `node_followup_v2.sh` install it, and the agent
 writes it at start when it is missing or different (then a best-effort
 `systemctl daemon-reload`), so a code deploy covers existing nodes.
 
-Rollback to an agent without rotation (it never touches the table or the addresses):
+Rollback to an agent without rotation (it never touches the table or the proxy
+entries). Delete the proxy entries with the table: without its forward guard a proxied
+address would be forwarded back out to the router. Only the egress module adds proxy
+entries on a node.
 
 ```bash
+IF="$(ip -6 route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+ip -6 neigh show proxy dev "$IF" | awk -v d="$IF" 'NF { print "neigh del proxy " $1 " dev " d }' | ip -6 -force -batch -
 nft delete table ip6 netrun_egress          # every port leaves from its anchor again
-rm -f /opt/netrun/proxyserver/egress_state.json
+rm -f /opt/netrun/proxyserver/egress_state.json /etc/sysctl.d/99-netrun-egress.conf
 nft list ruleset > /etc/nftables.conf       # the saved copy goes too
-# the drop-in may stay (a missing table is ignored); the added /128s go at the next reboot
+# the drop-in may stay (a missing table is ignored); proxy_ndp=1 with no entries is harmless
 ```
 
-`scripts/clean_node.sh` also deletes the table, `egress_state.json` and the drop-in.
+An agent of the version before proxy NDP finds the state's addresses missing from the
+NIC at start and re-adds them there (`address add`), so deleting the state as above is
+what keeps a rollback quick. `scripts/clean_node.sh` also deletes the proxy entries, the
+table, `egress_state.json`, the drop-in and the sysctl file.
 
 Limits: every address stays inside the node's one /64 (anti-fraud systems that score a
 whole /64 still see one network), and with dual-stack (`-64`) proxies IPv4-only sites
-still see the node's single IPv4. Each rotated port holds two addresses on the NIC
-(anchor + current) plus at most one draining. Before offering short timers at scale,
-watch `ipv6=` and `load=` in `/var/log/netrun-trend.log` on a full staging node.
+still see the node's single IPv4. Each rotated port holds its anchor on the NIC plus a
+proxy entry for its current address and at most one draining one. Before offering short
+timers at scale, watch `ipv6=` and `load=` in `/var/log/netrun-trend.log` on a full
+staging node.
 
 ```bash
-sudo bash scripts/smoke_egress_rotation.sh   # throw-away Linux box only: netns, real nft;
-                                             # also proves the saved ruleset loads back at boot
+sudo bash scripts/smoke_egress_rotation.sh
 ```
+
+The smoke runs the module against the real kernel (iproute2, proxy NDP, nft NAT,
+conntrack) entirely inside throw-away network namespaces — the veth pair is created
+inside them, the module's state and sysctl file go to a temp dir, everything is removed
+on exit — so it leaves the host's addresses, neighbour table, ruleset and sysctls alone.
+It checks the sysctls and the forward guard, that rotated and pool addresses are proxy
+entries and never NIC addresses, open connections across a rotation and across the
+move off the NIC, the GC, that unsolicited packets to a rotated address are dropped at
+the forward hook, that a unicast reachability probe for one is answered, and that the
+saved ruleset loads back at boot.
 
 ## Smoke Generate
 

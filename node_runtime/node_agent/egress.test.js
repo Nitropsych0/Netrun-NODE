@@ -1,8 +1,9 @@
 "use strict";
 
 // Wave IPV6-ROTATION — the pure half of egress.js: IPv6 text, cfg anchors,
-// state transitions, GC selection, the address budget, the exact nft text and
-// the nftables.service boot drop-in.
+// `ip` output, state transitions, GC selection, the address budget, the exact
+// nft text (with the forward guard), the proxy-NDP sysctls and the
+// nftables.service boot drop-in.
 // Run with: node --test node_runtime/node_agent/egress.test.js
 
 const test = require("node:test");
@@ -120,6 +121,51 @@ test("ip output parsers", () => {
     ["2001:db8:1:2::5", 128, "global"],
     ["2001:db8:1:2::1", 64, "global"],
     ["fe80::1", 64, "link"],
+  ]);
+  // `ip -6 neigh show proxy dev eth0` (no "dev" column when filtered) and unfiltered
+  const proxies = eg.parseNeighProxy([
+    "2001:db8:1:2:aaaa::1 proxy",
+    "2001:0db8:0001:0002:aaaa:0000:0000:0002 dev eth0 proxy",
+    "",
+    "garbage proxy",
+  ].join("\n"));
+  assert.deepStrictEqual([...proxies], ["2001:db8:1:2:aaaa::1", "2001:db8:1:2:aaaa::2"]);
+  assert.deepStrictEqual([...eg.parseNeighProxy("")], []);
+});
+
+test("proxy-NDP sysctls: what is set, in which order, and the persisted file", () => {
+  assert.deepStrictEqual(eg.egressSysctls("enp1s0").map((s) => [s.key.join("/"), s.want]), [
+    ["net/ipv6/conf/all/proxy_ndp", "1"], // unicast probes take ip6_forward(), which checks only "all"
+    ["net/ipv6/conf/enp1s0/proxy_ndp", "1"],
+    ["net/ipv6/neigh/enp1s0/proxy_delay", "0"],
+    ["net/ipv6/conf/all/forwarding", "1"],
+    ["net/ipv6/conf/enp1s0/forwarding", "1"],
+  ]);
+  const head = [
+    "# NETRUN IPv6 egress rotation (node-agent egress.js). Rotated and per-connection",
+    "# addresses are not added to enp1s0: the kernel answers the router's neighbour",
+    "# solicitations for them (proxy NDP; `ip -6 neigh show proxy dev enp1s0`).",
+    "# Written by the agent at start when it differs; edits are overwritten.",
+  ];
+  assert.strictEqual(eg.sysctlConfText("enp1s0"), [
+    ...head,
+    "net.ipv6.conf.all.proxy_ndp = 1",
+    "net.ipv6.conf.enp1s0.proxy_ndp = 1",
+    "net.ipv6.neigh.enp1s0.proxy_delay = 0",
+    "net.ipv6.conf.all.forwarding = 1",
+    "net.ipv6.conf.enp1s0.forwarding = 1",
+    "",
+  ].join("\n"));
+  // accept_ra before forwarding (sysctl applies the file in order); a dot in
+  // an interface name is written as "/"
+  const vlan = eg.sysctlConfText("eth0.100", { acceptRa: true }).split("\n").filter((l) => l && !l.startsWith("#"));
+  assert.deepStrictEqual(vlan, [
+    "net.ipv6.conf.all.proxy_ndp = 1",
+    "net.ipv6.conf.eth0/100.proxy_ndp = 1",
+    "net.ipv6.neigh.eth0/100.proxy_delay = 0",
+    "net.ipv6.conf.eth0/100.accept_ra = 2",
+    "net.ipv6.conf.all.forwarding = 1",
+    "net.ipv6.conf.eth0/100.forwarding = 1",
   ]);
 });
 
@@ -384,14 +430,14 @@ test("reconcileWithCfgs / dropMissing (startup)", () => {
     { 30000: { anchor: A, current: X, mode: "static" }, 30001: { anchor: B, current: Y, mode: "static" } },
     { pool: [P1, P2], draining: [{ addr: "2001:db8:1:2::d1", until: iso(NOW) }] }
   );
-  const present = new Map([[X, 128], [P2, 128]]);
+  const present = new Set([X, P2]); // proxy entries (or, not yet moved, NIC addresses)
   const kept = eg.dropMissing(s, present);
   assert.deepStrictEqual(kept.state.ports[30001], { anchor: B, current: null, mode: "static" });
   assert.deepStrictEqual(kept.state.ports[30000].current, X);
   assert.deepStrictEqual(kept.state.pool, [P2]);
   assert.deepStrictEqual(kept.state.draining, []);
   assert.deepStrictEqual(kept.lost.sort(), [P1, Y].sort());
-  const noPool = eg.dropMissing({ ...s, pool_refreshed_at: iso(NOW) }, new Map());
+  const noPool = eg.dropMissing({ ...s, pool_refreshed_at: iso(NOW) }, new Set());
   assert.deepStrictEqual([noPool.state.pool, noPool.state.pool_refreshed_at], [[], null]);
 });
 
@@ -418,19 +464,34 @@ test("pool refresh: oldest fraction out, shortfall filled, a failed add never sh
   });
 });
 
-test("planGc: due + on the NIC → delete with its real prefix length; protected never", () => {
+test("planGc: due proxy entries deleted, NIC leftovers with their real prefix length; protected never", () => {
+  const Z = "2001:db8:1:2:aaaa::9";
   const s = stateWith({}, {
     draining: [
-      { addr: X, until: iso(NOW - 1) }, // due, /128
-      { addr: Y, until: iso(NOW) }, // due, /64 after a boot restore
+      { addr: X, until: iso(NOW - 1) }, // due, a proxy entry
+      { addr: Y, until: iso(NOW) }, // due, proxy entry + left on the NIC (/64) by the version before
+      { addr: Z, until: iso(NOW) }, // due, only on the NIC (its proxy entry never came)
       { addr: P1, until: iso(NOW + 1) }, // not yet
       { addr: P2, until: iso(NOW - 1) }, // due but already gone
       { addr: A, until: iso(NOW - 1) }, // an anchor again → never deleted
     ],
   });
-  const plan = eg.planGc(s, { nowMs: NOW, iface: new Map([[X, 128], [Y, 64], [P1, 128], [A, 128]]), protectedAddrs: new Set([A]) });
-  assert.deepStrictEqual(plan.deletes.map((d) => [d.addr, d.plen]), [[X, 128], [Y, 64]]);
+  const plan = eg.planGc(s, {
+    nowMs: NOW,
+    proxies: new Set([X, Y, P1, A]),
+    nic: new Map([[Y, 64], [Z, 128], [A, 128]]),
+    protectedAddrs: new Set([A]),
+  });
+  assert.deepStrictEqual(plan.deletes.map((d) => [d.addr, d.proxy, d.plen]), [[X, true, undefined], [Y, true, 64], [Z, false, 128]]);
   assert.deepStrictEqual(plan.keep.map((d) => d.addr), [P1]);
+  assert.deepStrictEqual(eg.gcBatchLines(plan.deletes, "eth0"), [
+    `neigh del proxy ${X} dev eth0`,
+    `neigh del proxy ${Y} dev eth0`,
+    `address del ${Y}/64 dev eth0`,
+    `address del ${Z}/128 dev eth0`,
+  ]);
+  // no NIC leftovers (the usual case): proxy entries only
+  assert.deepStrictEqual(eg.planGc(s, { nowMs: NOW, proxies: new Set([X]), protectedAddrs: new Set() }).deletes.map((d) => d.addr), [X]);
 });
 
 test("nftRebuildScript: the exact table from the plan, one transaction", () => {
@@ -443,7 +504,7 @@ test("nftRebuildScript: the exact table from the plan, one transaction", () => {
     },
     { pool: [P1, P2] }
   );
-  assert.strictEqual(eg.nftRebuildScript(s), [
+  assert.strictEqual(eg.nftRebuildScript(s, "2001:db8:1:2::/64"), [
     "add table ip6 netrun_egress",
     "delete table ip6 netrun_egress",
     "table ip6 netrun_egress {",
@@ -468,14 +529,31 @@ test("nftRebuildScript: the exact table from the plan, one transaction", () => {
     "\t\tip6 saddr @dyn_anchors goto dyn",
     "\t\tsnat to ip6 saddr map @static_egress",
     "\t}",
+    "\tchain forward_guard {",
+    "\t\ttype filter hook forward priority filter; policy accept;",
+    "\t\tip6 daddr 2001:db8:1:2::/64 drop",
+    "\t}",
     "}",
     "",
   ].join("\n"));
 
-  // empty state: same shape, no elements, an empty dyn chain (egress = anchor)
-  const empty = eg.nftRebuildScript(eg.emptyState());
+  // empty state: same shape, no elements, an empty dyn chain (egress = anchor),
+  // the forward guard for whatever /64 the node has
+  const empty = eg.nftRebuildScript(eg.emptyState(), "2001:db8:aaaa:5::/64");
   assert.ok(!empty.includes("elements"));
   assert.ok(empty.includes("\tchain dyn {\n\t}\n"));
+  assert.ok(empty.endsWith([
+    "\tchain forward_guard {",
+    "\t\ttype filter hook forward priority filter; policy accept;",
+    "\t\tip6 daddr 2001:db8:aaaa:5::/64 drop",
+    "\t}",
+    "}",
+    "",
+  ].join("\n")));
+  // never a table without its guard
+  for (const bad of [undefined, null, "", "2001:db8:1::/48", "nope"]) {
+    assert.throws(() => eg.nftRebuildScript(s, bad), TypeError, String(bad));
+  }
 });
 
 test("nftDiffScript: element deltas, value change = delete + add, pool = flush + rule", () => {

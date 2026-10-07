@@ -85,6 +85,13 @@ merge_sysctl_conf() {
 }
 
 log "Applying kernel sysctl tweaks (merge into /etc/sysctl.d/99-netrun.conf)"
+# Wave IPV6-ROTATION — all.forwarding=1 is also what the agent's IPv6 egress
+# rotation relies on: rotated / per-connection addresses are proxy-NDP entries,
+# not NIC addresses (O(n) `ip address add|del` next to ~16k anchors), and the
+# kernel answers for them only on a forwarding interface. The agent sets
+# net.ipv6.conf.{all,<if>}.proxy_ndp=1 and net.ipv6.neigh.<if>.proxy_delay=0
+# itself and keeps them in /etc/sysctl.d/99-netrun-egress.conf (not written
+# here); its nft table drops forwarded packets to the node's /64.
 # NETRUN — raised limits for 4000+ concurrent 3proxy instances.
 # Default kernel.pid_max=65536 / threads-max=65536 trips fork EAGAIN
 # when restore script respawns the full pool at boot.
@@ -313,7 +320,7 @@ WantedBy=timers.target
 EOF
 
 # Wave IPV6-ROTATION — a saved /etc/nftables.conf may hold the agent's table
-# ip6 netrun_egress, whose addresses are gone after a reboot (the watchdog's
+# ip6 netrun_egress, whose proxy-NDP addresses are gone after a reboot (the watchdog's
 # tier 2 reboots): nftables.service deletes it right after the boot load, so
 # proxies leave from their anchors until the agent rebuilds it. The agent
 # writes the same file at start (egress.js nftDropinText).

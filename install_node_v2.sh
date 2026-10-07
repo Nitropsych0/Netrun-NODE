@@ -154,6 +154,17 @@ install_runtime_files() {
 }
 
 # === CHANGE 1: kernel.pid_max + threads-max added ===
+# Wave IPV6-ROTATION — all.forwarding=1 below is also what IPv6 egress
+# rotation's proxy NDP relies on: rotated / per-connection addresses are
+# proxy neighbour entries, not NIC addresses (an `ip address add|del` costs
+# O(n) next to ~16k anchors: 1000 adds ≈ 35 s on a production node; 1000
+# proxy entries ≈ 0.37 s), and the kernel answers for them only on a
+# forwarding interface. The agent (egress.js) sets the rest itself at start —
+# net.ipv6.conf.{all,<if>}.proxy_ndp=1, net.ipv6.neigh.<if>.proxy_delay=0 —
+# writing only what differs, and keeps them in
+# /etc/sysctl.d/99-netrun-egress.conf (rewritten whenever it differs; this
+# script never writes that file). Its nft table drops forwarded packets to the
+# node's /64, so forwarding=1 forwards nothing.
 configure_sysctl() {
   log "Configuring sysctl (IPv6 forwarding + raised kernel pid/thread limits)"
   # nf_conntrack module is lazy-loaded by nftables; on a freshly-cleaned node
@@ -368,8 +379,8 @@ configure_nftables() {
 
 # Wave IPV6-ROTATION — `nft list ruleset > /etc/nftables.conf` (here, the
 # generator, deprovision, netrun-harden, netrun-https) also saves the agent's
-# table ip6 netrun_egress, whose rotated / pool addresses are gone after a
-# reboot. This drop-in deletes it right after nftables.service loads the file:
+# table ip6 netrun_egress, whose rotated / pool addresses (proxy-NDP entries)
+# are gone after a reboot. This drop-in deletes it right after nftables.service loads the file:
 # proxies leave from their anchors until the agent rebuilds the table from
 # egress_state.json. The agent writes the same file at start (egress.js
 # nftDropinText; egress.test.js keeps the texts equal).
