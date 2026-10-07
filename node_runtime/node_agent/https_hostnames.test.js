@@ -13,6 +13,7 @@ const assert = require("node:assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const { execFileSync } = require("child_process");
 const { EventEmitter } = require("events");
 const lib = require("./https_hostnames.js");
@@ -48,8 +49,9 @@ function certs() {
   return pems;
 }
 
-// One fresh node: paths, a netrun-https with `certs`, stubbed commands.
-function setup({ systemdRun = true, bin = "#!/bin/bash\ncmd_certs() { :; }\n", env = {}, runningStates = [] } = {}) {
+// One fresh node: paths, a netrun-https with `certs`, stubbed commands, fake
+// timers (n.tick() runs the queued ones and waits for them).
+function setup({ systemdRun = true, bin = "#!/bin/bash\ncmd_certs() { :; }\n", env = {}, runningStates = [], maxPolls } = {}) {
   const root = fs.mkdtempSync(path.join(TMP, "node-"));
   const binPath = path.join(root, "netrun-https");
   if (bin !== null) fs.writeFileSync(binPath, bin, { mode: 0o755 });
@@ -58,8 +60,21 @@ function setup({ systemdRun = true, bin = "#!/bin/bash\ncmd_certs() { :; }\n", e
   const calls = [];
   const states = [...runningStates];
   const spawned = [];
+  const timerQueue = [];
   let nowMs = Date.now();
   const svc = lib.createHttpsHostnames({
+    timers: {
+      setTimeout: (fn, ms) => {
+        const t = { fn, ms, unref() {} };
+        timerQueue.push(t);
+        return t;
+      },
+      clearTimeout: (t) => {
+        const i = timerQueue.indexOf(t);
+        if (i >= 0) timerQueue.splice(i, 1);
+      },
+    },
+    ...(maxPolls ? { maxPolls } : {}),
     env: {
       NODE_AGENT_HTTPS_SYNC_BIN: binPath,
       NETRUN_HTTPS_HOSTNAMES_FILE: path.join(root, "etc", "https-hostnames"),
@@ -86,10 +101,27 @@ function setup({ systemdRun = true, bin = "#!/bin/bash\ncmd_certs() { :; }\n", e
     log: { log() {}, error() {} },
   });
   const hostnamesFile = path.join(root, "etc", "https-hostnames");
+  const pemPath = (h) => path.join(tlsDir, "hosts", `${h}.pem`);
   return {
-    svc, calls, spawned, root, binPath, tlsDir, hostnamesFile,
+    svc, calls, spawned, root, binPath, tlsDir, hostnamesFile, timerQueue,
     starts: () => calls.filter((c) => c[0] === "systemd-run"),
-    pem: (h, text) => fs.writeFileSync(path.join(tlsDir, "hosts", `${h}.pem`), text, { mode: 0o600 }),
+    pem: (h, text) => fs.writeFileSync(pemPath(h), text, { mode: 0o600 }),
+    // What netrun-https leaves after a verified reload serving these names:
+    // the crt-list lines and served.json with each PEM's sha256.
+    serve: (names, { bound = true, crtList = true } = {}) => {
+      const sha = (h) => crypto.createHash("sha256").update(fs.readFileSync(pemPath(h))).digest("hex");
+      const entries = names.map((h) => ({ hostname: h, pem: pemPath(h), sha256: sha(h) }));
+      fs.writeFileSync(path.join(tlsDir, "served.json"), JSON.stringify({
+        version: 1, stamp: "f".repeat(64), at: "2026-10-08T00:00:00Z", crtList: path.join(tlsDir, "crt-list"), crtListBound: bound, hostnames: entries,
+      }, null, 2));
+      if (crtList) {
+        fs.writeFileSync(path.join(tlsDir, "crt-list"), [path.join(tlsDir, "node.pem"), ...names.map((h) => `${pemPath(h)} ${h}`)].join("\n") + "\n");
+      }
+    },
+    tick: async () => {
+      const due = timerQueue.splice(0);
+      for (const t of due) await t.fn();
+    },
     setNow: (ms) => { nowMs = ms; },
   };
 }
@@ -175,6 +207,7 @@ test("POST: unchanged set + good certificates = no rewrite, no issuance", { skip
   const before = fs.statSync(n.hostnamesFile).mtimeMs;
   n.pem(H1, certs().h1);
   n.pem(H2, certs().h2);
+  n.serve([H1, H2]);
   fs.utimesSync(n.hostnamesFile, new Date(0), new Date(0));
   const out = await n.svc.post({ hostnames: [H1, H2.toUpperCase()] });
   assert.strictEqual(out.status, 200);
@@ -285,6 +318,7 @@ test("view / healthStatus: list, certificate status, issuing; /health cached for
   fs.mkdirSync(path.dirname(n.hostnamesFile), { recursive: true });
   fs.writeFileSync(n.hostnamesFile, `${H1}\n`);
   n.pem(H1, certs().h1);
+  n.serve([H1]);
   const v = await n.svc.view();
   assert.deepStrictEqual(
     { enabled: v.enabled, frontendInstalled: v.frontendInstalled, hostnames: v.hostnames, issuing: v.issuing, ok: v.certs[0].ok },
@@ -297,4 +331,106 @@ test("view / healthStatus: list, certificate status, issuing; /health cached for
   n.setNow(Date.now() + 6000);
   const h2 = await n.svc.healthStatus();
   assert.deepStrictEqual(h2.hostnames, [H1, H2]);
+});
+
+test("ok means SERVED: a good PEM is not_served until served.json (verified reload) lists it with this sha256 and the crt-list names it", { skip: !opensslOk && "no openssl" }, async () => {
+  const n = setup();
+  fs.mkdirSync(path.dirname(n.hostnamesFile), { recursive: true });
+  fs.writeFileSync(n.hostnamesFile, `${H1}\n`);
+  n.pem(H1, certs().h1);
+  const verdict = async () => {
+    const c = (await n.svc.view()).certs[0];
+    return [c.ok, c.error];
+  };
+  assert.deepStrictEqual(await verdict(), [false, "not_served"], "no served.json yet");
+  n.serve([H1]);
+  assert.deepStrictEqual(await verdict(), [true, null]);
+  assert.strictEqual((await n.svc.view()).servedAt, "2026-10-08T00:00:00Z");
+  // A renewed PEM in place, haproxy not reloaded with it yet: sha256 differs.
+  n.pem(H1, makePem(H1, 90));
+  assert.deepStrictEqual(await verdict(), [false, "not_served"], "PEM changed since the verified reload");
+  n.serve([H1]);
+  assert.deepStrictEqual(await verdict(), [true, null]);
+  // The crt-list no longer names it (rewritten, reload pending).
+  fs.writeFileSync(path.join(n.tlsDir, "crt-list"), `${path.join(n.tlsDir, "node.pem")}\n`);
+  assert.deepStrictEqual(await verdict(), [false, "not_served"], "crt-list line gone");
+  // haproxy.cfg not migrated to the crt-list (crtListBound false), or served.json garbage.
+  n.serve([H1], { bound: false });
+  assert.deepStrictEqual(await verdict(), [false, "not_served"], "not bound");
+  fs.writeFileSync(path.join(n.tlsDir, "served.json"), "{not json");
+  assert.deepStrictEqual(await verdict(), [false, "not_served"], "unreadable served.json");
+  // not_served is not a reason for lego: an unchanged POST starts nothing.
+  const out = await n.svc.post({ hostnames: [H1] });
+  assert.deepStrictEqual([out.body.changed, out.body.started, out.body.pending, out.body.certs[0].error], [false, false, false, "not_served"]);
+  assert.deepStrictEqual(n.starts(), []);
+  // Pure helpers.
+  assert.strictEqual(lib.parseServed(null).size, 0);
+  assert.strictEqual(lib.isServed({ hostname: H1, pemPath: "/x", pemSha256: "a", served: new Map(), crtListText: "" }), false);
+  const m = lib.parseServed(JSON.stringify({ version: 1, crtListBound: true, hostnames: [{ hostname: H1, pem: "/t//hosts/a.pem", sha256: "AB" }] }));
+  assert.ok(lib.isServed({ hostname: H1, pemPath: "/t/hosts/a.pem", pemSha256: "ab", served: m, crtListText: `/t/node.pem\n/t/hosts/a.pem ${H1}\n` }));
+  assert.ok(!lib.isServed({ hostname: H1, pemPath: "/t/hosts/a.pem", pemSha256: "ab", served: m, crtListText: `# /t/hosts/a.pem ${H1}\n` }));
+});
+
+test("pending: a change POSTed while netrun-https certs runs (or finishes) starts ONE more run once the unit is inactive", async () => {
+  // systemctl is-active answers, in order: POST 1, POST 2, poll 1, poll 2, poll 3.
+  const n = setup({ runningStates: ["active", "active", "active", "deactivating", "inactive"] });
+  const out = await n.svc.post({ hostnames: [H1] });
+  assert.deepStrictEqual([out.body.changed, out.body.started, out.body.issuing, out.body.pending], [true, false, true, true]);
+  assert.deepStrictEqual(n.starts(), []);
+  assert.strictEqual(n.timerQueue.length, 1);
+  assert.strictEqual(n.timerQueue[0].ms, 20_000, "polled every 20 s");
+  // A second POST while pending: still one pending run, one timer.
+  const out2 = await n.svc.post({ hostnames: [H1, H2] });
+  assert.deepStrictEqual([out2.body.started, out2.body.pending], [false, true]);
+  assert.strictEqual(n.timerQueue.length, 1);
+  await n.tick(); // active
+  assert.deepStrictEqual(n.starts(), []);
+  await n.tick(); // deactivating: still running
+  assert.deepStrictEqual(n.starts(), []);
+  await n.tick(); // inactive -> the one more run
+  assert.strictEqual(n.starts().length, 1);
+  assert.strictEqual(n.timerQueue.length, 0, "nothing left scheduled");
+  assert.strictEqual((await n.svc.view()).pending, false);
+  await n.tick();
+  assert.strictEqual(n.starts().length, 1, "exactly one more run");
+});
+
+test("pending: bounded — a run that never ends is given up after maxPolls checks (no start)", async () => {
+  const n = setup({ runningStates: Array(10).fill("active"), maxPolls: 3 });
+  await n.svc.post({ hostnames: [H1] });
+  for (let i = 0; i < 5; i += 1) await n.tick();
+  assert.deepStrictEqual(n.starts(), []);
+  assert.strictEqual(n.timerQueue.length, 0);
+  assert.strictEqual((await n.svc.view()).pending, false);
+});
+
+test("start(): at agent start, a list that differs from certs-applied (the last certs / renew pass) gets one more run; equal = nothing", async () => {
+  let n = setup();
+  fs.mkdirSync(path.dirname(n.hostnamesFile), { recursive: true });
+  fs.writeFileSync(n.hostnamesFile, `${H1}\n${H2}\n`);
+  assert.strictEqual(n.svc.start(), true, "no certs-applied yet");
+  assert.strictEqual(n.timerQueue.length, 1);
+  assert.ok(n.timerQueue[0].ms <= 5000, "soon after start");
+  await n.tick();
+  assert.strictEqual(n.starts().length, 1);
+  n = setup();
+  fs.mkdirSync(path.dirname(n.hostnamesFile), { recursive: true });
+  fs.writeFileSync(n.hostnamesFile, `${H2}\n${H1}\n`);
+  fs.writeFileSync(path.join(n.tlsDir, "certs-applied"), `${H1}\n${H2}\n`);
+  assert.strictEqual(n.svc.start(), false, "same set");
+  fs.writeFileSync(path.join(n.tlsDir, "certs-applied"), `${H1}\n`);
+  assert.strictEqual(n.svc.start(), true, "H2 never applied");
+  n.svc.stop();
+  assert.strictEqual(n.timerQueue.length, 0);
+  // Empty list, nothing applied: nothing to do. Switch off / no netrun-https: never.
+  n = setup();
+  assert.strictEqual(n.svc.start(), false);
+  n = setup({ env: { NODE_AGENT_HTTPS_HOSTNAMES: "0" } });
+  fs.mkdirSync(path.dirname(n.hostnamesFile), { recursive: true });
+  fs.writeFileSync(n.hostnamesFile, `${H1}\n`);
+  assert.strictEqual(n.svc.start(), false);
+  n = setup({ bin: null });
+  fs.mkdirSync(path.dirname(n.hostnamesFile), { recursive: true });
+  fs.writeFileSync(n.hostnamesFile, `${H1}\n`);
+  assert.strictEqual(n.svc.start(), false);
 });

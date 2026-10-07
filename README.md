@@ -332,7 +332,15 @@ haproxy's TLS terminator now loads a crt-list and picks the certificate by SNI.
   name has no good certificate (missing / not for the name / < 7 days left), the agent starts
   `systemd-run --unit netrun-https-certs --collect /usr/local/sbin/netrun-https certs`
   detached (never a second one while it runs) and answers at once:
-  `200 {success, changed, hostnames, issuing, started, certs: [{hostname, ok, notAfter, error, lastError}]}`.
+  `200 {success, changed, hostnames, issuing, started, pending, certs: [{hostname, ok, notAfter, error, lastError}]}`.
+  `ok` means SERVED: the certificate is good AND the last verified reload loaded that very PEM
+  for the name (`/etc/netrun/tls/served.json`, written by netrun-https after every verified
+  reload: `{version, stamp, at, crtList, crtListBound, hostnames: [{hostname, pem, sha256}]}`)
+  AND the crt-list still names it — else `error: "not_served"` (the file is fine, haproxy does
+  not serve it yet; the 5-min sync does). A POST that needs a run while one is in progress (or
+  just finishing) leaves one more run `pending`: it starts once `netrun-https-certs` is inactive
+  (checked every 20 s, at most 30 min); at agent start, a list that differs from what the last
+  certs / renew pass worked through (`/etc/netrun/tls/certs-applied`) gets one more run too.
   `400` bad body, `404 https_hostnames_disabled`, `409 https_frontend_missing` (no
   netrun-https) / `https_frontend_outdated` (an installed copy without `certs`),
   `500 issue_start_failed`. `GET /https/hostnames` and `/health httpsHostnames` (cached 5 s)
@@ -343,16 +351,27 @@ haproxy's TLS terminator now loads a crt-list and picks the certificate by SNI.
   `NETRUN_HTTPS_HOST_RENEW_DAYS` (30) of expiry — outside the sync lock, under
   `/run/netrun/https-acme.lock` (the IP renewal takes it too: one HTTP-01 client on :80). A
   name pointing elsewhere is skipped and never sent to the CA; a failed name waits
-  `NETRUN_HTTPS_ACME_RETRY_MIN` (60) minutes; one failing name never stops the others. The
-  outcome per name: `/etc/netrun/tls/hosts/<name>.error` (`lastError`). Then, under the sync
-  lock: `/etc/netrun/tls/hosts/<name>.pem` (0600), PEMs of unlisted names deleted, and
+  `NETRUN_HTTPS_ACME_RETRY_MIN` (60) minutes (the time of its last failure:
+  `hosts/<name>.acme-failed`, apart from the note — a `dns:` note never resets it; a name only
+  waiting does not fail the run, so `netrun-https-renew.service` is not "failed" for it); one
+  failing name never stops the others. What lego did is logged from the certificate file
+  (obtained / renewed / left unchanged — lego 5 `run` decides about a renewal itself). The
+  last note per name: `/etc/netrun/tls/hosts/<name>.error` (`lastError`: `dns: ...`,
+  `acme: ...`, `haproxy: rejected: <reason>`). Then, under the sync lock (held for this step
+  only): `/etc/netrun/tls/hosts/<name>.pem` (0600), PEMs of unlisted names deleted, and
   `/etc/netrun/tls/crt-list` — the IP certificate FIRST (the default: IP clients send no SNI),
-  then `<pem> <name>` per valid name. haproxy is reloaded only when the crt-list or a PEM in it
-  changed (the reload stamp covers them); a set `haproxy -c` rejects falls back to the IP line.
-- `netrun-https sync` writes the crt-list before any `haproxy -c` and rewrites `haproxy.cfg`
-  whenever it differs from the managed one (validated first), so an existing node moves from
-  `ssl crt node.pem` to `ssl crt-list` on its next 5-min sync (one reload).
-  `netrun-https status` lists the hostname certificates.
+  then `<pem> <name>` per name. Whenever the crt-list changed it is checked with `haproxy -c`
+  on its own — whether or not haproxy runs: a PEM haproxy rejects is found by checking the
+  lines one at a time, deleted and noted; the other names and the IP certificate are never
+  blocked by it (the next `certs` rebuilds it from lego's files and checks it again). haproxy is
+  reloaded only when the crt-list or a PEM in it changed (the reload stamp covers them).
+- `netrun-https sync` writes the crt-list before any `haproxy -c` (and checks it as above) and
+  rewrites `haproxy.cfg` whenever it differs from the managed one (validated first), so an
+  existing node moves from `ssl crt node.pem` to `ssl crt-list` on its next 5-min sync (one
+  reload). A line leaves the crt-list only for a definite reason (name unlisted, PEM missing,
+  certificate expired): an openssl error keeps it (no reload flap). When a full `haproxy -c`
+  still fails with hostname lines, it is retried once with the IP line alone (logged loudly).
+  `netrun-https status` lists the hostname certificates and what is served.
 
 Existing nodes: deploy the code, refresh the `/usr/local/sbin` copy
 (`bash scripts/apply_capacity_tuning.sh --apply --only units`, or `netrun-https units`),

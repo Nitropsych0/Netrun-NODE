@@ -4159,7 +4159,9 @@ async function handleHealth(req, res) {
     ipv4ExitSharedWithNode: egressModeNow === "dualstack" ? true : egressModeNow === "ipv6_only" ? false : null,
     // Audit FO-08 — additive. The node's DNS names (POST /https/hostnames), the
     // certificate haproxy serves for each by SNI ({hostname, ok, notAfter,
-    // error, lastError}) and whether `netrun-https certs` runs (cached 5 s).
+    // error, lastError}; ok = served after a verified reload, else error
+    // "not_served" when the file is fine), whether `netrun-https certs` runs
+    // or one more run is pending (cached 5 s).
     httpsHostnames: httpsHostnamesStatus,
   });
 }
@@ -4482,6 +4484,10 @@ if (require.main === module) {
     // Audit RES-11 — dead-batch respawn + anchor re-add / deprecation, every
     // minute after a first delay (the boot restore runs first).
     supervisor.start();
+    // Audit FO-08 (review) — a hostname list the last `netrun-https certs` /
+    // renew did not work through (a POST while a run was finishing, an agent
+    // restart): one more run, once no run is in progress.
+    httpsHostnames.start();
   });
 }
 

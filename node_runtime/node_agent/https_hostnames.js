@@ -15,8 +15,18 @@
 //     while it runs; a plain detached spawn where systemd-run is missing).
 //     netrun-https does the ACME work (DNS gate, lego, crt-list, reload).
 //   GET /https/hostnames (API key) — the list, per-name certificate status,
-//     whether an issuance runs.
+//     whether an issuance runs (or one more is pending).
 //   /health httpsHostnames — the same, cached STATUS_TTL_MS.
+// A name is `ok` only when haproxy SERVES its certificate: netrun-https writes
+// <tls>/served.json after every verified reload (the names whose crt-list
+// lines haproxy loaded, with each PEM's sha256); the name must be there with
+// the sha256 of the PEM in place now, and the crt-list must still name it —
+// else error "not_served" (the file is fine, haproxy does not serve it yet).
+// A change that arrives while `certs` runs (or is just finishing) is not lost:
+// one more run is PENDING and starts once the unit is inactive (polled every
+// PENDING_POLL_MS, at most PENDING_MAX_POLLS times); at agent start, a list
+// that differs from what the last certs / renew pass worked through
+// (<tls>/certs-applied) gets one more run the same way.
 // NODE_AGENT_HTTPS_HOSTNAMES=0 switches it off (POST answers 404); a node
 // without netrun-https (NODE_AGENT_HTTPS_SYNC_BIN, /usr/local/sbin/netrun-https)
 // answers 409.
@@ -39,6 +49,12 @@ const DAY_MS = 86_400_000;
 const OK_MARGIN_MS = DAY_MS;
 const RENEW_MARGIN_MS = 7 * DAY_MS;
 const STATUS_TTL_MS = 5000;
+const PENDING_POLL_MS = 20_000;
+const PENDING_MAX_POLLS = 90; // 30 min of a run still going: the renew timer takes over
+const START_DELAY_MS = 5000;
+const SERVED_FILE = "served.json";
+const CRT_LIST_FILE = "crt-list";
+const APPLIED_FILE = "certs-applied";
 const RUNNING_STATES = new Set(["active", "activating", "reloading", "deactivating"]);
 
 function readSettings(env = process.env) {
@@ -154,6 +170,51 @@ function evaluateCertificate(hostname, pemText, nowMs = Date.now()) {
   return out;
 }
 
+// served.json text -> Map hostname -> { pem, sha256 }. Empty when missing /
+// unreadable / of another version, or when haproxy.cfg's TLS bind did not load
+// the crt-list (crtListBound false): then no name is served by SNI.
+function parseServed(text) {
+  const out = new Map();
+  if (text === null || text === undefined) return out;
+  let j;
+  try {
+    j = JSON.parse(String(text));
+  } catch {
+    return out;
+  }
+  if (!j || j.version !== 1 || j.crtListBound !== true || !Array.isArray(j.hostnames)) return out;
+  for (const e of j.hostnames) {
+    if (e && typeof e.hostname === "string" && typeof e.sha256 === "string" && typeof e.pem === "string") {
+      out.set(e.hostname, { pem: e.pem, sha256: e.sha256.toLowerCase() });
+    }
+  }
+  return out;
+}
+
+// true when the crt-list text has the `<pemPath> <hostname>` line.
+function crtListNames(crtListText, pemPath, hostname) {
+  const want = path.resolve(pemPath);
+  for (const line of String(crtListText || "").split(/\r?\n/)) {
+    const f = line.trim().split(/\s+/);
+    if (f.length >= 2 && !f[0].startsWith("#") && f[1] === hostname && path.resolve(f[0]) === want) return true;
+  }
+  return false;
+}
+
+// haproxy verifiably serves PEM pemPath (sha256 pemSha256) for hostname: the
+// last verified reload loaded that very file for the name (served.json), and
+// the crt-list still names it.
+function isServed({ hostname, pemPath, pemSha256, served, crtListText }) {
+  const e = served instanceof Map ? served.get(hostname) : null;
+  return Boolean(
+    e &&
+      pemSha256 &&
+      e.sha256 === pemSha256 &&
+      path.resolve(e.pem) === path.resolve(pemPath) &&
+      crtListNames(crtListText, pemPath, hostname)
+  );
+}
+
 // ── io ───────────────────────────────────────────────────────────────────
 
 function writeFileAtomic(filePath, text) {
@@ -202,11 +263,16 @@ function createHttpsHostnames({
   spawnFn = spawn,
   findBin = (name) => findExecutable(name, env.PATH),
   log = console,
+  timers = { setTimeout, clearTimeout },
+  pollMs = PENDING_POLL_MS,
+  maxPolls = PENDING_MAX_POLLS,
+  startDelayMs = START_DELAY_MS,
 } = {}) {
   let child = null; // the fallback's detached `netrun-https certs` (no systemd-run)
-  let chain = Promise.resolve(); // POSTs one at a time
+  let chain = Promise.resolve(); // POSTs (and the pending poll) one at a time
   let cache = null; // { at, value } for /health
   let lastStart = null; // { at, via, error }
+  let pending = null; // { since, polls, reason, timer }: one more `certs` run due
   const binCheck = { key: null, supported: true };
 
   const settings = () => readSettings(env);
@@ -233,14 +299,35 @@ function createHttpsHostnames({
     }
   }
 
-  // Status of every name: the agent's verdict on the PEM haproxy serves, plus
-  // lastError — netrun-https's note of the last attempt (hosts/<name>.error:
-  // "dns: ..." skipped without a CA call, "acme: ..." lego failed).
+  function readBuffer(file) {
+    try {
+      return fs.readFileSync(file);
+    } catch {
+      return null;
+    }
+  }
+
+  // Status of every name: the agent's verdict on the PEM — ok only when the
+  // certificate is good AND haproxy serves it (else "not_served") — plus
+  // lastError, netrun-https's note of the last attempt (hosts/<name>.error:
+  // "dns: ..." skipped without a CA call, "acme: ..." lego failed,
+  // "haproxy: rejected..." haproxy -c refused the PEM).
   function certsFor(s, hostnames) {
     const nowMs = now();
     const hostsDir = path.join(s.tlsDir, "hosts");
+    const served = parseServed(readText(path.join(s.tlsDir, SERVED_FILE)));
+    const crtListText = readText(path.join(s.tlsDir, CRT_LIST_FILE));
     return hostnames.map((h) => {
-      const c = evaluateCertificate(h, readText(path.join(hostsDir, `${h}.pem`)), nowMs);
+      const pemPath = path.join(hostsDir, `${h}.pem`);
+      const buf = readBuffer(pemPath);
+      const c = evaluateCertificate(h, buf === null ? null : buf.toString("utf-8"), nowMs);
+      if (c.ok) {
+        const pemSha256 = crypto.createHash("sha256").update(buf).digest("hex");
+        if (!isServed({ hostname: h, pemPath, pemSha256, served, crtListText })) {
+          c.ok = false;
+          c.error = "not_served"; // renewDue stays the certificate's: the sync serves it, not lego
+        }
+      }
       const note = readText(path.join(hostsDir, `${h}.error`));
       const lastError = note ? note.split(/\r?\n/)[0].trim().slice(0, 300) || null : null;
       return { hostname: c.hostname, ok: c.ok, notAfter: c.notAfter, error: c.error, lastError, renewDue: c.renewDue };
@@ -306,6 +393,73 @@ function createHttpsHostnames({
     }
   }
 
+  // ── one more run once the current one is over (pending) ──
+
+  function schedulePending(delayMs) {
+    if (!pending || pending.timer) return;
+    const t = timers.setTimeout(() => {
+      if (pending) pending.timer = null;
+      return serialized(pollPending).catch((err) => log.error(`[https-hostnames] pending run: ${errText(err)}`));
+    }, delayMs);
+    if (t && typeof t.unref === "function") t.unref();
+    pending.timer = t || true;
+  }
+
+  function markPending(reason, delayMs = pollMs) {
+    if (pending) return;
+    pending = { since: now(), polls: 0, reason, timer: null };
+    log.log(`[https-hostnames] one more netrun-https certs run pending: ${reason}`);
+    schedulePending(delayMs);
+  }
+
+  async function pollPending() {
+    if (!pending) return;
+    const s = settings();
+    if (!s.enabled) {
+      pending = null;
+      return;
+    }
+    pending.polls += 1;
+    if (await isIssuing()) {
+      if (pending.polls >= maxPolls) {
+        log.error(`[https-hostnames] netrun-https certs still runs after ${pending.polls} checks — pending run dropped (the renew timer applies the list)`);
+        pending = null;
+        return;
+      }
+      schedulePending(pollMs);
+      return;
+    }
+    const r = await startIssue(s);
+    lastStart = { at: new Date(now()).toISOString(), via: r.via || null, error: r.error || null };
+    cache = null;
+    if (r.error) {
+      log.error(`[https-hostnames] could not start the pending netrun-https certs: ${r.error}`);
+      if (pending.polls >= maxPolls) pending = null;
+      else schedulePending(pollMs);
+      return;
+    }
+    log.log(`[https-hostnames] pending netrun-https certs run ${r.started ? "started" : "joined a run just started"} (${pending.reason})`);
+    pending = null;
+  }
+
+  // Agent start: the list file differs from what the last certs / renew pass
+  // worked through (certs-applied; none = nothing yet) -> one more run, as a
+  // pending one (it waits for a run in progress). true when one was queued.
+  function start() {
+    const s = settings();
+    if (!s.enabled || !fs.existsSync(s.bin) || !binSupportsCerts(s.bin)) return false;
+    const listed = readHostnames(s);
+    const applied = parseHostnamesFile(readText(path.join(s.tlsDir, APPLIED_FILE)) || "");
+    if (sameHostnames(listed, applied)) return false;
+    markPending(`the list (${listed.join(" ") || "empty"}) differs from the last applied one (${applied.join(" ") || "none"})`, startDelayMs);
+    return true;
+  }
+
+  function stop() {
+    if (pending && pending.timer && pending.timer !== true) timers.clearTimeout(pending.timer);
+    pending = null;
+  }
+
   async function post(body) {
     const s = settings();
     if (!s.enabled) return { status: 404, body: { success: false, error: "https_hostnames_disabled" } };
@@ -345,20 +499,35 @@ function createHttpsHostnames({
         started = r.started;
         issuing = r.started || Boolean(r.already);
       }
+      // A run in progress (or just finishing) may never see this change:
+      // one more once it is over.
+      if (due && !started) markPending(changed ? "hostname list changed while netrun-https certs runs" : "certificate due while netrun-https certs runs");
       cache = null;
-      return { status: 200, body: { success: true, changed, hostnames, issuing, started, certs: certs.map(publicCert) } };
+      return {
+        status: 200,
+        body: { success: true, changed, hostnames, issuing, started, pending: Boolean(pending), certs: certs.map(publicCert) },
+      };
     });
   }
 
   async function view() {
     const s = settings();
     const hostnames = readHostnames(s);
+    const served = readText(path.join(s.tlsDir, SERVED_FILE));
+    let servedAt = null;
+    try {
+      servedAt = served === null ? null : JSON.parse(served).at || null;
+    } catch {
+      servedAt = null;
+    }
     return {
       enabled: s.enabled,
       frontendInstalled: fs.existsSync(s.bin),
       hostnames,
       certs: certsFor(s, hostnames).map(publicCert),
       issuing: await isIssuing(),
+      pending: Boolean(pending),
+      servedAt,
       lastStart,
     };
   }
@@ -404,7 +573,7 @@ function createHttpsHostnames({
     return true;
   }
 
-  return { post, view, healthStatus, handleHttp, isIssuing, settings };
+  return { post, view, healthStatus, handleHttp, isIssuing, settings, start, stop };
 }
 
 module.exports = {
@@ -416,6 +585,8 @@ module.exports = {
   sameHostnames,
   hostnamesFileText,
   evaluateCertificate,
+  parseServed,
+  isServed,
   UNIT,
   MAX_HOSTNAMES,
 };

@@ -82,6 +82,7 @@ for f in http_port_ranges localize_http_listeners write_frontends frontend_sets_
   eval "$body"
 done
 haproxy_check() { return 0; }   # no haproxy here (section 5 tests the check itself)
+haproxy_check_crt() { haproxy_check "$@"; }   # FO-08: the hostname fallback (test_https_hostnames.sh)
 PROXY_DIR="$TMP/3proxy"; FRONTEND_DIR="$TMP/netrun.d"; mkdir -p "$PROXY_DIR"
 {
   echo "daemon"
@@ -152,7 +153,9 @@ ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -
            sha256_stream haproxy_config_hash stamp_read stamp_write stamp_expired frontend_first_ports \
            frontend_ports_missing verify_frontends_listening cmd_sync \
            https_hostnames host_cert_ok write_crt_list crt_list_pems base_config_text write_base_config \
-           base_config_current update_base_config; do
+           base_config_current update_base_config pem_expired crt_list_host_lines crt_list_hash crt_list_check \
+           crt_list_drop_rejected crt_list_validate haproxy_check_crt stamp_applied json_str served_invalidate \
+           served_stamp served_write file_sha256; do
     pat="/^$f() {/,/^}/p"   # (bash 3.2 brace-expands the pattern inline)
     eval "$(sed -n "$pat" "$HTTPS")"
     type "$f" >/dev/null 2>&1 || { echo "netrun-https: $f not found"; exit 1; }
@@ -175,6 +178,7 @@ ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -
   PEM="$TMP/sync/node.pem"; echo pem > "$PEM"; HAPROXY_CFG="$TMP/sync/haproxy.cfg"; echo '# Managed by netrun-https' > "$HAPROXY_CFG"
   # Audit FO-08 — the crt-list (IP certificate only: no hostname list here).
   TLS_DIR="$TMP/sync"; CRT_LIST="$TMP/sync/crt-list"; HOSTS_DIR="$TMP/sync/hosts"; HOSTNAMES_FILE="$TMP/sync/no-hostnames"
+  SERVED="$TMP/sync/served.json"; CRT_LIST_OK="$TMP/sync/crt-list.ok"
   APPLIED_STAMP="$TMP/sync/run/haproxy-applied.sha"
   batch() { printf 'socks -6 -a -p%s -i45.32.10.20 -e2001:db8::1\nproxy -6 -n -a -p%s -i127.0.0.1 -e2001:db8::1\n' "$1" "$(($1 - 10000))" > "$PROXY_DIR/3proxy_$1.cfg"; }
   reloads() { grep -c '^reload$' "$RELOADS"; }
@@ -182,6 +186,8 @@ ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -
   batch 18100
   ( cmd_sync ); want 1 "first sync must reload"
   [ "$(cat "$APPLIED_STAMP")" = "$(haproxy_config_hash)" ] || { echo "stamp not written after a verified reload"; exit 1; }
+  # Audit FO-08 (review) — served.json goes with the stamp (no hostnames here).
+  [ "$(served_stamp)" = "$(cat "$APPLIED_STAMP")" ] && grep -q '"crtListBound": true' "$SERVED" || { cat "$SERVED"; echo "served.json"; exit 1; }
   ( cmd_sync ); ( cmd_sync ); want 1 "unchanged syncs with a valid stamp reloaded haproxy"
   batch 18200; ( cmd_sync ); want 2 "a new batch did not reload"
   rm -f "$PROXY_DIR/3proxy_18200.cfg"; ( cmd_sync ); want 3 "a removed batch did not reload"
@@ -198,8 +204,12 @@ ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -
   batch 18400
   if ( HAPROXY_LISTENS=0 cmd_sync ); then echo "an unverified reload must fail the sync"; exit 1; fi
   want 7 "unverified reload attempt"
+  [ ! -e "$SERVED" ] || { echo "served.json kept after an unverified reload"; exit 1; }
   ( HAPROXY_LISTENS=0 cmd_sync ) || true; want 8 "an unverified reload was not retried"
   ( cmd_sync ); want 9 "verified retry"
+  [ "$(served_stamp)" = "$(cat "$APPLIED_STAMP")" ] || { echo "served.json not rewritten after the verified retry"; exit 1; }
+  rm -f "$SERVED"; ( cmd_sync ); want 9 "a lost served.json costs no reload"
+  [ "$(served_stamp)" = "$(cat "$APPLIED_STAMP")" ] || { echo "served.json not restored on a quiet sync"; exit 1; }
   ( cmd_sync ); want 9 "verified once, then quiet"
   ( HAPROXY_LISTENS=0 NETRUN_HTTPS_RELOAD_VERIFY=0 cmd_sync ); want 9 "verify off: nothing to do anyway"
   # (c) haproxy rejects the new set: the live directory is left untouched, nothing reloaded.
@@ -236,6 +246,7 @@ grep -q 'with_sync_lock cmd_sync' "$HTTPS" || fail "netrun-https: sync not seria
   eval "$(sed -n '/^renew_obtain() {/,/^}/p' "$HTTPS")"
   CALLS="$TMP/renew_calls"; : > "$CALLS"
   log() { :; }; public_ipv4() { echo 45.32.10.20; }
+  https_hostnames() { :; }; applied_write() { :; }
   lego_obtain() { echo "lego locked=${LOCKED:-0}" >> "$CALLS"; }
   certs_obtain() { :; }
   with_acme_lock() { "$@"; }

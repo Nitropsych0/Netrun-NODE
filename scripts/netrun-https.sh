@@ -39,14 +39,29 @@
 #      NETRUN_HTTPS_HOST_RENEW_DAYS (30) of expiry. A name that does not point
 #      here is skipped and never sent to the CA (failed validations count
 #      against Let's Encrypt limits); a name whose lego run failed waits
-#      NETRUN_HTTPS_ACME_RETRY_MIN (60) before the next try; one failing name
-#      never stops the others. The outcome per name: $HOSTS_DIR/<name>.error.
+#      NETRUN_HTTPS_ACME_RETRY_MIN (60) before the next try (the time of the
+#      last failure: $HOSTS_DIR/<name>.acme-failed, apart from the note, so a
+#      "dns:" note never resets it; a name only waiting is not a failure of
+#      the run); one failing name never stops the others. The last note per
+#      name ("dns: ...", "acme: ...", "haproxy: rejected..."):
+#      $HOSTS_DIR/<name>.error.
 #   2. under the sync lock: $HOSTS_DIR/<name>.pem (0600) per listed name with a
 #      valid certificate, PEMs of names no longer listed deleted, and the
 #      crt-list the TLS terminator loads — the IP certificate FIRST (the
-#      default: IP clients send no SNI), then one `<pem> <name>` line per valid
-#      hostname PEM. haproxy is reloaded only when the crt-list or a PEM in it
-#      changed (the reload stamp covers them all).
+#      default: IP clients send no SNI), then one `<pem> <name>` line per
+#      hostname PEM. The crt-list is checked with `haproxy -c` on its own
+#      whenever it changed, whether or not haproxy runs: a hostname PEM haproxy
+#      rejects is found by checking the lines one at a time, deleted and noted
+#      ("haproxy: rejected: <reason>") — the others and the IP certificate are
+#      never blocked by it (the next `certs` rebuilds it from lego's files and
+#      checks it again). haproxy is reloaded only when the crt-list or a PEM in
+#      it changed (the reload stamp covers them all).
+#   After every VERIFIED reload, $TLS_DIR/served.json lists the hostnames whose
+#   lines were in the crt-list haproxy loaded, with the sha256 of each PEM (it
+#   is deleted before a reload and while what haproxy loaded is unknown): the
+#   agent's `ok` means served, not just "a PEM exists". Each certs / renew pass
+#   writes the list it worked through to $TLS_DIR/certs-applied (the agent
+#   starts another `certs` when the list file differs from it).
 #
 # Settings (environment, else ${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}):
 #   NETRUN_ACCOUNTING_MATCH_IPV4=1  meter only client legs: the map rules also
@@ -82,10 +97,17 @@ PEM="$TLS_DIR/node.pem"
 # Audit FO-08 — hostname certificates (see the header).
 HOSTS_DIR="$TLS_DIR/hosts"
 CRT_LIST="$TLS_DIR/crt-list"
+# What haproxy verifiably serves (the agent's `ok`), the hostname list the
+# last certs / renew pass worked through, and the hash of the last crt-list
+# (+ PEMs) `haproxy -c` accepted on its own (see the header).
+SERVED="$TLS_DIR/served.json"
+CERTS_APPLIED="$TLS_DIR/certs-applied"
+CRT_LIST_OK="$TLS_DIR/crt-list.ok"
 HOSTNAMES_FILE="${NETRUN_HTTPS_HOSTNAMES_FILE:-/etc/netrun/https-hostnames}"
 ACME_LOCK="${NETRUN_HTTPS_ACME_LOCK:-/run/netrun/https-acme.lock}"
-HAPROXY_CFG=/etc/haproxy/haproxy.cfg
-FRONTEND_DIR=/etc/haproxy/netrun.d
+# (overridable for the tests only: the haproxy unit drop-in names the defaults)
+HAPROXY_CFG="${NETRUN_HTTPS_HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}"
+FRONTEND_DIR="${NETRUN_HTTPS_FRONTEND_DIR:-/etc/haproxy/netrun.d}"
 LEGO_VERSION="${LEGO_VERSION:-v5.5.2}"
 SELF=/usr/local/sbin/netrun-https
 SYSTEMD_DIR="${NETRUN_SYSTEMD_DIR:-/etc/systemd/system}"
@@ -122,9 +144,10 @@ build_pem() {
   local ip="$1" crt="$LEGO_DIR/certificates/$1.crt" key="$LEGO_DIR/certificates/$1.key"
   [ -s "$crt" ] && [ -s "$key" ] || die "certificate files missing for $ip"
   install -d -m 0700 "$TLS_DIR"
-  cat "$crt" "$key" > "$PEM.tmp"
+  # Explicit: renew's apply step runs where set -e does not apply (|| rc=1).
+  cat "$crt" "$key" > "$PEM.tmp" || { rm -f "$PEM.tmp"; die "cannot write $PEM.tmp"; }
   chmod 0600 "$PEM.tmp"
-  mv -f "$PEM.tmp" "$PEM"
+  mv -f "$PEM.tmp" "$PEM" || die "cannot replace $PEM"
 }
 
 # `lego run` obtains the certificate or renews it once due (half of the
@@ -186,22 +209,31 @@ host_cert_ok() {
   [ -n "$a" ] && [ "$a" = "$b" ]
 }
 
-# Per-name outcome of the last `certs` run (none = fine): "dns: ..." (skipped,
-# no CA call) or "acme: ..." (lego failed). The agent shows it.
+# Per-name note of the last `certs` / renew pass (none = fine): "dns: ..."
+# (skipped, no CA call), "acme: ..." (lego failed) or "haproxy: rejected..."
+# (haproxy -c refused the PEM: deleted, not served). The agent shows it.
 host_note() {
   install -d -m 0700 "$HOSTS_DIR"
   printf '%s\n' "$2" > "$HOSTS_DIR/$1.error"
 }
 
+# The last FAILED lego run for $1: $HOSTS_DIR/<name>.acme-failed (its mtime is
+# the time, its text the error). Kept apart from the note: a "dns:" note
+# written in between must never reset the ACME backoff (DNS flaps would let
+# the CA see more than 5 failed validations an hour).
+host_acme_failed() {
+  install -d -m 0700 "$HOSTS_DIR"
+  printf '%s\n' "$2" > "$HOSTS_DIR/$1.acme-failed"
+}
+
 # 0 while the last lego run for $1 failed less than NETRUN_HTTPS_ACME_RETRY_MIN
 # (60) minutes ago: at most one failed validation per name and hour (Let's
-# Encrypt allows 5). Delete the .error file to retry at once.
+# Encrypt allows 5). Delete hosts/<name>.acme-failed to retry at once.
 host_acme_backoff() {
-  local f="$HOSTS_DIR/$1.error" min
+  local f="$HOSTS_DIR/$1.acme-failed" min
   min="$(netrun_setting NETRUN_HTTPS_ACME_RETRY_MIN 60)"
   case "$min" in ''|*[!0-9]*) min=60 ;; esac
   [ "$min" -gt 0 ] && [ -f "$f" ] || return 1
-  [ "$(head -c 5 "$f")" = "acme:" ] || return 1
   [ -z "$(find "$f" -mmin +"$min" 2>/dev/null)" ]
 }
 
@@ -210,12 +242,21 @@ lego_obtain_host() {
   lego run --path "$LEGO_DIR" --accept-tos --domains "$1" --http --no-random-sleep >/dev/null
 }
 
+# sha256 of file $1, nothing when it is missing / empty.
+file_sha256() {
+  [ -s "$1" ] || return 0
+  sha256_stream < "$1"
+}
+
 # The ACME step of `certs` (call it under the ACME lock, outside the sync
 # lock): `lego run` for every listed name that points here and needs it.
-# Returns 1 when a lego run failed (or a name still backs off) — after
-# trying every name; a name pointing elsewhere is not a failure.
+# Returns 1 when a lego run failed in THIS pass — after trying every name; a
+# name pointing elsewhere or still in its retry backoff is not a failure (the
+# renew timer's unit would otherwise show "failed" for up to an hour).
+# lego 5 `run` decides about a renewal itself: what happened is read from the
+# certificate file (sha256 before / after), never assumed.
 certs_obtain() {
-  local ip="$1" h addrs days crt errf rc failed=0
+  local ip="$1" h addrs days crt errf rc failed=0 before after msg
   [ -n "$ip" ] || { log "ERROR: cannot detect the public IPv4 — no hostname certificate"; return 1; }
   days="$(netrun_setting NETRUN_HTTPS_HOST_RENEW_DAYS 30)"
   case "$days" in ''|*[!0-9]*) days=30 ;; esac
@@ -229,22 +270,37 @@ certs_obtain() {
     fi
     crt="$LEGO_DIR/certificates/$h.crt"
     if host_cert_ok "$h" "$crt" "$LEGO_DIR/certificates/$h.key" $((days * 86400)); then
-      rm -f "$HOSTS_DIR/$h.error"
+      rm -f "$HOSTS_DIR/$h.error" "$HOSTS_DIR/$h.acme-failed"
       continue
     fi
     if host_acme_backoff "$h"; then
-      log "skip $h: its last ACME attempt failed less than $(netrun_setting NETRUN_HTTPS_ACME_RETRY_MIN 60) min ago"
-      failed=1
+      log "skip $h: its last ACME attempt failed less than $(netrun_setting NETRUN_HTTPS_ACME_RETRY_MIN 60) min ago (backoff)"
       continue
     fi
+    before="$(file_sha256 "$crt")"
     errf="$(mktemp)"
     if lego_obtain_host "$h" 2>"$errf"; then
-      rm -f "$HOSTS_DIR/$h.error"
-      log "certificate for $h obtained / renewed"
+      after="$(file_sha256 "$crt")"
+      rm -f "$HOSTS_DIR/$h.error" "$HOSTS_DIR/$h.acme-failed"
+      if [ -z "$after" ]; then
+        msg="acme: lego exit 0 but no certificate at $crt"
+        host_note "$h" "$msg"
+        host_acme_failed "$h" "$msg"
+        log "WARNING: $msg"
+        failed=1
+      elif [ -z "$before" ]; then
+        log "certificate for $h obtained"
+      elif [ "$before" != "$after" ]; then
+        log "certificate for $h renewed"
+      else
+        log "lego left the certificate of $h unchanged (not due by lego's own rules)"
+      fi
     else
       rc=$?
       cat "$errf" >&2 || true
-      host_note "$h" "acme: lego exit $rc: $(tail -n 1 "$errf" | cut -c1-300)"
+      msg="acme: lego exit $rc: $(tail -n 1 "$errf" | cut -c1-300)"
+      host_note "$h" "$msg"
+      host_acme_failed "$h" "$msg"
       log "WARNING: lego failed for $h (exit $rc) — the other names go on"
       failed=1
     fi
@@ -265,11 +321,15 @@ build_host_pems() {
     key="$LEGO_DIR/certificates/$h.key"
     [ -s "$crt" ] || continue
     if ! host_cert_ok "$h" "$crt" "$key"; then
-      log "WARNING: $crt is expired, not for $h or not its key's — not served"
+      log "WARNING: $crt is expired, not for $h or not its key's (or openssl failed) — not installed"
       continue
     fi
     pem="$HOSTS_DIR/$h.pem"
-    (umask 077 && cat "$crt" "$key" > "$pem.tmp")
+    if ! (umask 077 && cat "$crt" "$key" > "$pem.tmp"); then
+      rm -f "$pem.tmp"
+      log "WARNING: cannot write $pem.tmp — the certificate of $h not installed"
+      continue
+    fi
     if cmp -s "$pem.tmp" "$pem"; then
       rm -f "$pem.tmp"
     else
@@ -285,31 +345,68 @@ build_host_pems() {
       *) rm -f "$pem" "$HOSTS_DIR/$h.error"; log "certificate of $h removed (no longer listed)" ;;
     esac
   done
-  for pem in "$HOSTS_DIR"/*.error; do
+  for pem in "$HOSTS_DIR"/*.error "$HOSTS_DIR"/*.acme-failed; do
     [ -e "$pem" ] || continue
-    h="$(basename "$pem" .error)"
+    h="$(basename "$pem")"
+    h="${h%.*}"
     case "$keep" in *" $h "*) ;; *) rm -f "$pem" ;; esac
   done
+}
+
+# 0 = the certificate in PEM $1 has expired (or expires within $2 seconds),
+# 1 = it has not, 2 = openssl could not tell (an ERROR, not a verdict). One
+# openssl call when it is valid: the cheap check the 5-min sync makes per
+# hostname PEM. OpenSSL prints its verdict; without one (LibreSSL prints
+# none, or openssl failed) "expired" needs a readable certificate and the
+# same answer twice.
+pem_expired() {
+  local out
+  out="$(openssl x509 -in "$1" -noout -checkend "${2:-0}" 2>/dev/null)" && return 1
+  case "$out" in *"will expire"*) return 0 ;; esac
+  openssl x509 -in "$1" -noout -enddate >/dev/null 2>&1 || return 2
+  openssl x509 -in "$1" -noout -checkend "${2:-0}" >/dev/null 2>&1 && return 1
+  return 0
 }
 
 # The crt-list of the TLS terminator: the IP certificate FIRST — haproxy's
 # default for a client without SNI (IP clients send none) or with an SNI no
 # line names — then `<pem> <name>` for every listed name whose PEM is in place
-# and valid. Always leaves a crt-list (at least the IP line) behind: the base
-# config names it, so it must exist before any `haproxy -c` / reload. With
-# "ip-only": the IP line alone. Replaced atomically, only when it differs.
+# and has not expired. Always leaves a crt-list (at least the IP line) behind:
+# the base config names it, so it must exist before any `haproxy -c` / reload.
+# With "ip-only": the IP line alone. Replaced atomically, only when it differs.
+# A line goes only for a definite reason (the name no longer listed, its PEM
+# missing, its certificate expired): when openssl merely fails, a line already
+# in the crt-list stays (a transient error must not cost two reloads) and a
+# new one waits for the next pass. A PEM is only ever installed after
+# host_cert_ok (build_host_pems) and the crt-list is checked by haproxy
+# (crt_list_validate), so this is the only check due every 5 min.
 write_crt_list() {
-  local h pem
+  local h pem rc prev="" lines
   install -d -m 0700 "$TLS_DIR"
-  {
-    printf '%s\n' "$PEM"
-    if [ "${1:-}" != ip-only ]; then
-      for h in $(https_hostnames); do
-        pem="$HOSTS_DIR/$h.pem"
-        if host_cert_ok "$h" "$pem"; then printf '%s %s\n' "$pem" "$h"; fi
-      done
-    fi
-  } > "$CRT_LIST.tmp"
+  lines="$PEM"$'\n'
+  if [ "${1:-}" != ip-only ]; then
+    prev="$(cat "$CRT_LIST" 2>/dev/null || true)"
+    for h in $(https_hostnames); do
+      pem="$HOSTS_DIR/$h.pem"
+      [ -s "$pem" ] || continue
+      rc=0
+      pem_expired "$pem" || rc=$?
+      case "$rc:"$'\n'"$prev"$'\n' in
+        1:*) lines="$lines$pem $h"$'\n' ;;
+        0:*$'\n'"$pem $h"$'\n'*) log "WARNING: the certificate of $h has expired — dropped from the crt-list" ;;
+        0:*) ;;
+        *$'\n'"$pem $h"$'\n'*)
+          log "WARNING: cannot read the certificate of $h (openssl failed) — its crt-list line kept"
+          lines="$lines$pem $h"$'\n' ;;
+        *) log "WARNING: cannot read the certificate of $h (openssl failed) — not added this time" ;;
+      esac
+    done
+  fi
+  if ! printf '%s' "$lines" > "$CRT_LIST.tmp"; then
+    rm -f "$CRT_LIST.tmp"
+    log "ERROR: cannot write $CRT_LIST.tmp — $CRT_LIST left as it was"
+    return 1
+  fi
   if cmp -s "$CRT_LIST.tmp" "$CRT_LIST"; then
     rm -f "$CRT_LIST.tmp"
   else
@@ -320,6 +417,99 @@ write_crt_list() {
 # The hostname PEMs named by the crt-list (the IP PEM is hashed on its own).
 crt_list_pems() {
   awk -v pem="$PEM" '$1 != "" && $1 !~ /^#/ && $1 != pem { print $1 }' "$CRT_LIST" 2>/dev/null || true
+}
+
+# The crt-list's hostname lines, "<pem> <name>" each.
+crt_list_host_lines() {
+  awk -v pem="$PEM" 'NF >= 2 && $1 !~ /^#/ && $1 != pem { print $1, $2 }' "$CRT_LIST" 2>/dev/null || true
+}
+
+# sha256 over the crt-list and every PEM it names (the IP PEM too).
+crt_list_hash() {
+  local f
+  # shellcheck disable=SC2046
+  for f in "$CRT_LIST" "$PEM" $(crt_list_pems); do
+    printf '== %s\n' "$f"
+    cat "$f" 2>/dev/null || true
+  done | sha256_stream
+}
+
+# `haproxy -c` of crt-list $1 on its own: the base config (same global TLS
+# settings, same bind options) naming $1 instead of $CRT_LIST, without the
+# per-batch frontends. haproxy's messages go to file $2 when given.
+crt_list_check() {
+  local d rc=0
+  d="$(mktemp -d)"
+  base_config_text | sed "s#ssl crt-list $CRT_LIST #ssl crt-list $1 #" > "$d/haproxy.cfg"
+  if grep -qF "ssl crt-list $1 " "$d/haproxy.cfg"; then
+    haproxy -c -f "$d/haproxy.cfg" > "$d/out" 2>&1 || rc=$?
+  else
+    echo "[ALERT] the base config names no 'ssl crt-list $CRT_LIST'" > "$d/out"
+    rc=2
+  fi
+  [ -z "${2:-}" ] || cp "$d/out" "$2"
+  rm -rf "$d"
+  return "$rc"
+}
+
+# Audit FO-08 (review) — the crt-list's hostname lines that haproxy rejects,
+# found one at a time (a crt-list of the IP line + that line, crt_list_check),
+# are dropped: the PEM deleted (the next `certs` rebuilds it from lego's files
+# and checks it again), "haproxy: rejected: <reason>" in hosts/<name>.error
+# (the agent shows it), the crt-list rewritten without it. The others stay.
+# 0 = a line was dropped; 1 = every line passes alone; 2 = the IP line alone
+# fails (not a hostname certificate's fault: nothing touched).
+crt_list_drop_rejected() {
+  local d pem h reason dropped=0
+  d="$(mktemp -d)"
+  printf '%s\n' "$PEM" > "$d/ip-only"
+  if ! crt_list_check "$d/ip-only" "$d/out"; then
+    log "ERROR: haproxy rejects even the IP certificate alone: $(grep -m 1 'ALERT' "$d/out" | cut -c1-300)"
+    rm -rf "$d"
+    return 2
+  fi
+  while read -r pem h; do
+    printf '%s\n%s %s\n' "$PEM" "$pem" "$h" > "$d/one"
+    crt_list_check "$d/one" "$d/out" && continue
+    reason="$(grep -m 1 'ALERT' "$d/out" | sed 's/.*: //' | cut -c1-200)"
+    log "ERROR: haproxy rejects the certificate of $h (${reason:-no reason given}) — not served; the next certs run retries"
+    rm -f "$HOSTS_DIR/$h.pem"
+    host_note "$h" "haproxy: rejected${reason:+: $reason}"
+    dropped=1
+  done < <(crt_list_host_lines)
+  rm -rf "$d"
+  [ "$dropped" = 1 ] || return 1
+  write_crt_list
+  return 0
+}
+
+# Audit FO-08 (review) — the crt-list must load on its own, whatever state
+# haproxy is in: a PEM haproxy rejects left in it would fail every later
+# `haproxy -c`, so every sync (and with haproxy stopped, its start) for good.
+# Checked only when it has hostname lines and differs from the last one
+# accepted ($CRT_LIST_OK). Rejected lines are dropped (crt_list_drop_rejected);
+# when every line passes alone but not the set, the IP line alone is left.
+# 0 = it loads as it is; 1 = lines were dropped; 2 = haproxy rejects the IP
+# line alone (nothing touched).
+crt_list_validate() {
+  local h r=0
+  [ -n "$(crt_list_host_lines)" ] || return 0
+  h="$(crt_list_hash)"
+  [ "$(cat "$CRT_LIST_OK" 2>/dev/null || true)" != "$h" ] || return 0
+  if crt_list_check "$CRT_LIST"; then
+    printf '%s\n' "$h" > "$CRT_LIST_OK" || true
+    return 0
+  fi
+  log "ERROR: haproxy rejects the crt-list $CRT_LIST — checking its hostname certificates one by one"
+  crt_list_drop_rejected || r=$?
+  [ "$r" != 2 ] || return 2
+  if [ -n "$(crt_list_host_lines)" ] && ! crt_list_check "$CRT_LIST"; then
+    log "ERROR: haproxy rejects the hostname certificates together (each passes alone) — serving the IP certificate alone"
+    write_crt_list ip-only
+  elif [ -n "$(crt_list_host_lines)" ]; then
+    printf '%s\n' "$(crt_list_hash)" > "$CRT_LIST_OK" || true
+  fi
+  return 1
 }
 
 # ── 3proxy HTTP listeners → 127.0.0.1 ─────────────────────────────
@@ -443,7 +633,7 @@ update_base_config() {
   if [ -s "$HAPROXY_CFG" ] && grep -q "netrun-https" "$HAPROXY_CFG"; then
     install -d -m 0755 "$FRONTEND_DIR"
     base_config_text > "$HAPROXY_CFG.new"
-    if ! haproxy_check "$FRONTEND_DIR" "$HAPROXY_CFG.new"; then
+    if ! haproxy_check_crt "$FRONTEND_DIR" "$HAPROXY_CFG.new"; then
       rm -f "$HAPROXY_CFG.new"
       log "WARNING: haproxy rejects the new base config — $HAPROXY_CFG left as it was"
       return 1
@@ -488,7 +678,7 @@ EOF
   # Validate the NEW set before it replaces the live one: a set haproxy
   # rejects never lands in $FRONTEND_DIR (the running haproxy, the next sync
   # and the next boot keep the last good set; this run fails loudly).
-  if ! haproxy_check "$tmpdir"; then
+  if ! haproxy_check_crt "$tmpdir"; then
     rm -rf "$tmpdir"
     die "haproxy rejects the new frontend set — $FRONTEND_DIR left as it was"
   fi
@@ -515,8 +705,35 @@ haproxy_check() {
   haproxy -c -q -f "${2:-$HAPROXY_CFG}" -f "$1"
 }
 
+# Audit FO-08 (review) — haproxy_check (same arguments) that a hostname
+# certificate can never fail for good: when it fails with hostname lines in
+# the crt-list, the lines haproxy rejects are dropped (crt_list_drop_rejected)
+# and the check repeated; when it still fails, it is retried ONCE with the IP
+# line alone — kept when that passes (logged loudly: the IP certificate must
+# never be blocked by a hostname PEM), the crt-list restored when it does not
+# (then the fault is elsewhere: base config, frontends).
+haproxy_check_crt() {
+  local r=0
+  haproxy_check "$@" && return 0
+  [ -n "$(crt_list_host_lines)" ] || return 1
+  log "ERROR: haproxy -c fails with hostname certificates in the crt-list — checking them one by one"
+  crt_list_drop_rejected || r=$?
+  [ "$r" != 2 ] || return 1
+  if [ "$r" = 0 ] && haproxy_check "$@"; then return 0; fi
+  [ -n "$(crt_list_host_lines)" ] || return 1
+  cp -f "$CRT_LIST" "$CRT_LIST.keep"
+  write_crt_list ip-only
+  if haproxy_check "$@"; then
+    rm -f "$CRT_LIST.keep"
+    log "ERROR: haproxy -c passes only with the IP certificate alone — the hostname certificates are NOT served"
+    return 0
+  fi
+  mv -f "$CRT_LIST.keep" "$CRT_LIST"
+  return 1
+}
+
 reload_haproxy() {
-  haproxy_check "$FRONTEND_DIR" || die "haproxy config check failed"
+  haproxy_check_crt "$FRONTEND_DIR" || die "haproxy config check failed"
   if systemctl is-active --quiet haproxy; then
     systemctl reload haproxy
   else
@@ -553,6 +770,66 @@ stamp_read() { cat "$APPLIED_STAMP" 2>/dev/null || true; }
 stamp_write() {
   mkdir -p "$(dirname "$APPLIED_STAMP")" 2>/dev/null || true
   printf '%s\n' "$1" > "$APPLIED_STAMP.tmp" && mv -f "$APPLIED_STAMP.tmp" "$APPLIED_STAMP"
+}
+
+# After a VERIFIED reload of the files whose hash is $1: the stamp, and what
+# haproxy now serves (served.json).
+stamp_applied() {
+  stamp_write "$1"
+  served_write "$1"
+}
+
+# ── served.json: the hostnames haproxy verifiably serves (audit FO-08 review) ──
+#
+# {"version": 1, "stamp": "<the reload stamp>", "at": "<UTC>",
+#  "crtList": "<path>", "crtListBound": true,
+#  "hostnames": [{"hostname": "<name>", "pem": "<path>", "sha256": "<of the PEM>"}, ...]}
+# Written right after a verified reload (all writers of the files hold the
+# sync lock, so they are what haproxy loaded); hostnames only when
+# haproxy.cfg's TLS bind loads the crt-list (crtListBound). Deleted before a
+# reload and when the files change while haproxy is down: until the next
+# verified reload nobody knows what haproxy serves. The agent's `ok` needs the
+# name here with the sha256 of the PEM in place now.
+
+json_str() {
+  printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
+served_invalidate() { rm -f "$SERVED"; }
+
+# The stamp served.json was written for (nothing when there is none).
+served_stamp() {
+  sed -n 's/^  "stamp": "\([0-9a-f]*\)",$/\1/p' "$SERVED" 2>/dev/null | head -n 1 || true
+}
+
+served_write() {
+  local stamp="$1" bound=false sep="" pem h sha
+  install -d -m 0700 "$TLS_DIR"
+  if grep -qF "ssl crt-list $CRT_LIST " "$HAPROXY_CFG" 2>/dev/null; then bound=true; fi
+  {
+    printf '{\n  "version": 1,\n  "stamp": "%s",\n  "at": "%s",\n' "$stamp" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "crtList": %s,\n  "crtListBound": %s,\n  "hostnames": [' "$(json_str "$CRT_LIST")" "$bound"
+    if [ "$bound" = true ]; then
+      while read -r pem h; do
+        sha="$(file_sha256 "$pem")"
+        [ -n "$sha" ] || continue
+        printf '%s\n    {"hostname": %s, "pem": %s, "sha256": "%s"}' "$sep" "$(json_str "$h")" "$(json_str "$pem")" "$sha"
+        sep=","
+      done < <(crt_list_host_lines)
+    fi
+    if [ -n "$sep" ]; then printf '\n  ]\n}\n'; else printf ']\n}\n'; fi
+  } > "$SERVED.tmp" && mv -f "$SERVED.tmp" "$SERVED" \
+    || { rm -f "$SERVED.tmp"; log "WARNING: could not write $SERVED"; }
+  return 0
+}
+
+# The hostname list a certs / renew pass worked through ($1, one per line):
+# $CERTS_APPLIED. The agent starts another `certs` when the list file differs.
+applied_write() {
+  install -d -m 0700 "$TLS_DIR"
+  { [ -z "$1" ] || printf '%s\n' "$1"; } > "$CERTS_APPLIED.tmp" && mv -f "$CERTS_APPLIED.tmp" "$CERTS_APPLIED" \
+    || { rm -f "$CERTS_APPLIED.tmp"; log "WARNING: could not write $CERTS_APPLIED"; }
+  return 0
 }
 
 # 0 when the stamp exists and is older than NETRUN_HTTPS_RELOAD_MAX_AGE_H.
@@ -681,7 +958,10 @@ cmd_sync() {
   [ -s "$PEM" ] || die "no certificate at $PEM — run: netrun-https setup"
   # Audit FO-08 — the crt-list before anything runs `haproxy -c` (the base
   # config names it); a name dropped from the list leaves it here already.
+  # Then checked on its own (when it changed): a hostname PEM haproxy rejects
+  # is dropped here, before any check of the live config could trip over it.
   write_crt_list
+  crt_list_validate || true
   if ! base_config_current && update_base_config; then
     base_changed=1
   fi
@@ -717,10 +997,19 @@ cmd_sync() {
   elif [ "$stamp" != "$want" ]; then reason="files not applied by the last reload"
   elif stamp_expired; then reason="last applied reload older than $(netrun_setting NETRUN_HTTPS_RELOAD_MAX_AGE_H 6) h"
   fi
-  [ -n "$reason" ] || return 0
+  if [ -z "$reason" ]; then
+    # Audit FO-08 (review) — haproxy verifiably runs exactly these files:
+    # served.json follows (a node upgraded in place, a lost write).
+    [ "$(served_stamp)" = "$stamp" ] || served_write "$stamp"
+    return 0
+  fi
+  served_invalidate
   reload_haproxy
+  # The check before the reload may have dropped hostname lines (a PEM
+  # haproxy rejects): the stamp is for the files haproxy really loaded.
+  want="$(haproxy_config_hash)"
   if verify_frontends_listening "$ip"; then
-    stamp_write "$want"
+    stamp_applied "$want"
     log "synced: haproxy reloaded ($reason; moved=${#moved[@]})"
   else
     log "synced: haproxy reloaded ($reason) but NOT verified"
@@ -733,11 +1022,14 @@ cmd_sync() {
 # lock, then the PEM swap + reload + stamp under the sync lock. Audit FO-08 —
 # the hostname certificates ride along: same ACME step (after the IP one, also
 # when that failed), same apply step (one reload for both). Exits non-zero
-# when the IP renewal or a hostname's lego run failed.
+# when the IP renewal or a hostname's lego run failed (not for a name only
+# waiting out its retry backoff) or haproxy rejected a certificate.
 cmd_renew() {
-  local rc=0
+  local rc=0 list
+  list="$(https_hostnames)"
   with_acme_lock renew_obtain || rc=$?
-  with_sync_lock cmd_renew_apply
+  with_sync_lock cmd_renew_apply || rc=1
+  applied_write "$list"
   return "$rc"
 }
 
@@ -755,16 +1047,20 @@ cmd_renew_apply() {
 
 # `certs` (the agent starts it after POST /https/hostnames): the hostname
 # certificates alone. A list rewritten while it ran (the agent never starts
-# a second run) is picked up by another pass, at most 3 in all.
+# a second run) is picked up by another pass, at most 3 in all; each pass
+# records the list it worked through (applied_write: the agent starts one more
+# run when the file still differs). The sync lock is held for the apply step
+# only (with_sync_lock is a subshell): never while lego runs on a later pass.
 cmd_certs() {
-  local ip rc pass=0 seen
+  local ip rc=0 pass=0 seen list
   ip="$(public_ipv4 || true)"
   [ -n "$ip" ] || die "cannot detect the public IPv4"
   while :; do
-    rc=0
     seen="$(cat "$HOSTNAMES_FILE" 2>/dev/null || true)"
-    with_acme_lock certs_obtain "$ip" || rc=$?
-    with_sync_lock certs_apply
+    list="$(https_hostnames)"
+    with_acme_lock certs_obtain "$ip" || rc=1
+    with_sync_lock certs_apply || rc=1
+    applied_write "$list"
     pass=$((pass + 1))
     [ "$pass" -lt 3 ] && [ "$(cat "$HOSTNAMES_FILE" 2>/dev/null || true)" != "$seen" ] || break
     log "the hostname list changed during the run — one more pass"
@@ -773,51 +1069,63 @@ cmd_certs() {
 }
 
 # Under the sync lock: the IP PEM (with "ip": renew), the hostname PEMs and
-# the crt-list; haproxy is reloaded only when one of them changed — and then
-# only once `haproxy -c` accepts them. A hostname set haproxy rejects is
-# dropped (crt-list back to the IP line alone, hostname PEMs deleted; returns
-# 1) so the 5-min sync never trips over it; the next `certs` rebuilds them
-# from lego's files.
+# the crt-list. The crt-list is checked on its own WHETHER OR NOT haproxy
+# runs (crt_list_validate): a hostname PEM haproxy rejects is deleted and
+# noted, the other lines stay (returns 1) — a rejected PEM left in the
+# crt-list while haproxy is down would make every later sync die before it
+# starts haproxy. haproxy is reloaded only when one of the files changed, and
+# only once `haproxy -c` of the whole config accepts them; served.json is
+# rewritten after a verified reload (deleted until then).
 certs_apply() {
   local ip before rc=0
-  ip="$(public_ipv4)"
+  ip="$(public_ipv4 || true)"
+  [ -n "$ip" ] || { log "ERROR: cannot detect the public IPv4 — nothing applied"; return 1; }
   before="$(haproxy_config_hash)"
   [ "${1:-}" != ip ] || build_pem "$ip"
   build_host_pems
   write_crt_list
+  crt_list_validate || rc=1
   if [ "$(haproxy_config_hash)" = "$before" ]; then
-    return 0
+    return "$rc"
+  fi
+  served_invalidate
+  if ! haproxy_check_crt "$FRONTEND_DIR"; then
+    log "ERROR: haproxy config check failed — not reloaded (the next sync retries)"
+    return 1
   fi
   if ! systemctl is-active --quiet haproxy; then
     log "certificates changed; haproxy is not running (the next sync starts it)"
-    return 0
+    return "$rc"
   fi
-  if ! haproxy_check "$FRONTEND_DIR"; then
-    log "ERROR: haproxy rejects the hostname certificates — serving the IP certificate alone"
-    rm -f "$HOSTS_DIR"/*.pem
-    write_crt_list ip-only
-    haproxy_check "$FRONTEND_DIR" || die "haproxy config check failed"
-    rc=1
-    [ "$(haproxy_config_hash)" != "$before" ] || return "$rc"
+  # Explicit checks: callers run this where set -e does not apply (|| rc=1).
+  if ! systemctl reload haproxy; then
+    log "ERROR: systemctl reload haproxy failed (the next sync retries)"
+    return 1
   fi
-  systemctl reload haproxy
   # The stamp covers the certificates: an unverified reload here is retried
   # by the next sync.
-  if verify_frontends_listening "$ip"; then stamp_write "$(haproxy_config_hash)"; fi
+  if verify_frontends_listening "$ip"; then stamp_applied "$(haproxy_config_hash)"; fi
   log "certificates changed, haproxy reloaded"
   return "$rc"
 }
 
 # sync / renew's apply step / certs' apply step / setup one at a time
 # (generator, timers, agent, /deprovision). NETRUN_HTTPS_LOCK_WAIT_SEC (300):
-# in-line callers pass less.
+# in-line callers pass less. Audit FO-08 (review) — a subshell holds fd 9, so
+# the lock is released when the command returns (it used to stay open in the
+# shell: from `certs`' second pass on, lego ran holding the sync lock and
+# blocked the generator's sync, /deprovision's and the 5-min timer); nothing
+# started later inherits it.
 with_sync_lock() {
-  if command -v flock >/dev/null 2>&1; then
-    mkdir -p "$(dirname "$SYNC_LOCK")" 2>/dev/null || true
-    exec 9>"$SYNC_LOCK"
-    flock -w "${NETRUN_HTTPS_LOCK_WAIT_SEC:-300}" 9 || die "another netrun-https run still holds $SYNC_LOCK"
+  if ! command -v flock >/dev/null 2>&1; then
+    "$@"
+    return
   fi
-  "$@"
+  mkdir -p "$(dirname "$SYNC_LOCK")" 2>/dev/null || true
+  (
+    flock -w "${NETRUN_HTTPS_LOCK_WAIT_SEC:-300}" 9 || die "another netrun-https run still holds $SYNC_LOCK"
+    "$@"
+  ) 9>"$SYNC_LOCK"
 }
 
 # Audit FO-08 — one HTTP-01 client on :80 at a time (the IP renewal, hostname
@@ -931,6 +1239,8 @@ cmd_setup() {
   install_lego
   install -m 0755 "$0" "$SELF" 2>/dev/null || true
   install -d -m 0755 "$FRONTEND_DIR"
+  # The crt-list before the base config that names it (FO-08).
+  write_crt_list
   write_base_config
   # Certificate first: the sync timer fires as soon as it is enabled.
   issue_or_renew
@@ -957,6 +1267,11 @@ cmd_status() {
     fi
   done
   echo "crt-list  : $( [ -s "$CRT_LIST" ] && wc -l < "$CRT_LIST" | tr -d ' ' || echo 0) line(s)$(grep -q 'ssl crt-list' "$HAPROXY_CFG" 2>/dev/null || echo ' — haproxy.cfg not migrated yet (next sync)')"
+  if [ -s "$SERVED" ]; then
+    echo "served    : $(grep -o '"hostname": "[^"]*"' "$SERVED" | sed 's/.*: "//; s/"$//' | tr '\n' ' ')(verified reload $(sed -n 's/^  "at": "\(.*\)",$/\1/p' "$SERVED"))"
+  else
+    echo "served    : unknown — no verified reload since the files changed"
+  fi
   echo "frontends : $(ls "$FRONTEND_DIR"/*.cfg 2>/dev/null | wc -l)"
   echo "3proxy http on public ip : $(cat "$PROXY_DIR"/3proxy_*.cfg 2>/dev/null | grep -cE "^proxy .* -i${ip//./\\.}[[:space:]]" || true)"
   echo "3proxy http on 127.0.0.1 : $(cat "$PROXY_DIR"/3proxy_*.cfg 2>/dev/null | grep -cE '^proxy .* -i127\.0\.0\.1[[:space:]]' || true)"

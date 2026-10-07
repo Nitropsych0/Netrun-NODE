@@ -93,6 +93,7 @@ test("POST /https/hostnames: 401 without the key, 400 on bad JSON / names, 200 w
     hostnames: ["us1.proxy.netrun.lol"],
     issuing: true,
     started: true,
+    pending: false,
     certs: [{ hostname: "us1.proxy.netrun.lol", ok: false, notAfter: null, error: "missing", lastError: null }],
   });
   assert.strictEqual(fs.readFileSync(HOSTNAMES_FILE, "utf-8"), "us1.proxy.netrun.lol\n");
@@ -110,6 +111,8 @@ test("GET /https/hostnames + /health httpsHostnames + /describe supports.https_h
   assert.strictEqual(r.json.frontendInstalled, true);
   assert.deepStrictEqual(r.json.hostnames, ["us1.proxy.netrun.lol"]);
   assert.strictEqual(r.json.issuing, false, "systemctl says inactive");
+  assert.strictEqual(r.json.pending, false);
+  assert.strictEqual(r.json.servedAt, null, "no verified reload yet");
   assert.deepStrictEqual(r.json.certs.map((c) => c.error), ["missing"]);
   r = await request("GET", "/health");
   assert.strictEqual(r.status, 200);
