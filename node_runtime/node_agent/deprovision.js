@@ -35,6 +35,8 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const egress = require("./egress.js");
+const proxySpawn = require("./proxy_spawn.js");
+const { withProcessLock } = require("./process_lock.js");
 
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
@@ -179,11 +181,12 @@ async function killCfgProcess(startPort) {
   return { killed: pids.length, forceKilled: survivors.length };
 }
 
-function spawnCfg(cfgPath) {
-  const child = spawn(PROXY_BIN, [cfgPath], { detached: true, stdio: "ignore" });
-  const pid = child.pid;
-  child.unref();
-  return pid;
+// Audit RES-11 — through the node's spawn helper (own systemd scope; the
+// direct detached start where the helper is absent).
+async function spawnCfg(cfgPath) {
+  const res = await proxySpawn.spawn3proxyCfg(cfgPath, { bin: PROXY_BIN });
+  if (!res.ok) throw new Error(`respawn_failed:${res.detail || res.outcome}`);
+  return res.pid;
 }
 
 // Remove the nft footprint of the given SOCKS ports. Accounting is MAP-based
@@ -278,39 +281,44 @@ async function deprovisionPorts(rawPorts) {
     };
 
     try {
-      if (wholeBatch) {
-        await killCfgProcess(startPort);
-        safeUnlink(cfgPath);
-        safeUnlink(cfgPath + ".disabled");
-        // Drop ALL of the generator's per-start-port state for this instance,
-        // not just the cfg. The generator keys these files by instance_id =
-        // start_port (proxyyy_automated.sh): a stale/partial ipv6_<port>.list
-        // (or users list) left behind makes the NEXT generate at this start_port
-        // REUSE it and emit an inconsistent batch — proxies.list has N entries
-        // but the cfg/map only 1 port, so the node-agent hangs forever waiting
-        // for N listeners to come up (observed on the 2026-06-30 recovery node).
-        safeUnlink(path.join(PROXY_ROOT, `proxy-startup_${startPort}.sh`));
-        safeUnlink(path.join(PROXY_ROOT, `ipv6_${startPort}.list`));
-        safeUnlink(path.join(PROXY_ROOT, `random_users_${startPort}.list`));
-        safeUnlink(path.join(PROXY_ROOT, `running_server_${startPort}.info`));
-      } else {
-        // Rewrite atomically: header + surviving blocks → temp → fsync rename.
-        const body = plan.newText;
-        // Sanity: the rewrite MUST still contain every kept socks port (guards a
-        // parse bug from silently dropping a customer port).
-        const stillHas = new Set();
-        for (const m of body.matchAll(/^socks\b.*?-p(\d+)\b/gm)) stillHas.add(Number(m[1]));
-        for (const b of keepBlocks) {
-          if (b.socksPort != null && !stillHas.has(b.socksPort)) {
-            throw new Error(`rewrite_sanity_failed_missing_${b.socksPort}`);
+      // Audit RES-11 — kill + unlink / kill + respawn as ONE step of the shared
+      // process lock: the supervisor must never see this batch "dead" between
+      // the kill and the unlink (and start it again with no cfg left).
+      await withProcessLock(async () => {
+        if (wholeBatch) {
+          await killCfgProcess(startPort);
+          safeUnlink(cfgPath);
+          safeUnlink(cfgPath + ".disabled");
+          // Drop ALL of the generator's per-start-port state for this instance,
+          // not just the cfg. The generator keys these files by instance_id =
+          // start_port (proxyyy_automated.sh): a stale/partial ipv6_<port>.list
+          // (or users list) left behind makes the NEXT generate at this start_port
+          // REUSE it and emit an inconsistent batch — proxies.list has N entries
+          // but the cfg/map only 1 port, so the node-agent hangs forever waiting
+          // for N listeners to come up (observed on the 2026-06-30 recovery node).
+          safeUnlink(path.join(PROXY_ROOT, `proxy-startup_${startPort}.sh`));
+          safeUnlink(path.join(PROXY_ROOT, `ipv6_${startPort}.list`));
+          safeUnlink(path.join(PROXY_ROOT, `random_users_${startPort}.list`));
+          safeUnlink(path.join(PROXY_ROOT, `running_server_${startPort}.info`));
+        } else {
+          // Rewrite atomically: header + surviving blocks → temp → fsync rename.
+          const body = plan.newText;
+          // Sanity: the rewrite MUST still contain every kept socks port (guards a
+          // parse bug from silently dropping a customer port).
+          const stillHas = new Set();
+          for (const m of body.matchAll(/^socks\b.*?-p(\d+)\b/gm)) stillHas.add(Number(m[1]));
+          for (const b of keepBlocks) {
+            if (b.socksPort != null && !stillHas.has(b.socksPort)) {
+              throw new Error(`rewrite_sanity_failed_missing_${b.socksPort}`);
+            }
           }
+          const tmp = cfgPath + ".deprov.tmp";
+          fs.writeFileSync(tmp, body);
+          fs.renameSync(tmp, cfgPath);
+          await killCfgProcess(startPort);
+          rec.respawnPid = await spawnCfg(cfgPath);
         }
-        const tmp = cfgPath + ".deprov.tmp";
-        fs.writeFileSync(tmp, body);
-        fs.renameSync(tmp, cfgPath);
-        await killCfgProcess(startPort);
-        rec.respawnPid = spawnCfg(cfgPath);
-      }
+      });
       for (const b of removeBlocks) {
         remaining.delete(b.socksPort);
         result.removed_ports.push(b.socksPort);

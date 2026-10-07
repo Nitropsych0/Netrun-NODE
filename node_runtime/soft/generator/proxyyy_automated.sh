@@ -9,6 +9,16 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# Wave FLEET-HEALTH (SPD-05) — a node setting: the environment wins, then
+# ${NETRUN_ENV_FILE:-/etc/netrun/netrun.env} (KEY=VALUE lines), then the default.
+function netrun_setting() {
+  local key="$1" def="$2" v="${!1:-}" f="${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}"
+  if [ -z "$v" ] && [ -r "$f" ]; then
+    v="$(awk -v k="$key" '{ sub(/^[ \t]+/, "") } index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { gsub(/^["\047 \t]+|["\047 \t\r]+$/, "", v); print v }' "$f")"
+  fi
+  printf '%s' "${v:-$def}"
+}
+
 # Program help info for users
 function usage() { echo "Usage: $0 [-s | --subnet <16|32|48|64|80|96|112> proxy subnet (default 64)] 
                           [-c | --proxy-count <number> count of proxies] 
@@ -33,14 +43,14 @@ function usage() { echo "Usage: $0 [-s | --subnet <16|32|48|64|80|96|112> proxy 
                           [--allowed-hosts <string> allowed hosts or IPs (3proxy format), for example \"google.com,*.google.com,*.gstatic.com\"
                                 if at least one host is allowed, the rest are banned by default]
                           [--denied-hosts <string> banned hosts or IP addresses in quotes (3proxy format)]
-                           [--dns-country <auto|ISO2> DNS region for upstream resolvers (default auto by backconnect IP)]
-                          [--dns-servers <ip1,ip2> explicit upstream DNS resolvers override]
-                           [--network-profile <standard_nat|residential_like|high_compatibility> edge TCP/IP profile (default standard_nat)]
-                           [--tcp-timestamps-mode <auto|on|off> explicit TCP timestamps mode override (default auto)]
-                           [--maxconn <number> 3proxy maxconn for this instance (default 200)]
-                           [--ipv6-policy <strict_dual_stack|ipv6_required|ipv6_only> egress family policy (default strict_dual_stack)]
-                            [--skip-self-check <bool> disable post-start dual-stack self-check (default false)]
-                           [--self-check-samples <number> number of first proxies to test for policy self-check (default 1)]
+                          [--dns-servers <ip1,ip2> explicit upstream DNS resolvers override (default: the node's unbound, 127.0.0.1 / ::1)]
+                          [--maxconn <number> 3proxy maxconn for this instance; the listen backlog is maxconn/16+1
+                                (default \$NETRUN_3PROXY_MAXCONN, else /etc/netrun/netrun.env, else 512)]
+                          [--ipv6-policy <strict_dual_stack|ipv6_required|ipv6_only> egress family policy (default strict_dual_stack)]
+                          [--dns-country, --network-profile, --tcp-timestamps-mode, --self-check-samples <value>,
+                           --skip-self-check: accepted and IGNORED (audit CLN-03/CLN-04: the TCP stack is set only by
+                           install_node_v2.sh / deploy/node/99-zz-netrun-tcp.conf, DNS is the local unbound, and the
+                           post-start self-check never ran under the agent)]
                           [--port-ipv6-map-file <string> path to CSV file with port-to-IPv6 mapping
                                 (default \`~/proxyserver/port_ipv6_map_<start_port>.csv\`)]
                           [--bootstrap-only run one-time node bootstrap and exit]
@@ -72,37 +82,30 @@ interface_name="$(ip -br l | awk '$1 !~ "lo|vir|wl|@NONE" { print $1 }' | awk 'N
 script_log_file="/var/tmp/ipv6-proxy-server-logs.log"
 backconnect_ipv4=""
 mode_flag="-64"  # Universal mode by default
-run_self_check=true
-self_check_samples=1
 ip_preference_mode="compat_ipv6_first"
-dns_country="auto"
 dns_servers_override=""
-network_profile="standard_nat"
-tcp_timestamps_mode="auto"
 ipv6_policy="strict_dual_stack"
-proxy_maxconn=200
+# Speed audit — 3proxy 0.9.3 has NO listen-backlog option: every service calls
+# listen(sock, (maxconn >> 4) + 1) (mainfunc 0xc408-0xc421 in the bundled
+# binary), and net.core.somaxconn only caps a LARGER request. maxconn 200 gave
+# each proxy port an accept queue of 13 (a burst of ~14 parallel connects ->
+# SYN drops, 1/3/7 s retransmits); 512 gives 33 and lets one proxy carry 512
+# concurrent connections instead of 200 (at the cap the listener stops
+# accepting). RAM is spent per ACTIVE connection only, so the per-port cap is
+# not a node budget. Applies to NEW batches (the cfg header); the setting
+# NETRUN_3PROXY_MAXCONN (environment, else /etc/netrun/netrun.env) or
+# --maxconn overrides it; 200 restores the old value.
+proxy_maxconn="$(netrun_setting NETRUN_3PROXY_MAXCONN 512)"
 proxy_count=1
 # Wave CAPACITY-18K — lowest port a proxy listener may bind (see check_startup_parameters).
 min_listen_port="${NETRUN_MIN_LISTEN_PORT:-8100}"
-dns_selected_country="fallback"
 dns_selected_servers_csv="127.0.0.1,::1"
 dns_selection_strategy="local_unbound"
 dns_nserver_lines=$'  nserver 127.0.0.1\n  nserver ::1'
-tls_clienthello_mode="passthrough"
 bootstrap_only=false
 runtime_only=false
 verify_bootstrap=false
 bootstrap_side_effects_allowed=true
-
-profile_ttl=64
-profile_mss_mode="set"
-profile_mss_value=1460
-profile_mtu_hint=1500
-profile_tcp_timestamps=0
-profile_tcp_syn_retries=3
-profile_tcp_retries2=10
-profile_tcp_fin_timeout=30
-profile_tcp_keepalive_time=7200
 
 while true; do
   case "$1" in
@@ -121,14 +124,13 @@ while true; do
     -d | --disable-inet6-ifaces-check ) inet6_network_interfaces_configuration_check=false; shift ;;
     --allowed-hosts ) allowed_hosts="$2"; shift 2 ;;
     --denied-hosts ) denied_hosts="$2"; shift 2 ;;
-    --dns-country ) dns_country="$2"; shift 2 ;;
     --dns-servers ) dns_servers_override="$2"; shift 2 ;;
-    --network-profile ) network_profile="$2"; shift 2 ;;
-    --tcp-timestamps-mode ) tcp_timestamps_mode="$2"; shift 2 ;;
     --ipv6-policy ) ipv6_policy="$2"; shift 2 ;;
     --maxconn ) proxy_maxconn="$2"; shift 2 ;;
-    --skip-self-check ) run_self_check=false; shift ;;
-    --self-check-samples ) self_check_samples="$2"; shift 2 ;;
+    # Audit CLN-03 — accepted and ignored for one release (the agent and older
+    # orchestrators still pass some of them): they changed nothing on the wire.
+    --dns-country | --network-profile | --tcp-timestamps-mode | --self-check-samples ) shift 2 ;;
+    --skip-self-check ) shift ;;
     --port-ipv6-map-file ) port_ipv6_map_file="$2"; shift 2 ;;
     --bootstrap-only ) bootstrap_only=true; shift ;;
     --runtime-only ) runtime_only=true; shift ;;
@@ -145,10 +147,6 @@ done
 if [ "$bootstrap_only" = true ] && [ "$runtime_only" = true ]; then
   echo "Error: --bootstrap-only and --runtime-only cannot be used together" 1>&2
   exit 1
-fi;
-
-if [ "$bootstrap_only" = true ] || [ "$verify_bootstrap" = true ]; then
-  run_self_check=false
 fi;
 
 function log_err() {
@@ -182,10 +180,6 @@ function check_startup_parameters() {
   re='^[0-9]+$'
   if ! [[ $proxy_count =~ $re ]]; then
     log_err_print_usage_and_exit "Error: Argument -c (proxy count) must be a positive integer number";
-  fi;
-
-  if ! [[ $self_check_samples =~ $re ]]; then
-    log_err_print_usage_and_exit "Error: '--self-check-samples' must be a non-negative integer number";
   fi;
 
   if ([ -z $user ] || [ -z $password ]) && is_auth_used && [ $use_random_auth = false ]; then
@@ -266,18 +260,6 @@ function check_startup_parameters() {
     log_err_print_usage_and_exit "Error: if '--allow-hosts' is specified, you cannot use '--deny-hosts'";
   fi;
 
-  if [ "$dns_country" != "auto" ] && ! [[ "$dns_country" =~ ^[A-Za-z]{2}$ ]]; then
-    log_err_print_usage_and_exit "Error: '--dns-country' must be 'auto' or 2-letter ISO country code (example: US)";
-  fi;
-
-  if [ "$network_profile" != "standard_nat" ] && [ "$network_profile" != "residential_like" ] && [ "$network_profile" != "high_compatibility" ]; then
-    log_err_print_usage_and_exit "Error: '--network-profile' must be one of: standard_nat, residential_like, high_compatibility";
-  fi;
-
-  if [ "$tcp_timestamps_mode" != "auto" ] && [ "$tcp_timestamps_mode" != "on" ] && [ "$tcp_timestamps_mode" != "off" ]; then
-    log_err_print_usage_and_exit "Error: '--tcp-timestamps-mode' must be one of: auto, on, off";
-  fi;
-
   if ! [[ $proxy_maxconn =~ $re ]]; then
     log_err_print_usage_and_exit "Error: '--maxconn' must be a positive integer number";
   fi;
@@ -288,97 +270,6 @@ function check_startup_parameters() {
   if cat /sys/class/net/$interface_name/operstate 2>&1 | grep -q "No such file or directory"; then
     log_err_print_usage_and_exit "Incorrect ethernet interface name \"$interface_name\", provide correct name using parameter '--interface'";
   fi;
-}
-
-function resolve_network_profile_settings() {
-  case "$network_profile" in
-    standard_nat)
-      profile_ttl=64
-      profile_mss_mode="set"
-      profile_mss_value=1460
-      profile_mtu_hint=1500
-      profile_tcp_timestamps=0
-      profile_tcp_syn_retries=3
-      profile_tcp_retries2=10
-      profile_tcp_fin_timeout=30
-      profile_tcp_keepalive_time=7200
-      ;;
-    residential_like)
-      profile_ttl=64
-      profile_mss_mode="clamp_pmtu"
-      profile_mss_value=1460
-      profile_mtu_hint=1500
-      profile_tcp_timestamps=1
-      profile_tcp_syn_retries=4
-      profile_tcp_retries2=12
-      profile_tcp_fin_timeout=40
-      profile_tcp_keepalive_time=5400
-      ;;
-    high_compatibility)
-      profile_ttl=64
-      profile_mss_mode="clamp_pmtu"
-      profile_mss_value=1460
-      profile_mtu_hint=1500
-      profile_tcp_timestamps=1
-      profile_tcp_syn_retries=5
-      profile_tcp_retries2=15
-      profile_tcp_fin_timeout=45
-      profile_tcp_keepalive_time=3600
-      ;;
-  esac
-
-  if [ "$tcp_timestamps_mode" = "on" ]; then
-    profile_tcp_timestamps=1
-  elif [ "$tcp_timestamps_mode" = "off" ]; then
-    profile_tcp_timestamps=0
-  fi
-}
-
-function set_sysctl_option() {
-  local key="$1"
-  local value="$2"
-  local escaped_key="${key//./\\.}"
-
-  if grep -Eq "^[[:space:]]*${escaped_key}[[:space:]]*=" /etc/sysctl.conf; then
-    sed -i -E "s|^[[:space:]]*${escaped_key}[[:space:]]*=.*$|${key} = ${value}|g" /etc/sysctl.conf
-  else
-    echo "${key} = ${value}" >> /etc/sysctl.conf
-  fi
-}
-
-function apply_network_profile_sysctl() {
-  local sysctl_options=(
-    "net.ipv4.route.min_adv_mss=${profile_mss_value}"
-    "net.ipv4.tcp_mtu_probing=1"
-    "net.ipv4.tcp_timestamps=${profile_tcp_timestamps}"
-    "net.ipv4.tcp_window_scaling=1"
-    "net.ipv4.tcp_sack=1"
-    "net.ipv4.icmp_echo_ignore_all=1"
-    "net.ipv4.tcp_max_syn_backlog=4096"
-    "net.ipv4.conf.all.forwarding=1"
-    "net.ipv4.ip_nonlocal_bind=1"
-    "net.ipv6.conf.all.proxy_ndp=1"
-    "net.ipv6.conf.default.forwarding=1"
-    "net.ipv6.conf.all.forwarding=1"
-    "net.ipv6.ip_nonlocal_bind=1"
-    "net.ipv4.ip_default_ttl=${profile_ttl}"
-    "net.ipv4.tcp_syn_retries=${profile_tcp_syn_retries}"
-    "net.ipv4.tcp_retries2=${profile_tcp_retries2}"
-    "net.ipv4.tcp_fin_timeout=${profile_tcp_fin_timeout}"
-    "net.ipv4.tcp_keepalive_time=${profile_tcp_keepalive_time}"
-    "net.ipv4.tcp_rmem=4096 87380 6291456"
-    "net.ipv4.tcp_wmem=4096 16384 6291456"
-  )
-
-  for option in "${sysctl_options[@]}"; do
-    local key="${option%%=*}"
-    local value="${option#*=}"
-    set_sysctl_option "$key" "$value"
-  done
-
-  if ! sysctl -p &>> $script_log_file; then
-    log_err_and_exit "Error: cannot apply TCP/IP sysctl profile";
-  fi
 }
 
 bash_location="$(which bash)"
@@ -411,11 +302,6 @@ function is_proxyserver_running() {
   if ps aux | grep -v grep | grep -q "$proxyserver_config_path"; then return 0; else return 1; fi;
 }
 
-function is_any_proxyserver_running() {
-  # Check if ANY 3proxy instance is running
-  if ps aux | grep -v grep | grep -q "3proxy"; then return 0; else return 1; fi;
-}
-
 function check_bootstrap_ready() {
   local print_report="${1:-false}"
   local ready=true
@@ -444,10 +330,6 @@ function check_bootstrap_ready() {
     ready=false
     if [ "$print_report" = true ]; then echo " - nft command is not available"; fi;
   else
-    if ! nft list table inet proxy_normalization > /dev/null 2>&1; then
-      ready=false
-      if [ "$print_report" = true ]; then echo " - nft table inet proxy_normalization is missing"; fi;
-    fi;
     if ! nft list table inet proxy_accounting > /dev/null 2>&1; then
       ready=false
       if [ "$print_report" = true ]; then echo " - nft table inet proxy_accounting is missing"; fi;
@@ -463,7 +345,6 @@ function write_bootstrap_marker() {
   cat > "$bootstrap_marker_file" <<-EOF
 {
   "bootstrapped_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "network_profile": "$network_profile",
   "interface_name": "$interface_name",
   "script": "proxyyy_automated.sh"
 }
@@ -538,54 +419,6 @@ function install_package() {
   fi;
 }
 
-function detect_country_code_by_ip() {
-  local ip="$1"
-  local detected=""
-
-  if ! command -v curl &> /dev/null; then install_package "curl"; fi;
-
-  detected=$(curl -4 -sS --max-time 8 "https://ipapi.co/${ip}/country/" 2>/dev/null | tr -d '\r\n[:space:]')
-  if [[ "$detected" =~ ^[A-Za-z]{2}$ ]]; then
-    echo "${detected^^}"
-    return 0
-  fi;
-
-  detected=$(curl -4 -sS --max-time 8 "https://ipwho.is/${ip}" 2>/dev/null | grep -m1 -oP '"country_code":"\K[A-Z]{2}' || true)
-  if [[ "$detected" =~ ^[A-Z]{2}$ ]]; then
-    echo "$detected"
-    return 0
-  fi;
-
-  detected=$(curl -4 -sS --max-time 8 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\r\n[:space:]')
-  if [[ "$detected" =~ ^[A-Za-z]{2}$ ]]; then
-    echo "${detected^^}"
-    return 0
-  fi;
-
-  return 1
-}
-
-function source_dns_selector_or_die() {
-  # Locate dns/select_dns.sh (shared with scripts/migrate_dns_inplace.sh).
-  local gen_dir=""
-  gen_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" 2>/dev/null && pwd -P 2>/dev/null) || gen_dir=""
-  local candidates=(
-    "${NETRUN_HOME:-/opt/netrun}/dns/select_dns.sh"
-    "/opt/netrun/dns/select_dns.sh"
-    "${gen_dir}/../../dns/select_dns.sh"
-    "${gen_dir}/../../../dns/select_dns.sh"
-  )
-  local p=""
-  for p in "${candidates[@]}"; do
-    if [ -n "$p" ] && [ -f "$p" ]; then
-      # shellcheck disable=SC1090
-      source "$p"
-      return 0
-    fi;
-  done
-  return 1
-}
-
 function configure_dns_servers() {
   # --- Manual override (accepts IPv4 OR IPv6 for each of the two slots) ---
   if [ -n "$dns_servers_override" ]; then
@@ -595,7 +428,6 @@ function configure_dns_servers() {
     if { is_valid_ip "$dns_override_1" || looks_like_ipv6 "$dns_override_1"; } \
        && { is_valid_ip "$dns_override_2" || looks_like_ipv6 "$dns_override_2"; }; then
       dns_nserver_lines="  nserver ${dns_override_1}"$'\n'"  nserver ${dns_override_2}"
-      dns_selected_country="manual"
       dns_selected_servers_csv="${dns_override_1},${dns_override_2}"
       dns_selection_strategy="manual_override"
       echo "   DNS selected (manual_override): ${dns_selected_servers_csv}"
@@ -606,12 +438,15 @@ function configure_dns_servers() {
   fi;
 
   # --- Default: local recursive resolver (unbound on 127.0.0.1) ---
-  # This 3proxy build honors the cfg `nserver`, and every node runs a local
-  # unbound (install_node_v2 → configure_unbound). Pointing nserver at it makes
-  # DNS egress from the node itself (resolver IP == exit IP) — no Cloudflare /
-  # third-party leak, geo/ASN-consistent. Override with --dns-servers if needed.
+  # The bundled 3proxy 0.9.3 HONOURS the cfg `nserver` (h_nserver sets
+  # resolvfunc = myresolver -> udpresolve), and every node runs a local unbound
+  # (install_node_v2 -> configure_unbound). Pointing nserver at it keeps customer
+  # lookups on the node — no Cloudflare / third-party resolver sees them. The
+  # recursion leaves from the node's PRIMARY address (proxy anchors are
+  # deprecated, never picked as a source), so a DNS-leak test shows the node,
+  # not the proxy's exit IP: same network/ASN, not the same address.
+  # Override with --dns-servers if needed.
   dns_nserver_lines="  nserver 127.0.0.1"$'\n'"  nserver ::1"
-  dns_selected_country="local"
   dns_selected_servers_csv="127.0.0.1,::1"
   dns_selection_strategy="local_unbound"
   echo "   DNS selected (local_unbound): 127.0.0.1, ::1"
@@ -748,52 +583,6 @@ function check_ipv6() {
   fi;
 }
 
-function install_requred_packages() {
-  apt update &>> $script_log_file;
-
-  requred_packages=("make" "g++" "wget" "curl" "cron");
-  for package in ${requred_packages[@]}; do install_package $package; done;
-
-  echo -e "\nРІСљвЂ¦ All required packages installed successfully";
-}
-
-function install_3proxy() {
-  mkdir $proxy_dir && cd $proxy_dir
-
-  echo -e "\nСЂСџвЂњТђ Downloading proxy server source...";
-  (
-  wget https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz &> /dev/null
-  tar -xf 0.9.4.tar.gz
-  rm 0.9.4.tar.gz
-  mv 3proxy-0.9.4 3proxy) &>> $script_log_file
-  echo "РІСљвЂ¦ Proxy server source code downloaded successfully";
-
-  echo -e "\nСЂСџвЂќРЃ Start building proxy server execution file from source...";
-  cd 3proxy
-  make -f Makefile.Linux &>> $script_log_file;
-  if test -f "$proxy_dir/3proxy/bin/3proxy"; then
-    echo "РІСљвЂ¦ Proxy server built successfully"
-  else
-    log_err_and_exit "Error: proxy server build from source code failed."
-  fi;
-  cd ..
-}
-
-function configure_ipv6() {
-  required_options=("conf.$interface_name.proxy_ndp" "conf.all.proxy_ndp" "conf.default.forwarding" "conf.all.forwarding" "ip_nonlocal_bind");
-  for option in ${required_options[@]}; do
-    set_sysctl_option "net.ipv6.$option" "1";
-  done;
-  sysctl -p &>> $script_log_file;
-
-  if [[ $(cat /proc/sys/net/ipv6/conf/$interface_name/proxy_ndp) == 1 ]] && [[ $(cat /proc/sys/net/ipv6/ip_nonlocal_bind) == 1 ]]; then
-    echo "РІСљвЂ¦ IPv6 network sysctl data configured successfully";
-  else
-    cat /etc/sysctl.conf &>> $script_log_file;
-    log_err_and_exit "Error: cannot configure IPv6 config";
-  fi;
-}
-
 function add_to_cron() {
   # Get existing crontab, add THIS instance's startup script
   # Do NOT remove other instances' scripts!
@@ -849,6 +638,38 @@ function generate_random_users_if_needed() {
   done;
 }
 
+# Speed audit — COUNT random addresses for a /BITS under MASK, one per line,
+# unique among themselves and against the lines of SEEN_FILE: ONE od + ONE awk
+# for the whole batch. The old loop forked ~17 subshells per address AND, via
+# $(get_subnet_mask) in a subshell (its cache never reached the parent), dumped
+# every address on the NIC (`ip -6 addr`, ~17k lines on a full node) per
+# address. Same layout as before: the mask, then one random hex digit per 4
+# bits with a ':' at every 16-bit boundary (each digit = one urandom byte mod 16,
+# uniform). Exit 1 if the random bytes ran out first (practically never: 2x).
+function random_ipv6_suffixes() {
+  local mask="$1" bits="$2" count="$3" seen="${4:-/dev/null}" digits
+  digits=$(( (128 - bits) / 4 ))
+  od -An -v -tu1 -N "$(( count * digits * 2 + 64 ))" /dev/urandom | awk \
+    -v mask="$mask" -v bits="$bits" -v count="$count" -v seenf="$seen" '
+    BEGIN {
+      while ((getline l < seenf) > 0) seen[l] = 1
+      hex = "0123456789abcdef"; n = 0; addr = ""
+    }
+    {
+      for (i = 1; i <= NF && n < count; i++) {
+        if (addr == "") { addr = mask; sym = bits }
+        if (sym % 16 == 0) addr = addr ":"
+        addr = addr substr(hex, ($i % 16) + 1, 1)
+        sym += 4
+        if (sym >= 128) {
+          if (!(addr in seen)) { seen[addr] = 1; print addr; n++ }
+          addr = ""
+        }
+      }
+    }
+    END { if (n < count) exit 1 }'
+}
+
 function generate_ipv6_addresses_if_needed() {
   # Generate IPv6 addresses early if they don't exist yet
   # This is needed for nftables counter setup
@@ -856,44 +677,27 @@ function generate_ipv6_addresses_if_needed() {
     echo "   Using existing IPv6 addresses from $random_ipv6_list_file"
     return
   fi
-  
+
   echo "   Generating $proxy_count unique IPv6 addresses..."
-  
-  array=( 1 2 3 4 5 6 7 8 9 0 a b c d e f )
-  
-  function rh () { echo ${array[$RANDOM%16]}; }
-  
-  rnd_subnet_ip () {
-    echo -n $(get_subnet_mask);
-    symbol=$subnet
-    while (( $symbol < 128)); do
-      if (($symbol % 16 == 0)); then echo -n :; fi;
-      echo -n $(rh);
-      let "symbol += 4";
-    done;
-    echo ;
-  }
-  
-  # Wave PERGB-IPV6-FAST: the legacy uniqueness check ran `ip -6 addr show | grep`
-  # (O(addresses-on-interface)) for EVERY candidate. With thousands of addresses
-  # already bound (a node full of pay-per-GB ports), that is O(N^2) and the
-  # generation job timed out partway -> an incomplete IPv6 list ("No IPv6 address
-  # for port X"), a broken proxies.list, and a wedged genlock. Snapshot the
-  # existing addresses into an associative array ONCE, then check membership O(1).
-  declare -A _ip6seen
-  while read -r _a; do [ -n "$_a" ] && _ip6seen[$_a]=1; done < <(ip -6 addr show 2>/dev/null | grep -oE 'inet6 [0-9a-f:]+' | sed -E 's/inet6 //')
-  count=1
-  while [ "$count" -le $proxy_count ]; do
-    # Generate unique IPv6 - check it's not already in use (O(1) set lookup)
-    new_ipv6=$(rnd_subnet_ip)
-    while [ -n "${_ip6seen[$new_ipv6]:-}" ]; do
-      new_ipv6=$(rnd_subnet_ip)
-    done
-    _ip6seen[$new_ipv6]=1
-    echo "$new_ipv6" >> $random_ipv6_list_file;
-    ((count+=1))
-  done
-  
+  # In THIS shell (not $(...)), so subnet_mask is derived once per batch (it
+  # was re-derived, with an `ip -6 addr` dump, for every address).
+  get_subnet_mask > /dev/null
+  if [ -z "$subnet_mask" ]; then
+    log_err_and_exit "Error: cannot derive the IPv6 /$subnet prefix (no global IPv6 address on the server)";
+  fi
+
+  # Wave PERGB-IPV6-FAST: never hand out an address the NIC already carries —
+  # one snapshot of the existing addresses, checked inside the awk pass.
+  local seen_file
+  seen_file="$(mktemp 2>/dev/null)" || log_err_and_exit "Error: mktemp failed"
+  ip -6 addr show 2>/dev/null | grep -oE 'inet6 [0-9a-f:]+' | sed -E 's/inet6 //' > "$seen_file"
+  if ! random_ipv6_suffixes "$subnet_mask" "$subnet" "$proxy_count" "$seen_file" > "${random_ipv6_list_file}.tmp"; then
+    rm -f "$seen_file" "${random_ipv6_list_file}.tmp"
+    log_err_and_exit "Error: could not generate $proxy_count unique IPv6 addresses"
+  fi
+  rm -f "$seen_file"
+  mv -f "${random_ipv6_list_file}.tmp" "$random_ipv6_list_file"
+
   echo "   РІСљвЂ¦ Generated $proxy_count IPv6 addresses"
 }
 
@@ -912,6 +716,9 @@ function create_startup_script() {
   http_listen_ip="$(http_listen_ip_for_node)"
   local main_listen_ip="$backconnect_ipv4"
   if [ "$proxies_type" = "http" ]; then main_listen_ip="$http_listen_ip"; fi
+  # Audit FP-01 — anchors are added deprecated (see the ip -batch below).
+  local anchor_lft=" preferred_lft 0"
+  if [ "$(netrun_setting NETRUN_ANCHOR_DEPRECATE 1)" = 0 ]; then anchor_lft=""; fi
 
   # Wave CAPACITY-18K — the batch header no longer carries
   # `nscache 65536` / `nscache6 65536`. In the bundled 3proxy 0.9.3 they make
@@ -939,37 +746,13 @@ function create_startup_script() {
 
 	# NOTE: We do NOT kill old 3proxy processes - each instance runs independently!
 
-	# Generate IPv6 addresses for THIS instance only
-	# NOTE: We do NOT delete old IPv6 list - keep it for persistence
-	
-	array=( 1 2 3 4 5 6 7 8 9 0 a b c d e f )
-
-	function rh () { echo \${array[\$RANDOM%16]}; }
-
-	rnd_subnet_ip () {
-	  echo -n $(get_subnet_mask);
-	  symbol=$subnet
-	  while (( \$symbol < 128)); do
-	    if ((\$symbol % 16 == 0)); then echo -n :; fi;
-	    echo -n \$(rh);
-	    let "symbol += 4";
-	  done;
-	  echo ;
-	}
-
-	# Only generate new IPv6 if list doesn't exist yet
-	if [ ! -f "$random_ipv6_list_file" ]; then
-	  count=1
-	  while [ "\$count" -le $proxy_count ]
-	  do
-	    # Generate unique IPv6 - check it's not already in use
-	    new_ipv6=\$(rnd_subnet_ip)
-	    while ip -6 addr show 2>/dev/null | grep -q "\$new_ipv6"; do
-	      new_ipv6=\$(rnd_subnet_ip)
-	    done
-	    echo "\$new_ipv6" >> $random_ipv6_list_file;
-	    ((count+=1))
-	  done;
+	# The generator writes $random_ipv6_list_file BEFORE this script. Without it
+	# this batch would get brand-new random exit addresses (every customer's IP
+	# silently changed) — refuse instead (audit speed/CLN: the old in-script
+	# generator was O(addresses on the NIC) per address).
+	if [ ! -s "$random_ipv6_list_file" ]; then
+	  echo "proxy-startup_${instance_id}: missing $random_ipv6_list_file — not starting (regenerate the batch)" >&2
+	  exit 1
 	fi
 
 	immutable_config_part="daemon
@@ -1049,16 +832,26 @@ $dns_nserver_lines
 	# instead of a fork per address, and nodad so an address is never left
 	# tentative (unusable as the -e egress source) even where accept_dad is still
 	# on for the interface. -force keeps going past "File exists" on re-runs.
+	# Audit FP-01: /128 and preferred_lft 0 — a deprecated anchor is never the
+	# kernel's choice of source for the node's OWN traffic (RFC 6724 rule 3),
+	# while 3proxy's explicit -e bind still uses it (NETRUN_ANCHOR_DEPRECATE=0: off).
 	ipv6_batch_file=\$(mktemp 2>/dev/null || echo "${random_ipv6_list_file}.ipbatch")
-	awk 'NF { print "address add " \$1 " dev $interface_name nodad" }' ${random_ipv6_list_file} > "\$ipv6_batch_file"
+	awk 'NF { print "address add " \$1 "/128 dev $interface_name nodad$anchor_lft" }' ${random_ipv6_list_file} > "\$ipv6_batch_file"
 	ip -6 -force -batch "\$ipv6_batch_file" >/dev/null 2>&1 || true
 	rm -f "\$ipv6_batch_file"
 
 	# NOTE: We do NOT kill old proxy processes - each instance is independent!
-	
-	# Start THIS 3proxy instance as a detached daemon
-	nohup ${user_home_dir}/proxyserver/3proxy/bin/3proxy ${proxyserver_config_path} >/dev/null 2>&1 &
-	sleep 2  # Wait for daemon to initialize
+
+	# Start THIS 3proxy instance. Audit RES-11: through the node's one spawn
+	# helper (its own systemd scope — never inside the agent's or a cron/ssh
+	# cgroup; idempotent, never a duplicate); a plain nohup where it is absent.
+	spawn_helper="\${NETRUN_3PROXY_SPAWN:-/opt/netrun/scripts/netrun-3proxy-spawn.sh}"
+	if [ -f "\$spawn_helper" ]; then
+	  NETRUN_3PROXY_BIN=${user_home_dir}/proxyserver/3proxy/bin/3proxy bash "\$spawn_helper" ${proxyserver_config_path} >/dev/null 2>&1 || true
+	else
+	  nohup ${user_home_dir}/proxyserver/3proxy/bin/3proxy ${proxyserver_config_path} >/dev/null 2>&1 &
+	  sleep 2  # Wait for daemon to initialize
+	fi
 
 	# HTTPS frontend: put this instance's HTTP ports behind haproxy right away
 	# (the netrun-https-sync timer would otherwise pick them up within 5 min).
@@ -1153,58 +946,6 @@ function ensure_nftables_ready() {
     systemctl enable nftables > /dev/null 2>&1 || true
     systemctl start nftables > /dev/null 2>&1 || true
   fi
-}
-
-function setup_nftables_edge_normalization() {
-  echo "   Applying edge normalization profile: $network_profile"
-  echo "   Target TTL/HopLimit: $profile_ttl"
-  echo "   MSS mode: $profile_mss_mode (target MSS: $profile_mss_value)"
-  echo "   MTU hint: $profile_mtu_hint"
-
-  ensure_nftables_ready
-
-  if [ "$bootstrap_side_effects_allowed" = true ]; then
-    nft add table inet proxy_normalization 2>/dev/null || true
-    nft add chain inet proxy_normalization output '{ type filter hook output priority -150; policy accept; }' 2>/dev/null || true
-    nft add chain inet proxy_normalization postrouting '{ type filter hook postrouting priority -150; policy accept; }' 2>/dev/null || true
-  elif ! nft list table inet proxy_normalization > /dev/null 2>&1; then
-    log_err_and_exit "nft table inet proxy_normalization is missing. Run bootstrap-only mode first."
-  fi;
-
-  nft flush chain inet proxy_normalization output 2>/dev/null || true
-  nft flush chain inet proxy_normalization postrouting 2>/dev/null || true
-
-  # Drop clearly invalid combinations before packets leave the node.
-  nft add rule inet proxy_normalization output ct state invalid drop 2>/dev/null || true
-  nft add rule inet proxy_normalization output 'tcp flags & (fin|syn) == (fin|syn) drop' 2>/dev/null || true
-  nft add rule inet proxy_normalization output 'tcp flags & (syn|rst) == (syn|rst) drop' 2>/dev/null || true
-
-  # Suppress fragmented egress traffic for a cleaner NAT signature.
-  nft add rule inet proxy_normalization output 'ip frag-off & 0x1fff != 0 drop' 2>/dev/null || true
-  nft add rule inet proxy_normalization output 'ip6 nexthdr frag drop' 2>/dev/null || true
-
-  # Normalize outgoing TTL / hop-limit.
-  nft add rule inet proxy_normalization postrouting meta l4proto tcp ip ttl set "$profile_ttl" 2>/dev/null || true
-  nft add rule inet proxy_normalization postrouting meta l4proto tcp ip6 hoplimit set "$profile_ttl" 2>/dev/null || true
-
-  # Normalize MSS for SYN packets (fixed or PMTU-clamped depending on profile).
-  if [ "$profile_mss_mode" = "clamp_pmtu" ]; then
-    nft add rule inet proxy_normalization output tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null || true
-  else
-    nft add rule inet proxy_normalization output tcp flags syn tcp option maxseg size set "$profile_mss_value" 2>/dev/null || true
-  fi
-
-  nft list ruleset > /etc/nftables.conf 2>/dev/null || true
-}
-
-# Wave FLEET-HEALTH (SPD-05) — a node setting: the environment wins, then
-# ${NETRUN_ENV_FILE:-/etc/netrun/netrun.env} (KEY=VALUE lines), then the default.
-function netrun_setting() {
-  local key="$1" def="$2" v="${!1:-}" f="${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}"
-  if [ -z "$v" ] && [ -r "$f" ]; then
-    v="$(awk -v k="$key" '{ sub(/^[ \t]+/, "") } index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { gsub(/^["\047 \t]+|["\047 \t\r]+$/, "", v); print v }' "$f")"
-  fi
-  printf '%s' "${v:-$def}"
 }
 
 # Wave FLEET-HEALTH (SPD-05) — the counter maps are keyed by PORT only, so an
@@ -1434,93 +1175,6 @@ function setup_nftables_counters() {
   fi
 }
 
-function setup_iptables_counters() {
-  # Legacy iptables function - kept for backward compatibility
-  # Create PROXY_ACCOUNTING chain if not exists
-  iptables -w 2 -N PROXY_ACCOUNTING 2>/dev/null || true
-  ip6tables -w 2 -N PROXY_ACCOUNTING 2>/dev/null || true
-
-  # Р СњР Вµ РЎвЂћР В»РЎРЊРЎв‚¬Р С‘РЎР‚РЎС“Р ВµР С Р Р†РЎРѓРЎР‹ РЎвЂ Р ВµР С—Р С•РЎвЂЎР С”РЎС“, РЎвЂЎРЎвЂљР С•Р В±РЎвЂ№ Р Р…Р Вµ Р В»Р С•Р СР В°РЎвЂљРЎРЉ РЎРѓРЎвЂЎРЎвЂРЎвЂљРЎвЂЎР С‘Р С”Р С‘ Р Т‘РЎР‚РЎС“Р С–Р С‘РЎвЂ¦ Р С–Р ВµР Р…Р ВµРЎР‚Р В°РЎвЂ Р С‘Р в„–.
-  # Р вЂќР В»РЎРЏ РЎвЂљР ВµР С”РЎС“РЎвЂ°Р ВµР С–Р С• Р Р…Р В°Р В±Р С•РЎР‚Р В° Р С—Р С•РЎР‚РЎвЂљР С•Р Р† РЎРѓР Р…Р В°РЎвЂЎР В°Р В»Р В° Р Р†РЎвЂ№РЎвЂЎР С‘РЎвЂ°Р В°Р ВµР С Р В»РЎР‹Р В±РЎвЂ№Р Вµ Р С—РЎР‚Р В°Р Р†Р С‘Р В»Р В° Р Р…Р В° РЎРЊРЎвЂљР С‘ Р С—Р С•РЎР‚РЎвЂљРЎвЂ№
-  # (Р Р†Р С”Р В»РЎР‹РЎвЂЎР В°РЎРЏ РЎРѓРЎвЂљР В°РЎР‚РЎвЂ№Р Вµ ACCEPT/RETURN Р В±Р ВµР В· Р С”Р С•Р СР СР ВµР Р…РЎвЂљР В°РЎР‚Р С‘Р ВµР Р†), Р С—Р С•РЎвЂљР С•Р С РЎРѓРЎвЂљР В°Р Р†Р С‘Р С Р С—РЎР‚Р В°Р Р†Р С‘Р В»РЎРЉР Р…РЎвЂ№Р Вµ.
-
-  echo "   Setting up traffic counters for all proxy ports (iptables - LEGACY)"
-  echo "   Strategy: INSERT rules at position 1 (before ufw/firewall rules)"
-  echo "   IPv4 INPUT (--dport): client -> proxy (bytesIn)"
-  echo "   IPv6 INPUT (--dport): client -> proxy (if IPv6 clients)"
-  echo "   IPv6 OUTPUT (--sport): proxy -> internet (bytesOut)"
-  
-  local added_count=0
-  local skipped_count=0
-  
-  for ((i=0; i<proxy_count; i++)); do
-    local port=$((start_port + i))
-    
-    # Р СџР С•Р В»Р Р…Р С•Р Вµ РЎС“Р Т‘Р В°Р В»Р ВµР Р…Р С‘Р Вµ Р В»РЎР‹Р В±РЎвЂ№РЎвЂ¦ РЎРѓРЎвЂљР В°РЎР‚РЎвЂ№РЎвЂ¦ Р С—РЎР‚Р В°Р Р†Р С‘Р В» Р С—Р С•Р Т‘ РЎРЊРЎвЂљР С•РЎвЂљ Р С—Р С•РЎР‚РЎвЂљ (v4/v6, dport/sport, Р В»РЎР‹Р В±РЎвЂ№Р Вµ РЎвЂљР В°РЎР‚Р С–Р ВµРЎвЂљРЎвЂ№)
-    while iptables  -w 2 -D PROXY_ACCOUNTING -p tcp --dport "$port"  -j RETURN 2>/dev/null; do :; done
-    while iptables  -w 2 -D PROXY_ACCOUNTING -p tcp --sport "$port"  -j RETURN 2>/dev/null; do :; done
-    while iptables  -w 2 -D PROXY_ACCOUNTING -p tcp --dport "$port"  2>/dev/null; do :; done
-    while iptables  -w 2 -D PROXY_ACCOUNTING -p tcp --sport "$port"  2>/dev/null; do :; done
-
-    while ip6tables -w 2 -D PROXY_ACCOUNTING -p tcp --dport "$port" -j RETURN 2>/dev/null; do :; done
-    while ip6tables -w 2 -D PROXY_ACCOUNTING -p tcp --sport "$port" -j RETURN 2>/dev/null; do :; done
-    while ip6tables -w 2 -D PROXY_ACCOUNTING -p tcp --dport "$port" 2>/dev/null; do :; done
-    while ip6tables -w 2 -D PROXY_ACCOUNTING -p tcp --sport "$port" 2>/dev/null; do :; done
-
-    # Р вЂќР С•Р В±Р В°Р Р†Р В»РЎРЏР ВµР С Р С”Р С•РЎР‚РЎР‚Р ВµР С”РЎвЂљР Р…РЎвЂ№Р Вµ RETURN РЎРѓ Р С”Р С•Р СР СР ВµР Р…РЎвЂљР В°РЎР‚Р С‘РЎРЏР СР С‘ (РЎвЂљР С•, РЎвЂЎРЎвЂљР С• РЎвЂЎР С‘РЎвЂљР В°Р ВµРЎвЂљ Р С—Р В°Р Р…Р ВµР В»РЎРЉ)
-    iptables  -w 2 -A PROXY_ACCOUNTING -p tcp --dport "$port" -m comment --comment "proxy_$port"       -j RETURN 2>/dev/null || true
-    iptables  -w 2 -A PROXY_ACCOUNTING -p tcp --sport "$port" -m comment --comment "proxy_${port}_out" -j RETURN 2>/dev/null || true
-    ip6tables -w 2 -A PROXY_ACCOUNTING -p tcp --sport "$port" -m comment --comment "proxy_${port}_out" -j RETURN 2>/dev/null || true
-    
-    # CRITICAL: APPEND jump rules (avoid conflicts with multiple proxy instances)
-    # Use APPEND instead of INSERT to avoid position conflicts
-    
-    # IPv4 INPUT: Delete old rule (if exists), then APPEND (bytesIn)
-    iptables -w 2 -D INPUT -p tcp --dport "$port" -j PROXY_ACCOUNTING 2>/dev/null || true
-    iptables -w 2 -A INPUT -p tcp --dport "$port" -j PROXY_ACCOUNTING 2>/dev/null || true
-
-    # IPv4 OUTPUT (fallback): Delete old rule (if exists), then APPEND
-    iptables -w 2 -D OUTPUT -p tcp --sport "$port" -j PROXY_ACCOUNTING 2>/dev/null || true
-    iptables -w 2 -A OUTPUT -p tcp --sport "$port" -j PROXY_ACCOUNTING 2>/dev/null || true
-    
-    # IPv6 INPUT: Delete old rule (if exists), then APPEND
-    ip6tables -w 2 -D INPUT -p tcp --dport "$port" -j PROXY_ACCOUNTING 2>/dev/null || true
-    ip6tables -w 2 -A INPUT -p tcp --dport "$port" -j PROXY_ACCOUNTING 2>/dev/null || true
-    
-    # IPv6 OUTPUT (primary): Delete old rule (if exists), then APPEND
-    ip6tables -w 2 -D OUTPUT -p tcp --sport "$port" -j PROXY_ACCOUNTING 2>/dev/null || true
-    ip6tables -w 2 -A OUTPUT -p tcp --sport "$port" -j PROXY_ACCOUNTING 2>/dev/null || true
-    
-    # Show progress every 100
-    if [ $((i % 100)) -eq 0 ] && [ "$i" -gt 0 ]; then
-      echo "   [PROGRESS] Setup $i/$proxy_count counters..."
-    fi
-  done
-  
-  echo "РІСљвЂ¦ Setup $added_count new iptables counters (skipped $skipped_count existing)"
-  echo "   Rules inserted at position 1 (before firewall rules)"
-  
-  # === SAVE IPTABLES RULES (persistent across reboots) ===
-  echo "СЂСџвЂ™С• Saving iptables rules for persistence..."
-  
-  # Create directories if they don't exist
-  mkdir -p /etc/iptables 2>/dev/null || true
-  
-  if command -v iptables-save &> /dev/null; then
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules 2>/dev/null || true
-    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || ip6tables-save > /etc/ip6tables.rules 2>/dev/null || true
-    echo "   РІСљвЂ¦ iptables rules saved"
-    
-    # Install iptables-persistent if not already installed (for auto-restore on reboot)
-    if ! dpkg -l 2>/dev/null | grep -q iptables-persistent; then
-      echo "   СЂСџвЂњВ¦ Installing iptables-persistent for auto-restore on reboot..."
-      DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent > /dev/null 2>&1 || true
-    fi
-  else
-    echo "   РІС™В РїС‘РЏ  iptables-save not found, rules may not persist after reboot"
-  fi
-}
-
 function run_proxy_server() {
   if [ ! -f $startup_script_path ]; then log_err_and_exit "Error: proxy startup script doesn't exist."; fi;
 
@@ -1643,100 +1297,6 @@ function write_port_ipv6_map_file() {
   done < $random_ipv6_list_file
 }
 
-function run_dualstack_self_check() {
-  if [ $run_self_check != true ]; then
-    echo "Skipping policy self-check (--skip-self-check)";
-    return;
-  fi;
-
-  if [ $self_check_samples -eq 0 ]; then
-    echo "Skipping policy self-check (samples=0)";
-    return;
-  fi;
-
-  if ! test -f $random_ipv6_list_file; then
-    log_err_and_exit "Error: cannot run self-check, IPv6 list file not found";
-  fi;
-
-  if ! command -v curl &> /dev/null; then install_package "curl"; fi;
-
-  local samples_to_test=$self_check_samples;
-  if [ $samples_to_test -gt $proxy_count ]; then samples_to_test=$proxy_count; fi;
-
-  local use_auth_for_checks=false;
-  is_auth_used;
-  if [ $? -eq 0 ]; then use_auth_for_checks=true; fi;
-
-  local proxy_scheme="socks5h";
-  if [ "$proxies_type" = "http" ]; then proxy_scheme="http"; fi;
-
-  local require_ipv4_fallback=true
-  if [ "$ipv6_policy" = "ipv6_only" ]; then
-    require_ipv4_fallback=false
-  fi;
-
-  readarray -t expected_ipv6_addresses < $random_ipv6_list_file;
-  if [ $use_random_auth = true ] && [ $use_auth_for_checks = true ]; then
-    readarray -t proxy_random_credentials < $random_users_list_file;
-  fi;
-
-  echo "Running $ipv6_policy self-check for $samples_to_test proxy(s)..."
-
-  local passed_count=0;
-  for ((idx=0; idx<samples_to_test; idx++)); do
-    local test_port=$((start_port + idx));
-    local expected_ipv6="${expected_ipv6_addresses[$idx]}";
-    local test_user="$user";
-    local test_password="$password";
-
-    if [ $use_random_auth = true ] && [ $use_auth_for_checks = true ]; then
-      IFS=':' read -r test_user test_password <<< "${proxy_random_credentials[$idx]}";
-      IFS=$' \t\n';
-    fi;
-
-    local proxy_url="${proxy_scheme}://${backconnect_ipv4}:${test_port}";
-    local ipv6_result="";
-    local ipv4_result="";
-
-    if [ $use_auth_for_checks = true ]; then
-      ipv6_result=$(curl --max-time 20 -sS --proxy "$proxy_url" --proxy-user "${test_user}:${test_password}" https://api64.ipify.org 2>/dev/null || true);
-      ipv4_result=$(curl --max-time 20 -sS --proxy "$proxy_url" --proxy-user "${test_user}:${test_password}" https://api.ipify.org 2>/dev/null || true);
-    else
-      ipv6_result=$(curl --max-time 20 -sS --proxy "$proxy_url" https://api64.ipify.org 2>/dev/null || true);
-      ipv4_result=$(curl --max-time 20 -sS --proxy "$proxy_url" https://api.ipify.org 2>/dev/null || true);
-    fi;
-
-    if ! looks_like_ipv6 "$ipv6_result"; then
-      log_err "Self-check failed on port $test_port: expected IPv6 on IPv6 endpoint, got \"$ipv6_result\"";
-      log_err_and_exit "Error: policy self-check failed (IPv6 egress is not working)";
-    fi;
-
-    if [ "$require_ipv4_fallback" = true ] && ! is_valid_ip "$ipv4_result"; then
-      log_err "Self-check failed on port $test_port: expected IPv4 fallback on IPv4 endpoint, got \"$ipv4_result\"";
-      log_err_and_exit "Error: policy self-check failed (IPv4 fallback is required but unavailable)";
-    fi;
-
-    if [ "$require_ipv4_fallback" = false ] && is_valid_ip "$ipv4_result"; then
-      log_err "Self-check failed on port $test_port: IPv4 fallback must be blocked for ipv6_only, got \"$ipv4_result\"";
-      log_err_and_exit "Error: policy self-check failed (IPv4 fallback is unexpectedly allowed)";
-    fi;
-
-    if [ -n "$expected_ipv6" ] && [ "$ipv6_result" != "$expected_ipv6" ]; then
-      echo "   Warning: port $test_port returned IPv6 $ipv6_result (expected bind $expected_ipv6)";
-      echo "   Continuing because formatting/normalization can differ.";
-    fi;
-
-    if [ "$require_ipv4_fallback" = true ]; then
-      echo "   OK port $test_port: IPv6 egress OK ($ipv6_result), IPv4 fallback OK ($ipv4_result)"
-    else
-      echo "   OK port $test_port: IPv6 egress OK ($ipv6_result), IPv4 fallback blocked (expected)"
-    fi;
-    passed_count=$((passed_count + 1));
-  done
-
-  echo "$ipv6_policy self-check passed for $passed_count/$samples_to_test proxy(s)"
-}
-
 function write_proxyserver_info() {
   delete_file_if_exists $proxyserver_info_file;
 
@@ -1746,13 +1306,7 @@ Proxy Server Information:
   Proxy type: $proxies_type
   IPv6 policy: $ipv6_policy
   IP preference mode: $ip_preference_mode
-  Network profile: $network_profile
-  TCP timestamps mode: $tcp_timestamps_mode (effective: $profile_tcp_timestamps)
-  TCP ttl target: $profile_ttl
-  TCP MSS mode: $profile_mss_mode (target: $profile_mss_value)
-  TLS client handshake mode: $tls_clienthello_mode
-  DNS country mode: $dns_country
-  DNS selected country: $dns_selected_country
+  Maxconn: $proxy_maxconn (listen backlog $((proxy_maxconn / 16 + 1)))
   DNS selection strategy: $dns_selection_strategy
   DNS servers: $dns_selected_servers_csv
   Proxy IP: $(get_backconnect_ipv4)
@@ -1761,7 +1315,6 @@ Proxy Server Information:
   Rules: $(if ([ -n "$denied_hosts" ] || [ -n "$allowed_hosts" ]); then if [ -n "$denied_hosts" ]; then echo "denied hosts - $denied_hosts, all others are allowed"; else echo "allowed hosts - $allowed_hosts, all others are denied"; fi; else echo "no rules specified, all hosts are allowed"; fi;)
   File with backconnect proxy list: $backconnect_proxies_file
   File with port-to-IPv6 map: $port_ipv6_map_file
-  Self-check: $(if [ $run_self_check = true ]; then echo "enabled (samples: $self_check_samples, policy: $ipv6_policy)"; else echo "disabled"; fi;)
 
 Technical Information:
   Subnet: /$subnet
@@ -1888,7 +1441,6 @@ delete_file_if_exists $script_log_file;
 
 echo "СЂСџвЂќРЊ Checking startup parameters..."
 check_startup_parameters;
-resolve_network_profile_settings;
 
 if [ "$verify_bootstrap" = true ]; then
   verify_bootstrap_or_exit;
@@ -1907,15 +1459,10 @@ else
   systemctl disable firewalld 2>/dev/null || true
 fi;
 
-echo "СЂСџвЂєВ  Applying TCP/IP profile..."
-if [ "$runtime_only" = true ]; then
-  echo "Runtime-only mode: skipping TCP/IP profile writes."
-else
-  echo "Applying TCP/IP profile..."
-  apply_network_profile_sysctl;
-  echo "   Profile: $network_profile (TTL=$profile_ttl, MSS mode=$profile_mss_mode, timestamps=$profile_tcp_timestamps)"
-  echo "   TLS client handshake mode: $tls_clienthello_mode (CONNECT/SOCKS passthrough)"
-fi;
+# Audit CLN-03 — no TCP/IP profile here any more: the generator used to write
+# /etc/sysctl.conf (applied AFTER /etc/sysctl.d, so its tcp_timestamps=0 default
+# silently beat the production value) outside --runtime-only. The TCP stack is
+# set ONLY by install_node_v2.sh (deploy/node/99-zz-netrun-tcp.conf).
 
 echo "СЂСџвЂќРЊ Checking IPv6 configuration..."
 check_ipv6;
@@ -1923,18 +1470,17 @@ check_ipv6;
 if is_proxyserver_installed; then
   echo -e "РІС™В РїС‘РЏ Proxy server already installed, reconfiguring:\n";
 else
-  if [ "$runtime_only" = true ]; then
-    log_err_and_exit "3proxy is not installed. Run bootstrap-only mode first.";
-  fi;
-  configure_ipv6;
-  install_requred_packages;
-  install_3proxy;
+  # Audit CLN-03 — the generator no longer downloads and builds 3proxy (the
+  # GitHub path built 0.9.4; nodes run the audited bundled 0.9.3).
+  log_err_and_exit "3proxy is not installed in $proxy_dir. Install the node with install_node_v2.sh (it ships the bundled 3proxy 0.9.3).";
+fi;
+if [ ! -x "$proxy_dir/3proxy/bin/3proxy" ]; then
+  log_err_and_exit "Error: bundled 3proxy binary missing at $proxy_dir/3proxy/bin/3proxy (install_node_v2.sh installs deploy/node/bin/3proxy).";
 fi;
 
 echo "СЂСџРЉС’ Getting backconnect IPv4 address..."
 if [ "$bootstrap_only" = true ]; then
   echo "Bootstrap-only mode: applying nftables baseline..."
-  setup_nftables_edge_normalization;
   ensure_nftables_ready;
   nft add table inet proxy_accounting 2>/dev/null || true
   nft add chain inet proxy_accounting input '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
@@ -1969,11 +1515,7 @@ add_to_cron;
 echo "СЂСџвЂќТђ Opening firewall ports..."
 open_ufw_backconnect_ports;
 
-echo "СЂСџВ§В± Applying edge TCP/IP normalization..."
-if [ "$runtime_only" = true ]; then
-  echo "Runtime-only mode: skipping edge TCP/IP normalization bootstrap step."
-else
-  setup_nftables_edge_normalization;
+if [ "$runtime_only" != true ]; then
   write_bootstrap_marker;
 fi;
 
@@ -1988,9 +1530,6 @@ write_backconnect_proxies_to_file;
 
 echo "СЂСџвЂ”С”РїС‘РЏ Writing port-to-IPv6 map file..."
 write_port_ipv6_map_file;
-
-echo "СЂСџвЂќР‹ Verifying IPv6 policy..."
-run_dualstack_self_check;
 
 echo "СЂСџвЂњвЂ№ Writing server info..."
 write_proxyserver_info;
@@ -2007,16 +1546,9 @@ echo "РІвЂўС™РІвЂўС’РІвЂўС’РІвЂўС’РІвЂўС�
 echo "РІР‚Сћ Proxy Type: $proxies_type"
 echo "РІР‚Сћ IPv6 Policy: $ipv6_policy"
 echo "РІР‚Сћ IP Preference Mode: $ip_preference_mode"
-echo "РІР‚Сћ Network Profile: $network_profile"
-echo "РІР‚Сћ TCP timestamps: $tcp_timestamps_mode (effective: $profile_tcp_timestamps)"
-echo "РІР‚Сћ TCP TTL target: $profile_ttl"
-echo "РІР‚Сћ TCP MSS mode: $profile_mss_mode (target: $profile_mss_value)"
-echo "РІР‚Сћ TLS handshake mode: $tls_clienthello_mode"
-echo "РІР‚Сћ DNS Country Mode: $dns_country"
-echo "РІР‚Сћ DNS Selected Country: $dns_selected_country"
 echo "РІР‚Сћ DNS Selection Strategy: $dns_selection_strategy"
 echo "РІР‚Сћ DNS Servers: $dns_selected_servers_csv"
-echo "РІР‚Сћ Maxconn: $proxy_maxconn"
+echo "РІР‚Сћ Maxconn: $proxy_maxconn (listen backlog $((proxy_maxconn / 16 + 1)))"
 echo "РІР‚Сћ Proxy Count: $proxy_count"
 echo "РІР‚Сћ Port Range: $start_port-$last_port"
 echo "РІР‚Сћ Backconnect IP: $backconnect_ipv4"
@@ -2025,7 +1557,6 @@ echo "РІР‚Сћ PortРІвЂ вЂќIPv6 Map File: $port_ipv6_map_file"
 echo "РІР‚Сћ Instance ID: $instance_id"
 echo "РІР‚Сћ Config File: 3proxy_${instance_id}.cfg"
 echo "РІР‚Сћ Mode: MULTI-INSTANCE (old proxies preserved)"
-echo "РІР‚Сћ Policy self-check: $(if [ $run_self_check = true ]; then echo "enabled"; else echo "disabled"; fi;)"
 echo ""
 
 exit 0

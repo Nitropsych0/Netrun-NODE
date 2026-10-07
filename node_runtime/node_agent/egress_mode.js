@@ -26,6 +26,8 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const { spawn } = require("child_process");
+const proxySpawn = require("./proxy_spawn.js");
+const { withProcessLock } = require("./process_lock.js");
 
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
@@ -225,16 +227,16 @@ async function restartCfg(cfgPath) {
       }
     }
   }
-  if (!fs.existsSync(PROXY_BIN)) {
-    throw new EgressModeError("3proxy_binary_missing", PROXY_BIN);
-  }
-  let child;
+  // Audit RES-11 — the respawn goes through the node's spawn helper (own
+  // systemd scope; the direct detached start where the helper is absent).
+  let res;
   try {
-    child = spawn(PROXY_BIN, [cfgPath], { detached: true, stdio: "ignore" });
+    res = await proxySpawn.spawn3proxyCfg(cfgPath, { bin: PROXY_BIN });
   } catch (err) {
+    if (err && err.code === "BINARY_MISSING") throw new EgressModeError("3proxy_binary_missing", PROXY_BIN);
     throw new EgressModeError("3proxy_spawn_failed", String((err && err.message) || err));
   }
-  child.unref();
+  if (!res.ok) throw new EgressModeError("3proxy_spawn_failed", res.detail || res.outcome);
   return { restarted: true, killed: pids };
 }
 
@@ -272,7 +274,9 @@ async function applyEgressMode(mode) {
     }
     cfgsRewritten += 1;
     try {
-      await restartCfg(cfgPath);
+      // Audit RES-11 — kill + respawn as one step of the shared process lock
+      // (the supervisor never sees the batch "dead" in between).
+      await withProcessLock(() => restartCfg(cfgPath));
     } catch (err) {
       restartErrors.push({ cfg: path.basename(cfgPath), error: `restart_failed: ${(err && err.message) || err}` });
     }

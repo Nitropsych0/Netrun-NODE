@@ -51,6 +51,11 @@ rm -f /etc/systemd/system/nftables.service.d/netrun-egress.conf
 rmdir /etc/systemd/system/nftables.service.d 2>/dev/null || true
 rm -f /etc/sysctl.d/99-netrun-egress.conf
 
+# Audit RES-13 — the desired-state firewall of the old install (its ghost list
+# names ports a new install may reuse) and the supervisor's status file.
+log "Removing the agent's desired firewall state and supervisor status"
+rm -f /var/lib/netrun/desired.json /run/netrun/supervisor.json
+
 log "Removing /opt/netrun"
 rm -rf /opt/netrun
 

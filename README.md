@@ -11,7 +11,8 @@ bash install_node_v2.sh
 ```
 
 > `install_node_v2.sh` is the maintained installer (raised kernel pid/thread
-> limits, DAD/MLD off, bounded 3proxy restore, MSS 1460, unbound resolver,
+> limits, DAD/MLD off, bounded 3proxy restore through the spawn helper, the
+> pinned TCP signature `deploy/node/99-zz-netrun-tcp.conf`, unbound resolver,
 > trend + IPv6-egress restore units). `install_node.sh` is now a thin shim that
 > execs v2, so either filename works on a fresh node.
 
@@ -66,10 +67,145 @@ Wave FLEET-HEALTH additive fields (every older field is unchanged):
 `duplicatesReaped`, `lastReapAt` and `hygiene` (duplicate 3proxy reaper + crontab
 hygiene) are described under "Boot duplicates" below.
 
+Audit N2 additive fields (every older field is unchanged):
+
+| Field | Meaning |
+|---|---|
+| `supervisor` | the 3proxy supervisor: `{enabled, intervalSec, lastRunAt, lastOutcome, cfgsRespawned, respawnFailures, lastRespawns[], pendingDown[], unsupervised[], seenServing[], failedCfgs[], addressesReadded, addressesMissing, anchorsDeprecated, anchorsPendingDeprecate, anchorsExpected, iface, readdAnchors, deprecateAnchors}` (also `/run/netrun/supervisor.json`) |
+| `firewall` | the desired-state firewall: `{enabled, reapplySec, desired: {receivedAt, computedAt, windows, livePorts, pergbBlocked, ghostPorts} \| null, lastApply}` |
+| `cfgsLegacyDns` | `{count, items: [{startPort, nservers}]}` — cfgs whose `nserver` lines name a third-party resolver (the 2026-05 geo seed); the spawn helper rewrites them at the batch's next start |
+| `cfgsEgressFamily` | in `ipv6_only` egress mode: `{expectedFlag: "-6", mismatched, items: [{startPort, flags}]}` — cfgs that can leave over IPv4 (`-64`/`-46`/`-4`/no flag); `{expectedFlag: null, mismatched: null}` otherwise. Replaces the generator's dual-stack self-check, which the agent always skipped |
+| `nodeTuning` | `{ipLocalPortRange, ephemeralOverlapsProxyPorts, proxyListenFloor, tcpTimestamps, ipDefaultTtl, tcpRmem, pipeUserPagesSoft}` — `ephemeralOverlapsProxyPorts: true` is the 2026-10-07 5–7 % failure bug coming back |
+
 `proxyReady` / `proxyReadiness` probe each instance on the same first socks port.
 The agent binds `NODE_AGENT_HOST` (default `0.0.0.0`; the unit template has always
 set it, nothing read it, so it used to answer on `[::]` = every customer exit IPv6).
 `NODE_AGENT_HOST=::` restores the old bind.
+
+## 3proxy supervision, desired-state firewall, node source address (audit N2)
+
+### One spawn helper (RES-11)
+
+`scripts/netrun-3proxy-spawn.sh <cfg>` is the only way a batch is started: the boot
+restore (`scripts/restore_3proxy.sh`, unit `deploy/node/netrun-3proxy-restore.service`
+— the installer and the follow-up no longer write their own heredoc copies), the
+agent (supervisor, `/deprovision` rewrite, `/egress_mode`, pay-per-GB enable),
+`netrun-https` (HTTP listeners moved behind haproxy), `netrun-harden auth-fix` and the
+generator's start-up script. It is idempotent (a 3proxy already running the cfg in any
+directory, or a listening first socks port: exit 0, nothing started), takes a per-cfg
+`flock` (`/run/netrun/3proxy-spawn-<sp>.lock`), refuses `*.cfg.disabled`, and starts
+3proxy in its own scope: `systemd-run --scope --unit netrun-3proxy-<sp> -p KillMode=process
+-p TasksMax=infinity --collect` (setsid only when no 3proxy appeared) — restarting the
+restore unit, the agent or the https-sync oneshot never takes a batch down any more.
+Right before a start it rewrites legacy third-party `nserver` lines (the 2026-05 geo
+seed) to `127.0.0.1` / `::1` while unbound is active (`NETRUN_SPAWN_FIX_DNS=0`: off).
+`scripts/test_3proxy_spawn.sh`.
+
+### Supervisor (RES-11)
+
+Every `NODE_AGENT_SUPERVISOR_INTERVAL_SEC` (60; first run after
+`NODE_AGENT_SUPERVISOR_FIRST_DELAY_SEC`, 120) the agent:
+
+- respawns a batch cfg (never `*.cfg.disabled`) that runs ZERO times and whose first socks
+  port does not listen — only one that DIED (seen serving since boot; the set survives an
+  agent restart in `/run/netrun/supervisor.json`) or whose cfg predates the boot; a cfg
+  written after the boot that never served (a failed generation's leftover) is listed as
+  `unsupervised` and left to the next reboot / a regeneration — on two consecutive ticks, not within
+  `NODE_AGENT_SUPERVISOR_SETTLE_SEC` (120) of a cfg write, never while a `/generate`
+  holds the generation lock (checked per tick and again right before the spawn) or the
+  boot restore unit is running; at most `NODE_AGENT_SUPERVISOR_MAX_RESPAWNS_PER_HOUR`
+  (5) per cfg, then the cfg is `failed` (logged once, `/health supervisor.failedCfgs`)
+  until it listens again or its file changes. The duplicate reaper and the supervisor
+  share one process lock (`process_lock.js`) and never fight: the supervisor starts only
+  a cfg that runs zero times, the reaper acts only on a cfg that runs twice and never
+  kills its last copy; `/deprovision` and `/egress_mode` kill+respawn under the same lock;
+- re-adds anchors (cfg `-e` addresses) missing from `/proc/net/if_inet6` whose /64 the node
+  still has, in ONE `ip -6 -force -batch` (`/128 nodad preferred_lft 0`), at most
+  `NODE_AGENT_ANCHOR_READD_BATCH` (2000) per tick — an add holds RTNL for O(addresses on the NIC), ~30 ms at 16k (`NETRUN_ANCHOR_READD=0`: off);
+- deprecates anchors (below), `NODE_AGENT_ANCHOR_DEPRECATE_BATCH` (2000) per tick.
+
+`NODE_AGENT_SUPERVISOR=0` turns it off. `netrun-ipv6-restore.sh` now exits 1 (loudly)
+when it finds no IPv6 interface instead of exiting 0.
+
+### Node-originated traffic leaves from the primary IPv6 (FP-01)
+
+Every anchor is added with `preferred_lft 0` (generator, boot restore, supervisor; the
+supervisor converts existing ones in batches with `ip address change … nodad valid_lft
+forever preferred_lft 0`). A deprecated address is never the kernel's choice of SOURCE
+(RFC 6724 rule 3, `ipv6_dev_get_saddr`), but stays valid: NDP answers for it, replies to
+it are delivered, and 3proxy's explicit `-e<anchor>` bind works as before. So unbound's
+recursion, apt, `ping6` in the generator and the agent's egress / DNS checks leave from
+the node's own SLAAC address — not from a customer's exit IP — with no per-program
+setting. Chosen over the alternatives: an `ip -6 route … src` on the default route is
+owned by systemd-networkd / the RA (rewritten on every RA refresh or `netplan apply`)
+and does not cover on-link /64 destinations; `unbound outgoing-interface` + an agent
+`localAddress` cover two programs only and break when the SLAAC address changes. Only
+`nodad` anchors are ever deprecated (the host's own address never carries nodad).
+`NETRUN_ANCHOR_DEPRECATE=0` (environment or `/etc/netrun/netrun.env`) turns it off;
+undo on a node: the same `ip address change` with `preferred_lft forever`.
+Check: `ip -6 route get 2001:500:2f::f` shows the primary as `src`.
+
+### Uniform TCP signature (FP-01)
+
+`deploy/node/99-zz-netrun-tcp.conf` → `/etc/sysctl.d/99-zz-netrun-tcp.conf` pins the
+stock Ubuntu 24.04 / kernel 6.8 values (TTL 64, timestamps, SACK, window scaling, ECN 2,
+`tcp_rmem 4096 131072 6291456`, `min_adv_mss 256`, MTU probing) on every node; it sorts
+after `99-sysctl.conf` (= `/etc/sysctl.conf`), where the old generator wrote
+`tcp_timestamps = 0` / `tcp_rmem 4096 87380 …`. The inert knobs are gone instead: the
+generator's TCP profile (`apply_network_profile_sysctl`, written to `/etc/sysctl.conf`),
+its edge "normalization" (ttl/hoplimit set, ct invalid drop, fragment drops) and every
+`tcp option maxseg size set` rule (nft can only LOWER an MSS; 1460 was a no-op, the legacy
+1340 read as OpenVPN). Existing nodes: `apply_capacity_tuning.sh --only fingerprint`.
+
+### Desired-state firewall for stale listeners (RES-13, node part)
+
+`POST /firewall/desired` (X-API-KEY): `{livePorts:[int], pergbBlocked:[int], window:[lo,hi]
+| windows:[[lo,hi],…], httpMirror?, computedAt?, dryRun?, force?}`. Blocks (one `nft -f` on
+`inet proxy_accounting pergb_blocked`) every listener inside the windows that is not in
+`livePorts` plus `pergbBlocked` (each socks port with its http port, socks − 10000), and
+unblocks every blocked port in `livePorts` that is not in `pergbBlocked`. Ports of an
+in-flight generation (the generation lock: range + http mirror) are never blocked and
+their blocks are lifted; `/generate` also lifts the blocks of the batch it is about to
+generate. A listener of a cfg written in the last `NODE_AGENT_FIREWALL_FRESH_SEC` (1800)
+or after `computedAt − 5 min` is never a ghost. More than
+`NODE_AGENT_FIREWALL_MAX_NEW_BLOCKS` (3000) new blocks, or no live port while listeners
+exist: 409 unless `force`. The accepted push is persisted
+(`/var/lib/netrun/desired.json`) and re-applied at agent start (after
+`reapplyPergbBlocks`) and every `NODE_AGENT_FIREWALL_REAPPLY_SEC` (900) — a re-apply
+re-asserts the pushed ghosts and `pergbBlocked` and removes stale drops on live ports,
+but never declares new ghosts. `GET /firewall/desired` shows the state.
+`NODE_AGENT_FIREWALL_DESIRED=0`: off. Response `report`: `{ghosts, pergbBlocked, added,
+removed, skippedInFlight}` (`{count, sample}` each), `listenersInWindows`, `freshExempt`.
+
+### 3proxy accept backlog, splice pipes, HTTPS reloads (speed)
+
+- 3proxy 0.9.3 has no backlog option: every service calls `listen(sock, (maxconn >> 4) + 1)`
+  (`mainfunc` 0xc408–0xc421 of the bundled binary) and `net.core.somaxconn` only caps a
+  larger request — maxconn 200 meant an accept queue of 13 per proxy port. New batches get
+  `maxconn 512` (backlog 33; also 512 concurrent connections per proxy before the listener
+  pauses). `NETRUN_3PROXY_MAXCONN` (environment or `/etc/netrun/netrun.env`) or `--maxconn`
+  overrides; existing batches keep their header until regenerated (no restarts).
+- `fs.pipe-user-pages-soft` (all 3proxy run as uid 65535 and relay with splice, two pipes
+  per connection): past the soft limit new pipes get 8 KiB instead of 64 KiB. Sized by RAM
+  (largest power of two ≤ MemTotal/32 pages, 16384..262144; 2c/4GB → 65536 = full pipes for
+  ~2048 relays, 256 MiB worst case). Existing nodes: `apply_capacity_tuning.sh --only pipes`.
+- `netrun-https sync` reloads haproxy only when the frontends or the base config changed
+  (it reloaded every 5 min, each reload leaving a draining worker for up to the 1 h tunnel
+  timeout); its unit gets `KillMode=process` (`netrun-https units`).
+- Batch IPv6 generation: one `od` + one `awk` per batch (was ~17 subshells and one
+  `ip -6 addr` dump of every NIC address per address).
+
+### Existing nodes
+
+```bash
+bash scripts/apply_capacity_tuning.sh --only units,fingerprint,pipes,ipv6restore           # dry-run
+bash scripts/apply_capacity_tuning.sh --apply --only units,fingerprint,pipes,ipv6restore   # no restarts
+```
+
+Tests: `bash scripts/test_3proxy_spawn.sh`, `bash scripts/test_generator_flags.sh`,
+`bash scripts/test_apply_capacity_tuning.sh`, `bash scripts/test_capacity_18k_node.sh`,
+`cd node_runtime/node_agent && node --test` (`supervisor`, `firewall`, `proxy_spawn`,
+`cfg_checks`, `server.n2`).
 
 ## Self-describe (for orchestrator enroll)
 
@@ -85,8 +221,10 @@ Returns a single JSON snapshot the orchestrator consumes via `POST /v1/nodes/enr
 - `geo_code` (ISO 3166-1 alpha-2, cached 1h via ipapi.co)
 - `ipv6`, `ipv6_egress` (same shape as `/health`)
 - `api_key_required`, `jobs_root`, `proxy_root`
-- `supports.{describe,enroll,accounting,egress_rotation}` (`egress_rotation` is true once the
-  egress module below has its nft NAT table up)
+- `supports.{describe,enroll,accounting,egress_rotation,firewall_desired,supervisor}`
+  (`egress_rotation` is true once the egress module below has its nft NAT table up;
+  `firewall_desired`: `POST /firewall/desired` is served; `supervisor`: dead batches are
+  respawned — audit N2)
 
 Open access (mirrors `/health`); set `NODE_AGENT_API_KEY` only if you want auth on the write endpoints.
 
@@ -689,7 +827,16 @@ The bundled 3proxy binary must exist at `deploy/node/bin/3proxy`. The installer 
 
 ## Fingerprint Contract
 
-The proxy layer does not control Android browser fingerprinting. `android_mobile` is an intended client OS profile only. Production logs and job metadata must report:
+Audit CLN-04: the only enforced part of the `/generate` product profile is
+`ipv6_policy` (it must match the node's egress mode; a mismatch fails closed with
+`ipv6_only_required` / `product_profile_contract_mismatch`). The labels
+(`fingerprint_profile_version`, `network_profile`, `intended_client_os_profile`,
+`client_os_profile_enforcement`, `profile_selection_*`, `ipv6_rollout_stage`) are
+accepted and IGNORED — a mismatch is logged once per process — because none of them
+reaches the wire: the TCP stack is set ONLY by `install_node_v2.sh` through
+`deploy/node/99-zz-netrun-tcp.conf` (see "Uniform TCP signature"), and the generator's
+`--network-profile` / `--tcp-timestamps-mode` / `--dns-country` flags are accepted
+no-ops. The proxy layer does not control Android browser fingerprinting. `android_mobile` is an intended client OS profile only. Production logs and job metadata must report:
 
 ```text
 intended_client_os_profile=android_mobile

@@ -55,7 +55,9 @@ REMOTE
 | `configure_file_limits` | `nofile=1M`, `nproc=unlimited` + `DefaultTasksMax=infinity` в `/etc/systemd/system.conf.d/`. |
 | `install_systemd_service` | node-agent на :8085 **с drop-in override** `/etc/systemd/system/netrun-node-agent.service.d/99-netrun-limits.conf` → `TasksMax=infinity` (НЕ через sed — он ломается на `\n`). |
 | `ensure_legacy_root_proxyserver_symlink` | `/root/proxyserver` → симлинк на `/opt/netrun/proxyserver`. Иначе legacy-скрипты пишут в одну директорию, а node-agent в другую → рассинхрон. |
-| `install_3proxy_restore_unit` | `netrun-3proxy-restore.service` — bounded parallel (`xargs -P 4` + `setsid`), НЕ fork-bomb. |
+| `install_3proxy_restore_unit` | `netrun-3proxy-restore.service` (`deploy/node/netrun-3proxy-restore.service`) → `scripts/restore_3proxy.sh` из репо: bounded parallel (`xargs -P 4`), каждая партия через `scripts/netrun-3proxy-spawn.sh` в своём systemd scope (рестарт юнита не убивает 3proxy), НЕ fork-bomb. Одна копия на весь флот (раньше installer и followup писали каждый свою heredoc-копию). |
+| `configure_tcp_signature` | `/etc/sysctl.d/99-zz-netrun-tcp.conf` из `deploy/node/` — единый TCP-отпечаток (TTL 64, timestamps, SACK, window scaling, ECN, tcp_rmem), сортируется ПОСЛЕ `/etc/sysctl.conf`; те же ключи удаляются из `/etc/sysctl.conf`. MSS-clamp в nftables больше нет (1460 был no-op, 1340 = «OpenVPN»). |
+| `configure_pipe_limit` | `fs.pipe-user-pages-soft` по RAM (2c/4GB → 65536 стр.): splice-пайпы 3proxy (uid 65535) не сжимаются до 8 КиБ уже на ~512 соединениях. |
 
 ### Что делает `node_followup_v2.sh`
 
@@ -140,7 +142,7 @@ VALUES ((SELECT id FROM skus WHERE code='ipv6_xx'), 'xx-city-01', 100, 100, true
 1. **Vultr-панель → инстанс → Restart Server** (power-cycle через гипервизор; SSH/console-login НЕ нужны)
 2. Подожди ~90 сек
 3. Проверь: `ssh root@<NODE_IP> 'uptime'`
-4. После boot `netrun-3proxy-restore.service` поднимет 3proxy сам. Строки генератора `@reboot … proxy-startup_<p>.sh` агент удаляет из crontab, а лишние копии 3proxy гасит через минуту после старта (инцидент 2026-10-07: каждая партия запускалась дважды — README, «Boot duplicates»)
+4. После boot `netrun-3proxy-restore.service` поднимет 3proxy сам (каждую партию — через `scripts/netrun-3proxy-spawn.sh`, в своём systemd scope). Cron `@reboot` 3proxy НЕ запускает: строки генератора `@reboot … proxy-startup_<p>.sh` агент удаляет из crontab, а лишние копии 3proxy гасит через минуту после старта (инцидент 2026-10-07: каждая партия запускалась дважды — README, «Boot duplicates»). Упавшую потом партию агент сам поднимет через ~2 мин (супервизор, README «3proxy supervision»), недостающие anchor-адреса допишет.
 
 > ⚠️ **noVNC console «Login incorrect»** — это спецсимволы пароля в noVNC keyboard layout, НЕ проблема ноды. Для recovery console не нужен — только Restart Server. Если нужен console-доступ — поставь root-пароль без спецсимволов.
 
@@ -166,7 +168,7 @@ UPDATE traffic_accounts SET status='expired', updated_at=now()
 UPDATE nodes SET runtime_status='active', heartbeat_failures=0, updated_at=now()
  WHERE runtime_status='degraded';
 ```
-> degraded ставит traffic_poll после N timeout'ов. Авто-recovery в active **пока не реализован** (техдолг) — возвращать вручную.
+> degraded ставит traffic_poll после N timeout'ов. Обратно в active ноду возвращает egress-watchdog оркестратора (degraded→active recovery есть); SQL выше — только если ждать нельзя.
 
 ---
 
@@ -219,9 +221,9 @@ PROXY_ALLOW_DEGRADED_NODES=true       # degraded ноды продолжают �
 ---
 
 ## Открытые техдолги (кандидаты в ops-wave)
-1. **degraded→active авто-recovery** в traffic_poll (сейчас вручную SQL).
-2. **refill раздувает IPv6** на below-target нодах — legacy `proxy-startup` не чистит старые IPv6/процессы при regenerate.
-3. **`nodes.last_heartbeat_at`** колонка не пишется (мёртвая).
+1. ~~degraded→active авто-recovery~~ — есть (egress-watchdog оркестратора).
+2. **refill раздувает IPv6** на below-target нодах — при regenerate старые anchor-адреса партии не удаляются с NIC (kill-on-rebind чистит файлы, не адреса).
+3. ~~`nodes.last_heartbeat_at` не пишется~~ — пишет egress-watchdog (единственный писатель).
 4. **reserve 400 → бот пишет «оркестратор недоступен»** — различать бизнес-ошибки от недоступности.
 5. **Стратегия:** Vultr периодически abuse-блокает proxy-трафик. Долгосрочно — сменить провайдера (M247/BuyVM/HostUS) или nft-фильтр abusive outbound.
 

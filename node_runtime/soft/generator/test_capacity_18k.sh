@@ -14,7 +14,7 @@ fail() { echo "FAIL: $1"; exit 1; }
 ok() { PASS=$((PASS + 1)); echo "ok: $1"; }
 extract() { sed -n "/^function $1()/,/^}/p" "$GEN"; }
 
-for f in select_listen_conflicts count_listening_in_range ss_listen_snapshot \
+for f in netrun_setting select_listen_conflicts count_listening_in_range ss_listen_snapshot \
          check_ports_not_listening http_listen_ip_for_node check_startup_parameters \
          create_startup_script; do
   body="$(extract "$f")"
@@ -32,10 +32,9 @@ guard() { # proxies_type start_port proxy_count [min_listen_port]
     log_err() { :; }
     cat() { if [[ "${1:-}" == /sys/class/net/* ]]; then echo up; else command cat "$@"; fi; }
     proxies_type="$1"; start_port="$2"; proxy_count="$3"; min_listen_port="${4:-8100}"
-    self_check_samples=1; user=""; password=""; use_random_auth=true
+    user=""; password=""; use_random_auth=true
     ipv6_policy="ipv6_only"; subnet=64; rotating_interval=0; backconnect_ipv4=""
-    allowed_hosts=""; denied_hosts=""; dns_country="auto"; network_profile="standard_nat"
-    tcp_timestamps_mode="auto"; proxy_maxconn=200; interface_name="eth0"
+    allowed_hosts=""; denied_hosts=""; proxy_maxconn=200; interface_name="eth0"
     check_startup_parameters >/dev/null 2>&1 && echo ACCEPT
   ) | tail -n 1
 }
@@ -122,6 +121,7 @@ ok "pre-check: one ss snapshot per batch, refuses busy ports, escape hatch works
   start_port=18100; last_port=18101; proxy_count=2; proxies_type=dual; mode_flag=-6
   backconnect_ipv4=45.32.10.20; interface_name=eth9; subnet=64
   dns_nserver_lines=$'  nserver 127.0.0.1\n  nserver ::1'; proxy_maxconn=200
+  NETRUN_ENV_FILE="$TMP/none.env"
   user=""; password=""; use_random_auth=true; allowed_hosts=""; denied_hosts=""
   proxyserver_config_path="$HOME_DIR/proxyserver/3proxy/3proxy_18100.cfg"
   random_ipv6_list_file="$HOME_DIR/proxyserver/ipv6_18100.list"
@@ -149,10 +149,11 @@ cat > "$TMP/stub/sleep" <<'EOF'
 exit 0
 EOF
 chmod +x "$TMP/stub/ip" "$TMP/stub/sleep"
-PATH="$TMP/stub:$PATH" bash "$S" >/dev/null 2>&1
+PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/no-helper" bash "$S" >/dev/null 2>&1
 [ "$(wc -l < "$TMP/ip_calls" | tr -d ' ')" = 1 ] || fail "expected ONE ip call, got: $(cat "$TMP/ip_calls")"
 grep -q -- '-6 -force -batch' "$TMP/ip_calls" || fail "ip not called with -force -batch"
-printf 'address add 2001:db8:0:1::a dev eth9 nodad\naddress add 2001:db8:0:1::b dev eth9 nodad\n' > "$TMP/want_batch"
+# Audit FP-01: explicit /128 + preferred_lft 0 (deprecated anchors).
+printf 'address add 2001:db8:0:1::a/128 dev eth9 nodad preferred_lft 0\naddress add 2001:db8:0:1::b/128 dev eth9 nodad preferred_lft 0\n' > "$TMP/want_batch"
 cmp -s "$TMP/want_batch" "$TMP/ip_batch" || { cat "$TMP/ip_batch"; fail "ip batch content"; }
 CFG="$TMP/home/proxyserver/3proxy/3proxy_18100.cfg"
 ! grep -q 'nscache' "$CFG" || fail "cfg still has nscache"
@@ -160,6 +161,6 @@ grep -qE '^[[:space:]]*nserver 127\.0\.0\.1$' "$CFG" || fail "cfg lost nserver 1
 grep -qE '^[[:space:]]*maxconn 200$' "$CFG" || fail "cfg lost maxconn"
 grep -q 'socks -6 -a -p18100 -i45.32.10.20 -e2001:db8:0:1::a' "$CFG" || fail "cfg socks line"
 grep -qE 'proxy -6 -n -a -p8100 -i(45\.32\.10\.20|127\.0\.0\.1) -e2001:db8:0:1::a' "$CFG" || fail "cfg paired http line at 8100"
-ok "startup script: header without nscache/nscache6, ONE ip -batch with nodad (/128 as before), dual http at 8100"
+ok "startup script: header without nscache/nscache6, ONE ip -batch with nodad (/128, deprecated), dual http at 8100"
 
 echo "test_capacity_18k.sh — all $PASS generator checks passed"

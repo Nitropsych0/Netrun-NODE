@@ -7,7 +7,8 @@
 #   - never starts, stops, restarts or signals 3proxy;
 #   - never changes a listener, a port, a cfg file or a sold proxy;
 #   - never touches nft map/set rules, counters, or tables other than the
-#     legacy per-port rules of inet proxy_accounting.
+#     legacy per-port rules of inet proxy_accounting and (fingerprint step)
+#     the inert inet proxy_normalization table.
 #
 #   bash apply_capacity_tuning.sh                     # = --dry-run: print the plan, change nothing
 #   bash apply_capacity_tuning.sh --apply             # do it
@@ -55,18 +56,46 @@
 #                connection is touched. NOTE: the 99-netrun.conf line
 #                nf_conntrack_tcp_timeout_established = 7200 also starts to apply
 #                at boot (harmless: 3proxy drops idle connections after 1800 s).
+#   units        OPT-IN (audit RES-11). netrun-3proxy-restore.service -> the repo
+#                unit (deploy/node/netrun-3proxy-restore.service: ExecStart =
+#                /opt/netrun/scripts/restore_3proxy.sh, every batch through the
+#                spawn helper); the legacy heredoc restore-3proxy.sh is removed;
+#                netrun-https-sync.service gets a KillMode=process drop-in; the
+#                /usr/local/sbin/netrun-https copy the timers run is refreshed from
+#                the repo (haproxy is then reloaded only when its config changes).
+#                daemon-reload only: NOTHING is started, stopped or restarted.
+#   fingerprint  OPT-IN (audit FP-01). /etc/sysctl.d/99-zz-netrun-tcp.conf from
+#                deploy/node (pinned TTL 64, timestamps, SACK, window scaling,
+#                ECN, tcp_rmem, min_adv_mss — it sorts after /etc/sysctl.conf),
+#                the same keys removed from /etc/sysctl.conf (backup first; the old
+#                generator wrote tcp_timestamps = 0 there), applied now with
+#                sysctl -p (new sockets only). And the inert/legacy rules of nft
+#                table inet proxy_normalization (MSS `maxseg size set` 1460 — or
+#                1340, which reads as OpenVPN — ttl/hoplimit set, ct invalid drop,
+#                fragment drops) are deleted in one nft -f; the empty table goes
+#                too once the deployed generator no longer checks for it. Refused
+#                while a generation holds the genlock (ruleset persist).
+#   pipes        OPT-IN (speed audit). fs.pipe-user-pages-soft sized by RAM (the
+#                largest power of two <= MemTotal/32 in pages, 16384..262144;
+#                2c/4GB -> 65536 = full 64 KiB splice pipes for ~2048 relayed
+#                connections instead of ~512). Persisted in 99-netrun.conf; the
+#                runtime value is only ever raised. New pipes only.
 #
 # Read-only listener audit (always printed): TCP listeners below 8100 and any
 # listener >= 8100 that is not 3proxy / haproxy (those would collide with
-# proxy ports 8100-65535).
+# proxy ports 8100-65535). Plus (audit FP-01/CLN-03): batch cfgs whose nserver
+# lines name third-party resolvers (2026-05 geo-seed; the spawn helper fixes
+# them at the batch's next start), MSS clamp rules, the ephemeral range vs the
+# proxy ports.
 #
 # Options:
 #   --dry-run                 default; print what would be done
 #   --apply                   do it (root)
-#   --only LIST               comma list of: sysctl,unbound,nft,ipv6restore,conntrack
-#                             (default: sysctl,unbound,nft,ipv6restore — conntrack is opt-in)
+#   --only LIST               comma list of: sysctl,unbound,nft,ipv6restore,conntrack,units,fingerprint,pipes
+#                             (default: sysctl,unbound,nft,ipv6restore — the others are opt-in)
 #   --ephemeral-range LO-HI   default 1024-8000
 #   --conntrack-max N         conntrack step target (default: sized by MemTotal)
+#   --pipe-pages N            pipes step target (default: sized by MemTotal)
 #   --allow-unbound-restart   last resort when unbound cannot be reloaded
 #   --ignore-genlock          run the nft step even if a generation lock exists
 #
@@ -76,7 +105,8 @@
 #
 # Test hook: NETRUN_TUNE_ROOT=<dir> prefixes every file path (fixtures); the
 # commands (ss, nft, sysctl, systemctl, udevadm, unbound-checkconf, unbound-control) are
-# taken from PATH.
+# taken from PATH. NETRUN_TUNE_REPO=<dir> overrides the repo the units /
+# fingerprint steps install from (default: the directory above this script).
 set -uo pipefail
 
 ROOT="${NETRUN_TUNE_ROOT:-}"
@@ -101,6 +131,20 @@ CT_MODULES_TEXT='# NETRUN — load conntrack before systemd-sysctl so net.netfil
 nf_conntrack'
 CT_UDEV_TEXT='# NETRUN — re-apply net.netfilter.* sysctls whenever nf_conntrack is (re)loaded
 ACTION=="add", SUBSYSTEM=="module", KERNEL=="nf_conntrack", RUN+="/usr/lib/systemd/systemd-sysctl --prefix=/net/netfilter"'
+REPO="${NETRUN_TUNE_REPO:-${SCRIPT_DIR:+$SCRIPT_DIR/..}}"
+SYSTEMD_DIR="$ROOT/etc/systemd/system"
+RESTORE3_UNIT="$SYSTEMD_DIR/netrun-3proxy-restore.service"
+RESTORE3_SCRIPT="$ROOT/opt/netrun/scripts/restore_3proxy.sh"
+RESTORE3_LEGACY="$ROOT/opt/netrun/scripts/restore-3proxy.sh"
+SPAWN_SCRIPT="$ROOT/opt/netrun/scripts/netrun-3proxy-spawn.sh"
+HTTPS_SYNC_UNIT="$SYSTEMD_DIR/netrun-https-sync.service"
+HTTPS_SYNC_DROPIN="$SYSTEMD_DIR/netrun-https-sync.service.d/10-killmode.conf"
+HTTPS_SBIN="$ROOT/usr/local/sbin/netrun-https"
+TCP_FILE="$ROOT/etc/sysctl.d/99-zz-netrun-tcp.conf"
+SYSCTL_CONF="$ROOT/etc/sysctl.conf"
+GENERATOR="$ROOT/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh"
+PROC_PIPE_SOFT="$ROOT/proc/sys/fs/pipe-user-pages-soft"
+TCP_KEYS="net.ipv4.ip_default_ttl net.ipv4.tcp_timestamps net.ipv4.tcp_sack net.ipv4.tcp_window_scaling net.ipv4.tcp_ecn net.ipv4.tcp_rmem net.ipv4.route.min_adv_mss net.ipv4.tcp_mtu_probing"
 
 
 NFT_TABLE="proxy_accounting"
@@ -115,6 +159,7 @@ EPH_HI=8000
 ALLOW_UNBOUND_RESTART=0
 IGNORE_GENLOCK=0
 CT_MAX_OVERRIDE=""
+PIPE_OVERRIDE=""
 
 RC_REFUSED=0
 RC_FAILED=0
@@ -127,7 +172,7 @@ refused() { step_status "$1" "REFUSED" "$2"; RC_REFUSED=1; }
 failed() { step_status "$1" "FAILED" "$2"; RC_FAILED=1; }
 die() { log "ERROR: $*" >&2; exit 1; }
 
-usage() { sed -n '2,79p' "$0" 2>/dev/null; }
+usage() { sed -n '2,108p' "$0" 2>/dev/null; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -140,6 +185,8 @@ while [ $# -gt 0 ]; do
     --ignore-genlock) IGNORE_GENLOCK=1 ;;
     --conntrack-max) [ $# -ge 2 ] || die "--conntrack-max needs a number"; CT_MAX_OVERRIDE="$2"; shift ;;
     --conntrack-max=*) CT_MAX_OVERRIDE="${1#--conntrack-max=}" ;;
+    --pipe-pages) [ $# -ge 2 ] || die "--pipe-pages needs a number"; PIPE_OVERRIDE="$2"; shift ;;
+    --pipe-pages=*) PIPE_OVERRIDE="${1#--pipe-pages=}" ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -150,11 +197,15 @@ case "$EPH_LO$EPH_HI" in *[!0-9]*|"") die "--ephemeral-range must be LO-HI (inte
 [ "$EPH_LO" -ge 1024 ] && [ "$EPH_HI" -gt "$EPH_LO" ] && [ "$EPH_HI" -lt "$PROXY_PORT_FLOOR" ] \
   || die "--ephemeral-range: need 1024 <= LO < HI < $PROXY_PORT_FLOOR (the range must stay below every proxy listener)"
 for s in $(printf '%s' "$ONLY" | tr ',' ' '); do
-  case "$s" in sysctl|unbound|nft|ipv6restore|conntrack) ;; *) die "--only: unknown step '$s'" ;; esac
+  case "$s" in sysctl|unbound|nft|ipv6restore|conntrack|units|fingerprint|pipes) ;; *) die "--only: unknown step '$s'" ;; esac
 done
 if [ -n "$CT_MAX_OVERRIDE" ]; then
   case "$CT_MAX_OVERRIDE" in *[!0-9]*) die "--conntrack-max must be an integer" ;; esac
   [ "$CT_MAX_OVERRIDE" -ge 65536 ] && [ "$CT_MAX_OVERRIDE" -le 4194304 ] || die "--conntrack-max: need 65536 <= N <= 4194304"
+fi
+if [ -n "$PIPE_OVERRIDE" ]; then
+  case "$PIPE_OVERRIDE" in *[!0-9]*) die "--pipe-pages must be an integer" ;; esac
+  [ "$PIPE_OVERRIDE" -ge 16384 ] && [ "$PIPE_OVERRIDE" -le 1048576 ] || die "--pipe-pages: need 16384 <= N <= 1048576"
 fi
 want() { case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
@@ -238,6 +289,35 @@ audit_listeners() {
       printf " other=%d\n", c
       for (k in other) print "[capacity-tuning]     WARNING non-proxy listener in the proxy port range: " k
     }'
+}
+
+# Audit FP-01 / CLN-03 — read-only: cfgs that still send customer DNS to
+# third-party resolvers (the 2026-05 geo seed), MSS clamp rules, and the
+# ephemeral range vs the proxy ports (the 2026-10-07 5-7 % failure bug).
+audit_fingerprint() {
+  local f n=0 sample="" range
+  for f in "$CFG_DIR"/3proxy_*.cfg "$CFG_DIR"/3proxy_*.cfg.disabled; do
+    [ -f "$f" ] || continue
+    if awk '/^[ \t]*nserver[ \t]/ { a = $2; if (a != "127.0.0.1" && a != "::1" && a != "localhost" && a !~ /^127\./) bad = 1 } END { exit bad ? 0 : 1 }' "$f"; then
+      n=$((n + 1)); [ "$n" -le 5 ] && sample="$sample $(basename "$f")"
+    fi
+  done
+  if [ "$n" -gt 0 ]; then
+    log "audit: WARNING $n batch cfg(s) send customer DNS to third-party resolvers (legacy geo seed):$sample — the spawn helper rewrites them to 127.0.0.1/::1 at each batch's next (re)start"
+  else
+    log "audit: every batch cfg resolves through the node's unbound (no third-party nserver)"
+  fi
+  # The nft part only with the fingerprint step (other steps stay nft-free).
+  if want fingerprint && command -v nft >/dev/null 2>&1 && nft list table inet proxy_normalization >/dev/null 2>&1; then
+    n="$(nft list table inet proxy_normalization 2>/dev/null | grep -c 'maxseg size set')"
+    log "audit: inet proxy_normalization present, MSS clamp rules: $n$(nft list table inet proxy_normalization 2>/dev/null | grep -q 'size set 1340' && echo ' (1340 = reads as OpenVPN!)') — removed by --only fingerprint"
+  fi
+  if [ -r "$PROC_RANGE" ]; then
+    range="$(awk '{ print $1 " " $2 }' "$PROC_RANGE")"
+    if [ "${range##* }" -ge "$PROXY_PORT_FLOOR" ] 2>/dev/null; then
+      log "audit: WARNING ip_local_port_range $range overlaps the proxy ports (>= $PROXY_PORT_FLOOR): upstream sockets collide with listeners and pergb drops — run the sysctl step"
+    fi
+  fi
 }
 
 # ── step: sysctl ephemeral range ──────────────────────────────────
@@ -575,16 +655,180 @@ step_conntrack() {
   [ -z "$overrides" ] || log "  NOTE: also set in: $overrides (a later file wins at boot — review it)"
 }
 
+# ── step: boot units (opt-in, audit RES-11) ───────────────────────
+
+step_units() {
+  local need=() src_unit="$REPO/deploy/node/netrun-3proxy-restore.service" src_https="$REPO/scripts/netrun-https.sh"
+  if [ ! -f "$src_unit" ]; then
+    refused units "repo unit $src_unit not found (deploy the code first)"
+    return 0
+  fi
+  if [ ! -f "$RESTORE3_SCRIPT" ] || [ ! -f "$SPAWN_SCRIPT" ]; then
+    refused units "$RESTORE3_SCRIPT / $SPAWN_SCRIPT missing — deploy the repo to /opt/netrun first; the unit would point at nothing"
+    return 0
+  fi
+  cmp -s "$src_unit" "$RESTORE3_UNIT" 2>/dev/null || need+=("restore-unit")
+  { [ -x "$RESTORE3_SCRIPT" ] && [ -x "$SPAWN_SCRIPT" ]; } || need+=("exec-bits")
+  [ ! -e "$RESTORE3_LEGACY" ] || need+=("legacy-restore-script")
+  if [ -f "$HTTPS_SYNC_UNIT" ] && ! grep -qs '^KillMode=process' "$HTTPS_SYNC_UNIT" "$HTTPS_SYNC_DROPIN"; then need+=("https-sync-killmode"); fi
+  if [ -f "$HTTPS_SBIN" ] && [ -f "$src_https" ] && ! cmp -s "$src_https" "$HTTPS_SBIN"; then need+=("netrun-https-copy"); fi
+  if [ "${#need[@]}" -eq 0 ]; then
+    step_status units ok "restore unit = repo unit (restore_3proxy.sh + spawn helper), https-sync KillMode=process, netrun-https copy current"
+    return 0
+  fi
+  if [ "$MODE" = "dry-run" ]; then
+    step_status units would-apply "do: ${need[*]}; then systemctl daemon-reload — nothing is started, stopped or restarted"
+    return 0
+  fi
+  local stamp; stamp="$(date +%Y%m%d%H%M%S)"
+  case " ${need[*]} " in *" restore-unit "*)
+    [ -f "$RESTORE3_UNIT" ] && cp -p "$RESTORE3_UNIT" "$RESTORE3_UNIT.bak-units-$stamp"
+    mkdir -p "$SYSTEMD_DIR" && cat "$src_unit" > "$RESTORE3_UNIT.new.$$" && mv -f "$RESTORE3_UNIT.new.$$" "$RESTORE3_UNIT" \
+      || { failed units "cannot write $RESTORE3_UNIT"; return 0; } ;;
+  esac
+  case " ${need[*]} " in *" exec-bits "*) chmod 0755 "$RESTORE3_SCRIPT" "$SPAWN_SCRIPT" || { failed units "cannot chmod the restore / spawn scripts"; return 0; } ;; esac
+  case " ${need[*]} " in *" legacy-restore-script "*) rm -f "$RESTORE3_LEGACY" ;; esac
+  case " ${need[*]} " in *" https-sync-killmode "*)
+    write_text_file "$HTTPS_SYNC_DROPIN" '# NETRUN (audit RES-11): a 3proxy the sync oneshot (re)started must not die with it
+[Service]
+KillMode=process' || { failed units "cannot write $HTTPS_SYNC_DROPIN"; return 0; } ;;
+  esac
+  case " ${need[*]} " in *" netrun-https-copy "*)
+    cp -p "$HTTPS_SBIN" "$HTTPS_SBIN.bak-units-$stamp" 2>/dev/null || true
+    cat "$src_https" > "$HTTPS_SBIN.new.$$" && chmod 0755 "$HTTPS_SBIN.new.$$" && mv -f "$HTTPS_SBIN.new.$$" "$HTTPS_SBIN" \
+      || { failed units "cannot refresh $HTTPS_SBIN"; return 0; } ;;
+  esac
+  systemctl daemon-reload >/dev/null 2>&1 || log "  WARNING: systemctl daemon-reload failed — run it by hand"
+  step_status units applied "${need[*]}; daemon-reload (nothing restarted; the restore unit runs at the next boot)"
+}
+
+# ── step: TCP signature + legacy normalization rules (opt-in, FP-01) ─
+
+# "<chain> <handle>" of every rule of inet proxy_normalization (all ours: MSS
+# clamps, ttl/hoplimit set, ct invalid drop, fragment drops).
+normalization_rules() {
+  local chain
+  for chain in output postrouting; do
+    nft -a list chain inet proxy_normalization "$chain" 2>/dev/null \
+      | awk -v c="$chain" '$1 == "table" || $1 == "chain" || /hook/ { next } match($0, /# handle [0-9]+$/) { print c, substr($0, RSTART + 9) }'
+  done
+}
+
+step_fingerprint() {
+  local src="$REPO/deploy/node/99-zz-netrun-tcp.conf" need=() key ek legacy="" rules="" n_rules=0 drop_table=0
+  if [ ! -f "$src" ]; then
+    refused fingerprint "repo file $src not found (deploy the code first)"
+    return 0
+  fi
+  cmp -s "$src" "$TCP_FILE" 2>/dev/null || need+=("tcp-signature-file")
+  if [ -f "$SYSCTL_CONF" ]; then
+    for key in $TCP_KEYS; do
+      ek="$(printf '%s' "$key" | sed 's/[.]/\\./g')"
+      grep -qE "^[[:space:]]*${ek}[[:space:]]*=" "$SYSCTL_CONF" && legacy="$legacy $key"
+    done
+  fi
+  [ -z "$legacy" ] || need+=("sysctl.conf:${legacy# }")
+  if command -v nft >/dev/null 2>&1 && nft list table inet proxy_normalization >/dev/null 2>&1; then
+    rules="$(normalization_rules)"
+    n_rules="$(printf '%s' "$rules" | grep -c .)"
+    [ "$n_rules" -eq 0 ] || need+=("nft-normalization-rules:$n_rules")
+    if [ -f "$GENERATOR" ] && ! grep -q 'proxy_normalization' "$GENERATOR"; then drop_table=1; need+=("nft-normalization-table"); fi
+  fi
+  if [ "${#need[@]}" -eq 0 ]; then
+    step_status fingerprint ok "pinned TCP signature in place ($TCP_FILE), no legacy keys in /etc/sysctl.conf, no normalization rules"
+    return 0
+  fi
+  if [ "$MODE" = "dry-run" ]; then
+    step_status fingerprint would-apply "do: ${need[*]}; sysctl -p $TCP_FILE (new sockets only)"
+    [ -z "$rules" ] || nft list table inet proxy_normalization 2>/dev/null | grep -E 'maxseg|ttl|hoplimit|ct state|frag' | head -n 8 | sed 's/^/[capacity-tuning]     /'
+    return 0
+  fi
+  if [ "$n_rules" -gt 0 ] || [ "$drop_table" = 1 ]; then
+    if [ -e "$GENLOCK" ] && [ "$IGNORE_GENLOCK" != 1 ]; then
+      refused fingerprint "a generation holds $GENLOCK — rerun when it is done (the ruleset is persisted)"
+      return 0
+    fi
+  fi
+  local stamp; stamp="$(date +%Y%m%d%H%M%S)"
+  write_text_file "$TCP_FILE" "$(cat "$src")" || { failed fingerprint "cannot write $TCP_FILE"; return 0; }
+  if [ -n "$legacy" ]; then
+    cp -p "$SYSCTL_CONF" "$SYSCTL_CONF.bak-fingerprint-$stamp" || { failed fingerprint "cannot back up $SYSCTL_CONF"; return 0; }
+    for key in $legacy; do
+      ek="$(printf '%s' "$key" | sed 's/[.]/\\./g')"
+      sed -E "/^[[:space:]]*${ek}[[:space:]]*=/d" "$SYSCTL_CONF" > "$TMPD/sysctl.conf" && cat "$TMPD/sysctl.conf" > "$SYSCTL_CONF"
+    done
+  fi
+  sysctl -p "$TCP_FILE" >/dev/null 2>&1 || { failed fingerprint "sysctl -p $TCP_FILE failed (files written)"; return 0; }
+  if [ "$n_rules" -gt 0 ] || [ "$drop_table" = 1 ]; then
+    {
+      printf '%s\n' "$rules" | awk 'NF == 2 { print "delete rule inet proxy_normalization " $1 " handle " $2 }'
+      [ "$drop_table" = 1 ] && echo "delete table inet proxy_normalization"
+    } > "$TMPD/norm_batch"
+    if ! nft -f "$TMPD/norm_batch" 2>"$TMPD/norm_err"; then
+      failed fingerprint "nft -f rejected (sysctl part applied): $(head -c 300 "$TMPD/norm_err" | tr '\n' ' ')"
+      return 0
+    fi
+    if [ -f "$NFT_PERSIST" ]; then cp -p "$NFT_PERSIST" "$NFT_PERSIST.bak-fingerprint-$stamp" 2>/dev/null || true; fi
+    nft list ruleset > "$NFT_PERSIST" 2>/dev/null || log "  WARNING: could not persist the ruleset to $NFT_PERSIST"
+  fi
+  step_status fingerprint applied "${need[*]}; runtime tcp_timestamps=$(sysctl -n net.ipv4.tcp_timestamps 2>/dev/null) tcp_rmem='$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)'"
+}
+
+# ── step: splice pipe budget (opt-in, speed audit) ─────────────────
+
+# MemTotal kB -> largest power of two <= kB/32 pages, 16384..262144 (same
+# formula as install_node_v2.sh / node_followup_v2.sh).
+pipe_pages_for_mem_kb() {
+  local kb="${1:-0}" v=16384
+  case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+  while [ "$v" -lt 262144 ] && [ $((v * 2)) -le $((kb / 32)) ]; do v=$((v * 2)); done
+  echo "$v"
+}
+
+step_pipes() {
+  local mem_kb target persisted runtime need=()
+  mem_kb="$(awk '/^MemTotal:/ { print $2 }' "$MEMINFO" 2>/dev/null)"
+  if [ -n "$PIPE_OVERRIDE" ]; then
+    target="$PIPE_OVERRIDE"
+  elif [ -n "$mem_kb" ]; then
+    target="$(pipe_pages_for_mem_kb "$mem_kb")"
+  else
+    refused pipes "cannot read MemTotal from $MEMINFO — pass --pipe-pages N"
+    return 0
+  fi
+  persisted="$(sysctl_file_key fs.pipe-user-pages-soft)"
+  runtime="$(cat "$PROC_PIPE_SOFT" 2>/dev/null || true)"
+  [ "$persisted" = "$target" ] || need+=("persist")
+  if [ -n "$runtime" ] && [ "$runtime" != 0 ] && [ "$runtime" -lt "$target" ] 2>/dev/null; then need+=("runtime-raise"); fi
+  if [ "${#need[@]}" -eq 0 ]; then
+    step_status pipes ok "fs.pipe-user-pages-soft $target persisted (runtime ${runtime:-?})"
+    return 0
+  fi
+  if [ "$MODE" = "dry-run" ]; then
+    step_status pipes would-apply "fs.pipe-user-pages-soft -> $target pages (MemTotal ${mem_kb:-?} kB${PIPE_OVERRIDE:+, --pipe-pages}); persisted '${persisted:-none}', runtime '${runtime:-?}'; do: ${need[*]}"
+    return 0
+  fi
+  persist_sysctl_kv "$SYSCTL_FILE" "fs.pipe-user-pages-soft" "$target"
+  case " ${need[*]} " in *" runtime-raise "*)
+    sysctl -w "fs.pipe-user-pages-soft=$target" >/dev/null || { failed pipes "sysctl -w fs.pipe-user-pages-soft=$target failed (persisted)"; return 0; } ;;
+  esac
+  step_status pipes applied "fs.pipe-user-pages-soft = $target (persisted${runtime:+, runtime was $runtime})"
+}
+
 # ── main ──────────────────────────────────────────────────────────
 
 log "mode: $MODE | steps: $ONLY | ephemeral range target: $EPH_LO-$EPH_HI${ROOT:+ | root: $ROOT}"
 log "never touches 3proxy processes, listeners, ports or cfg files"
 audit_listeners
+audit_fingerprint
 want sysctl && step_sysctl
 want unbound && step_unbound
 want nft && step_nft
 want ipv6restore && step_ipv6restore
 want conntrack && step_conntrack
+want units && step_units
+want fingerprint && step_fingerprint
+want pipes && step_pipes
 
 if [ "$RC_FAILED" = 1 ]; then log "result: a step FAILED (see above)"; exit 1; fi
 if [ "$RC_REFUSED" = 1 ]; then log "result: a step was REFUSED by a safety check (nothing changed for it)"; exit 2; fi

@@ -55,12 +55,25 @@ function ipv6ToHex(text) {
 // port in the file (first proxy/http port for an http-only cfg): after a
 // /deprovision rewrite the block of the file's start port may be gone while
 // the batch still serves, so the file name alone is not a listening probe.
+//
+// Audit FP-01 — also the cfg's resolvers (`nserver` lines) and the egress
+// family flags of its service lines (-6 / -64 / -46 / -4; none = 3proxy's
+// default, IPv4), for /health's static checks: third-party DNS left over from
+// the 2026-05 geo seed, and a batch that can leave over IPv4 while the node is
+// in ipv6_only egress mode (the dual-stack self-check never ran).
 function parseCfgSummary(text) {
   const socksPorts = [];
   const httpPorts = [];
   const egress = new Set();
+  const nservers = [];
+  const modeFlags = new Set();
   for (const raw of String(text || "").split(/\r?\n/)) {
     const line = raw.trim();
+    const ns = /^nserver\s+(\S+)/.exec(line);
+    if (ns) {
+      nservers.push(ns[1]);
+      continue;
+    }
     const isSocks = /^socks\s/.test(line);
     const isHttp = /^proxy\s/.test(line);
     if (!isSocks && !isHttp) continue;
@@ -68,6 +81,8 @@ function parseCfgSummary(text) {
     if (pm) (isSocks ? socksPorts : httpPorts).push(Number(pm[1]));
     const em = /(?:^|\s)-e(\S+)/.exec(line);
     if (em && em[1].includes(":")) egress.add(em[1]);
+    const fm = /(?:^|\s)(-64|-46|-6|-4)(?=\s|$)/.exec(line);
+    modeFlags.add(fm ? fm[1] : "none");
   }
   const primary = socksPorts.length ? socksPorts : httpPorts;
   return {
@@ -76,6 +91,39 @@ function parseCfgSummary(text) {
     socksPorts,
     httpPorts,
     egress: [...egress],
+    nservers,
+    modeFlags: [...modeFlags].sort(),
+  };
+}
+
+// A resolver that is not the node's own unbound (127.0.0.0/8, ::1, localhost;
+// an optional :port).
+function isLocalResolver(addr) {
+  const a = String(addr || "").trim().toLowerCase().replace(/^\[(.*)\](?::\d+)?$/, "$1");
+  if (a === "::1" || a === "localhost") return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(a);
+}
+
+// Static per-cfg checks for /health (cfgs = createCfgInventory().read().cfgs):
+//   legacyDns: cfgs whose nserver lines name third-party resolvers;
+//   egressFamily: with an expected flag (ipv6_only -> "-6"), cfgs whose
+//     service lines carry anything else (-64 / -46 / -4 / none = IPv4 egress
+//     possible). expectedFlag null (dualstack / unknown) checks nothing.
+function staticCfgChecks(cfgs, { expectedFlag = null, sample = 20 } = {}) {
+  const legacy = [];
+  const family = [];
+  for (const c of Array.isArray(cfgs) ? cfgs : []) {
+    const bad = (c.nservers || []).filter((a) => !isLocalResolver(a));
+    if (bad.length) legacy.push({ startPort: c.startPort, nservers: [...new Set(bad)].slice(0, 4) });
+    if (expectedFlag && (c.modeFlags || []).some((f) => f !== expectedFlag)) {
+      family.push({ startPort: c.startPort, flags: c.modeFlags });
+    }
+  }
+  return {
+    cfgsLegacyDns: { count: legacy.length, items: legacy.slice(0, sample) },
+    cfgsEgressFamily: expectedFlag
+      ? { expectedFlag, mismatched: family.length, items: family.slice(0, sample) }
+      : { expectedFlag: null, mismatched: null, items: [] },
   };
 }
 
@@ -214,6 +262,11 @@ function createCfgInventory({ cfgDir, fs: fsImpl = fsp } = {}) {
         probePort: hit.summary.probePort,
         count: hit.summary.count,
         egress: hit.summary.egress,
+        nservers: hit.summary.nservers,
+        modeFlags: hit.summary.modeFlags,
+        socksPorts: hit.summary.socksPorts,
+        httpPorts: hit.summary.httpPorts,
+        mtimeMs: st.mtimeMs,
       });
     }
     for (const name of [...cache.keys()]) if (!live.has(name)) cache.delete(name);
@@ -278,6 +331,8 @@ function createCoverageProbe({
 module.exports = {
   ipv6ToHex,
   parseCfgSummary,
+  isLocalResolver,
+  staticCfgChecks,
   parseIfInet6,
   parseIpAddrShow,
   computeAddressCoverage,

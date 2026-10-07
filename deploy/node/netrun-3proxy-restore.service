@@ -1,0 +1,26 @@
+# NETRUN — start every 3proxy batch after boot (audit RES-11). Installed as
+# /etc/systemd/system/netrun-3proxy-restore.service by install_node_v2.sh,
+# node_followup_v2.sh and `apply_capacity_tuning.sh --only units`.
+# The script is the repo's scripts/restore_3proxy.sh: each batch is started by
+# scripts/netrun-3proxy-spawn.sh in its OWN systemd scope, so restarting this
+# unit never stops a batch. A legacy cfg layout goes in a drop-in
+# (netrun-3proxy-restore.service.d/10-paths.conf: NETRUN_PROXY_CFG_DIR,
+# NETRUN_3PROXY_BIN), written by node_followup_v2.sh.
+[Unit]
+Description=NETRUN — restore all 3proxy instances from saved cfg files
+After=network-online.target netrun-node-agent.service netrun-ipv6-restore.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/netrun/scripts/restore_3proxy.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=900
+TasksMax=infinity
+LimitNOFILE=1048576
+LimitNPROC=infinity
+
+[Install]
+WantedBy=multi-user.target

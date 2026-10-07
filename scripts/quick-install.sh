@@ -108,7 +108,7 @@ ok "source cloned"
 
 # === 3. Run install_node_v2.sh ===
 log "3/6 Running install_node_v2.sh (hardening + node-agent install)"
-log "    UFW purge + DNS pin + sysctl tune + FD limits + 3proxy-restore + MSS=1460"
+log "    UFW purge + DNS pin + sysctl tune + pinned TCP signature + FD limits + 3proxy-restore"
 cd /tmp/netrun-source
 bash install_node_v2.sh
 ok "install_node_v2.sh finished"

@@ -42,6 +42,13 @@
 // Both run at start (dedupe after firstDedupeDelayMs, so the boot restore has
 // finished) and every NODE_AGENT_HYGIENE_INTERVAL_SEC (600) on unref'd timers.
 // The steady state costs one `ps` and one `crontab -l` per tick.
+//
+// Audit RES-11 — the signalling part of the dedupe runs under the agent's
+// shared process lock (processLock, process_lock.js), the same one the 3proxy
+// supervisor (supervisor.js) holds while it respawns a dead batch. The two
+// never fight by construction as well: the supervisor starts a cfg only when
+// it runs ZERO times, the reaper acts only on a cfg that runs twice or more and
+// never kills its last copy.
 
 const fs = require("fs");
 const fsp = require("fs/promises");
@@ -244,6 +251,7 @@ function createHygiene({
   bootUnits = BOOT_UNITS,
   tmpDir = os.tmpdir(),
   log = console,
+  processLock = (fn) => fn(),
 } = {}) {
   const settings = readSettings(env);
   const stats = {
@@ -451,7 +459,11 @@ function createHygiene({
       }
     }
     if (actionable.length === 0) return finish("ok");
+    return processLock(() => reap(actionable, finish));
+  }
 
+  // The signalling half of dedupe(), under the shared process lock.
+  async function reap(actionable, finish) {
     // Re-check right before signalling: a /generate may have started since the
     // snapshot, and a pid may have exited (or been recycled) meanwhile.
     if (await busy()) return { ...finish("generation_in_progress"), skipped: true };

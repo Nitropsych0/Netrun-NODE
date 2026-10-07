@@ -3,6 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
+const proxySpawn = require("./proxy_spawn.js");
 
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
@@ -313,6 +314,21 @@ function _readBlockedList() {
   }
 }
 
+// Audit RES-13 — the list has a second writer now (firewall.js, the desired-
+// state apply): every read-modify-write goes through this chain, so a disable
+// and a firewall apply can never drop each other's entries.
+let _listTail = Promise.resolve();
+function updateBlockedList(fn) {
+  const run = _listTail.then(() => {
+    const list = _readBlockedList();
+    const out = fn(list);
+    _writeBlockedList(list);
+    return out;
+  });
+  _listTail = run.catch(() => {});
+  return run;
+}
+
 function _writeBlockedList(set) {
   try {
     fs.writeFileSync(
@@ -418,12 +434,12 @@ async function _enforceBlock(portNum, blocked) {
   } catch (err) {
     failures.push(String((err && err.message) || err));
   }
-  const list = _readBlockedList();
-  for (const p of ports) {
-    if (blocked) list.add(p);
-    else list.delete(p);
-  }
-  _writeBlockedList(list);
+  await updateBlockedList((list) => {
+    for (const p of ports) {
+      if (blocked) list.add(p);
+      else list.delete(p);
+    }
+  });
   if (blocked && failures.length > 0) {
     const detail = failures.join("; ").slice(0, 500);
     console.error(`[accounting] nft block port ${portNum} failed: ${detail}`);
@@ -653,22 +669,17 @@ async function _enablePortCfg(port) {
     return { action: "already_enabled", pids };
   }
 
-  if (!fs.existsSync(PROXY_BIN)) {
-    throw new ProcessSpawnError("3proxy_binary_missing", PROXY_BIN);
-  }
-
-  let child;
+  // Audit RES-11 — through the node's spawn helper (own systemd scope; the
+  // direct detached start where the helper is absent).
+  let res;
   try {
-    child = spawn(PROXY_BIN, [cfg], {
-      detached: true,
-      stdio: "ignore",
-    });
+    res = await proxySpawn.spawn3proxyCfg(cfg, { bin: PROXY_BIN });
   } catch (err) {
+    if (err && err.code === "BINARY_MISSING") throw new ProcessSpawnError("3proxy_binary_missing", PROXY_BIN);
     throw new ProcessSpawnError("3proxy_spawn_failed", String(err && err.message || err));
   }
-  const pid = child.pid;
-  child.unref();
-  return { action: "started", pid };
+  if (!res.ok) throw new ProcessSpawnError("3proxy_spawn_failed", res.detail || res.outcome);
+  return { action: "started", pid: res.pid };
 }
 
 module.exports = {
@@ -704,6 +715,7 @@ module.exports = {
   _counterParses,
   NFT_DUMP_TIMEOUT_MS,
   _writeBlockedList,
+  updateBlockedList,
   _httpFor,
   BLOCKED_LIST_FILE,
   NFT_BLOCK_SET,

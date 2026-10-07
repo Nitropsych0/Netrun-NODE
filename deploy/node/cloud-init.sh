@@ -8,8 +8,8 @@
 # C:\__NETRUN__\УСТАНОВКА….txt + ПОСЛЕ УСТАНОВКИ….txt manuals.
 #
 # This script does NOT reimplement install logic — it only invokes:
-#   - install_node_v2.sh --clean --remove-legacy-root  (unbound / nft Android
-#     fingerprint / sysctl pid limits / node-agent + 3proxy-restore units / health)
+#   - install_node_v2.sh --clean --remove-legacy-root  (unbound / pinned TCP
+#     signature / sysctl pid limits / node-agent + 3proxy-restore units / health)
 #   - scripts/node_followup_v2.sh                        (watchdog v3 + restore)
 #
 # ── PLACEHOLDERS ──────────────────────────────────────────────────────────────

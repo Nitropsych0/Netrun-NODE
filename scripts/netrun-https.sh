@@ -16,10 +16,12 @@
 # HTTP-01 on :80), renewed automatically by the netrun-https-renew timer.
 #
 #   netrun-https setup   # once: haproxy + lego, certificate, timers, then sync
-#   netrun-https sync    # idempotent: move HTTP listeners, (re)write frontends
+#   netrun-https sync    # idempotent: move HTTP listeners, (re)write frontends;
+#                        # haproxy is reloaded ONLY when its config changed
 #   netrun-https renew   # timer: renew the certificate when due, reload haproxy
 #   netrun-https status  # short report
 #   netrun-https accounting  # only (re)write the two per-port counter map rules
+#   netrun-https units   # (re)write the renew/sync units (KillMode=process); no restarts
 #
 # Settings (environment, else ${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}):
 #   NETRUN_ACCOUNTING_MATCH_IPV4=1  meter only client legs: the map rules also
@@ -28,6 +30,9 @@ set -euo pipefail
 
 PROXY_DIR="${NETRUN_PROXY_DIR:-/opt/netrun/proxyserver/3proxy}"
 PROXY_BIN="$PROXY_DIR/bin/3proxy"
+# Audit RES-11 — the node's one 3proxy spawn helper (own systemd scope per
+# batch, idempotent); the repo copy, not a copy taken at setup time.
+SPAWN_HELPER="${NETRUN_3PROXY_SPAWN:-/opt/netrun/scripts/netrun-3proxy-spawn.sh}"
 TLS_DIR=/etc/netrun/tls
 LEGO_DIR=/etc/netrun/lego
 PEM="$TLS_DIR/node.pem"
@@ -35,6 +40,7 @@ HAPROXY_CFG=/etc/haproxy/haproxy.cfg
 FRONTEND_DIR=/etc/haproxy/netrun.d
 LEGO_VERSION="${LEGO_VERSION:-v5.5.2}"
 SELF=/usr/local/sbin/netrun-https
+SYSTEMD_DIR="${NETRUN_SYSTEMD_DIR:-/etc/systemd/system}"
 
 log() { printf '[netrun-https] %s\n' "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
@@ -92,9 +98,16 @@ restart_cfg() {
     survivors="$(pids_for_cfg "$cfg")"
     [ -z "$survivors" ] || kill -9 $survivors 2>/dev/null || true
   fi
-  # Same launch shape as the generator (raised limits, config `daemon`).
-  bash -c "ulimit -n 600000; ulimit -u 600000; exec '$PROXY_BIN' '$cfg'" </dev/null >/dev/null 2>&1 &
-  sleep 1
+  # Audit RES-11 — the respawn goes through the spawn helper: its own systemd
+  # scope, so this oneshot (the 5-min sync timer) can never take the batch down
+  # with it when it exits. The plain start is only for a node without it.
+  if [ -f "$SPAWN_HELPER" ]; then
+    NETRUN_3PROXY_BIN="$PROXY_BIN" bash "$SPAWN_HELPER" "$cfg" >/dev/null 2>&1 \
+      || log "WARNING: spawn helper failed for $(basename "$cfg") (the agent's supervisor retries)"
+  else
+    bash -c "ulimit -n 600000; ulimit -u 600000; exec '$PROXY_BIN' '$cfg'" </dev/null >/dev/null 2>&1 &
+    sleep 1
+  fi
 }
 
 # Rewrite `proxy ... -i<public-ip> ...` to listen on 127.0.0.1. Prints 1 when
@@ -184,10 +197,29 @@ EOF
     } > "$tmpdir/$name.cfg"
   done
   install -d -m 0755 "$FRONTEND_DIR"
+  # Audit RES-11 — compare before touching anything: an identical set leaves
+  # the live files (and haproxy) alone. FRONTENDS_CHANGED tells cmd_sync.
+  if frontend_sets_equal "$tmpdir" "$FRONTEND_DIR"; then
+    FRONTENDS_CHANGED=0
+    rm -rf "$tmpdir"
+    return 0
+  fi
+  FRONTENDS_CHANGED=1
   # Replace the set atomically enough: new/changed files in, stale ones out.
   rm -f "$FRONTEND_DIR"/*.cfg
   cp "$tmpdir"/*.cfg "$FRONTEND_DIR"/ 2>/dev/null || true
   rm -rf "$tmpdir"
+}
+
+# 0 when directories A and B hold the same *.cfg files with the same content.
+frontend_sets_equal() {
+  local a="$1" b="$2" f
+  [ "$( (cd "$a" && ls -1 -- *.cfg 2>/dev/null) | sort)" = "$( (cd "$b" && ls -1 -- *.cfg 2>/dev/null) | sort)" ] || return 1
+  for f in "$a"/*.cfg; do
+    [ -e "$f" ] || continue
+    cmp -s "$f" "$b/$(basename "$f")" || return 1
+  done
+  return 0
 }
 
 reload_haproxy() {
@@ -261,11 +293,14 @@ fix_accounting() {
 # ── commands ──────────────────────────────────────────────────────
 
 cmd_sync() {
-  local ip cfg changed=0
+  local ip cfg changed=0 base_changed=0
   ip="$(public_ipv4)"
   [ -n "$ip" ] || die "cannot detect the public IPv4"
   [ -s "$PEM" ] || die "no certificate at $PEM — run: netrun-https setup"
-  [ -s "$HAPROXY_CFG" ] && grep -q "netrun-https" "$HAPROXY_CFG" || write_base_config
+  if ! { [ -s "$HAPROXY_CFG" ] && grep -q "netrun-https" "$HAPROXY_CFG"; }; then
+    write_base_config
+    base_changed=1
+  fi
   fix_accounting
   local moved=()
   for cfg in "$PROXY_DIR"/3proxy_*.cfg; do
@@ -276,14 +311,24 @@ cmd_sync() {
   done
   # Free the public HTTP ports (3proxy respawns on 127.0.0.1), then let haproxy
   # take them. The gap is a few seconds per config.
-  for cfg in "${moved[@]}"; do
+  for cfg in ${moved[@]+"${moved[@]}"}; do
     log "moving HTTP listeners of $(basename "$cfg") to 127.0.0.1"
     restart_cfg "$cfg"
     changed=1
   done
+  FRONTENDS_CHANGED=1
   write_frontends "$ip"
-  reload_haproxy
-  [ "$changed" = 0 ] || log "synced: ${#moved[@]} config(s) moved behind haproxy"
+  # Audit RES-11 — reload ONLY on a change (it used to reload every 5 min:
+  # each reload re-binds every frontend on a 2-vCPU box and leaves the old
+  # worker draining for up to the 1 h tunnel timeout). A stopped haproxy is
+  # started whatever the diff says.
+  if [ "$FRONTENDS_CHANGED" = 1 ] || [ "$base_changed" = 1 ] || [ "$changed" = 1 ]; then
+    reload_haproxy
+    log "synced: haproxy reloaded (frontends_changed=$FRONTENDS_CHANGED base_changed=$base_changed moved=${#moved[@]})"
+  elif ! systemctl is-active --quiet haproxy; then
+    reload_haproxy
+    log "synced: haproxy was not running — started"
+  fi
 }
 
 cmd_renew() {
@@ -311,7 +356,18 @@ install_lego() {
 }
 
 install_units() {
-  cat > /etc/systemd/system/netrun-https-renew.service <<EOF
+  write_units
+  systemctl daemon-reload
+  systemctl enable --now netrun-https-renew.timer netrun-https-sync.timer >/dev/null
+}
+
+# The unit files only (setup, and `netrun-https units` for an existing node).
+# Audit RES-11 — the sync oneshot gets KillMode=process: a 3proxy it started
+# (an HTTP-listener move) must never die with it, even where the spawn helper
+# is missing; until now only nodes built from the orchestrator's cloud-init
+# template had that drop-in.
+write_units() {
+  cat > "$SYSTEMD_DIR/netrun-https-renew.service" <<EOF
 [Unit]
 Description=NETRUN — renew the node HTTPS certificate
 After=network-online.target
@@ -321,7 +377,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=$SELF renew
 EOF
-  cat > /etc/systemd/system/netrun-https-renew.timer <<'EOF'
+  cat > "$SYSTEMD_DIR/netrun-https-renew.timer" <<'EOF'
 [Unit]
 Description=NETRUN — node HTTPS certificate renewal (twice a day)
 
@@ -335,7 +391,7 @@ WantedBy=timers.target
 EOF
   # Periodic reconcile: new batches from the generator / whole-batch
   # deprovisions get their HTTP ports fronted without a manual step.
-  cat > /etc/systemd/system/netrun-https-sync.service <<EOF
+  cat > "$SYSTEMD_DIR/netrun-https-sync.service" <<EOF
 [Unit]
 Description=NETRUN — keep HTTP proxy ports behind the HTTPS frontend
 After=haproxy.service
@@ -343,8 +399,9 @@ After=haproxy.service
 [Service]
 Type=oneshot
 ExecStart=$SELF sync
+KillMode=process
 EOF
-  cat > /etc/systemd/system/netrun-https-sync.timer <<'EOF'
+  cat > "$SYSTEMD_DIR/netrun-https-sync.timer" <<'EOF'
 [Unit]
 Description=NETRUN — HTTPS frontend reconcile (every 5 minutes)
 
@@ -355,14 +412,22 @@ OnUnitActiveSec=5min
 [Install]
 WantedBy=timers.target
 EOF
-  install -d /etc/systemd/system/haproxy.service.d
-  cat > /etc/systemd/system/haproxy.service.d/netrun.conf <<'EOF'
+  install -d "$SYSTEMD_DIR/haproxy.service.d"
+  cat > "$SYSTEMD_DIR/haproxy.service.d/netrun.conf" <<'EOF'
 [Service]
 LimitNOFILE=1048576
 Environment="EXTRAOPTS=-S /run/haproxy-master.sock -f /etc/haproxy/netrun.d"
 EOF
+}
+
+# `netrun-https units`: rewrite the unit files of an existing node (and refresh
+# the /usr/local/sbin copy the timers run) — daemon-reload only; nothing is
+# restarted, the timers keep their schedule.
+cmd_units() {
+  install -m 0755 "$0" "$SELF" 2>/dev/null || true
+  write_units
   systemctl daemon-reload
-  systemctl enable --now netrun-https-renew.timer netrun-https-sync.timer >/dev/null
+  log "units rewritten (netrun-https-sync.service: KillMode=process); nothing restarted"
 }
 
 cmd_setup() {
@@ -396,5 +461,6 @@ case "${1:-}" in
   renew) cmd_renew ;;
   status) cmd_status ;;
   accounting) fix_accounting ;;
-  *) echo "usage: $0 {setup|sync|renew|status|accounting}" >&2; exit 2 ;;
+  units) cmd_units ;;
+  *) echo "usage: $0 {setup|sync|renew|status|accounting|units}" >&2; exit 2 ;;
 esac

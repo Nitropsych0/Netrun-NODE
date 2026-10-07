@@ -15,6 +15,10 @@ const loadSampler = require("./load_sampler.js").createSampler();
 const cfgStatus = require("./cfg_status.js");
 const jobRetention = require("./job_retention.js");
 const hygieneLib = require("./hygiene.js");
+const { withProcessLock } = require("./process_lock.js");
+const supervisorLib = require("./supervisor.js");
+const firewallLib = require("./firewall.js");
+const proxySpawn = require("./proxy_spawn.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 // Wave FLEET-HEALTH (RES-10) — bind address. The unit template has always set
@@ -491,6 +495,31 @@ function normalizeContractValue(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+// Audit CLN-04 — the product-profile contract is reduced to ipv6_policy. The
+// labels (fingerprint_profile_version, network_profile, intended / effective
+// client OS profile, profile_selection_*, ipv6_rollout_stage) never reached
+// the wire — the generator runs --runtime-only, and the TCP stack is set only
+// by install_node_v2.sh (deploy/node/99-zz-netrun-tcp.conf) — yet a typo or a
+// rename in one of them failed EVERY /generate (install_node_v2.sh documents
+// exactly that outage). They are accepted, ignored, and a mismatch is logged
+// once per process (field + value). ipv6_policy keeps failing closed.
+const CONTRACT_IPV6_FIELDS = new Set(["intended_ipv6_policy", "effective_ipv6_policy", "ipv6_policy"]);
+const loggedLabelMismatches = new Set();
+function logLabelMismatchesOnce(jobId, mismatches) {
+  for (const m of mismatches) {
+    const key = `${m.field}=${m.actual}`;
+    if (loggedLabelMismatches.has(key)) continue;
+    loggedLabelMismatches.add(key);
+    console.warn(
+      "[node-agent] profile label ignored (audit CLN-04): job_id=%s field=%s expected=%s actual=%s — logged once per process",
+      jobId,
+      m.field,
+      m.expected,
+      m.actual
+    );
+  }
+}
+
 function evaluateProductProfileContract(params, profileDiagnostics) {
   const paramsObject = params && typeof params === "object" ? params : {};
   const profile = profileDiagnostics && typeof profileDiagnostics === "object" ? profileDiagnostics : {};
@@ -569,9 +598,12 @@ function evaluateProductProfileContract(params, profileDiagnostics) {
     addMismatch("ipv6_rollout_stage", PRODUCTION_IPV6_ROLLOUT_STAGE, profile.ipv6_rollout_stage);
   }
 
+  // Audit CLN-04 — only the ipv6_policy fields can fail the contract.
+  const blocking = mismatches.filter((m) => CONTRACT_IPV6_FIELDS.has(m.field));
+  const ignoredLabels = mismatches.filter((m) => !CONTRACT_IPV6_FIELDS.has(m.field));
   return {
-    ok: mismatches.length === 0,
-    error: mismatches.length === 0 ? null : "product_profile_contract_mismatch",
+    ok: blocking.length === 0,
+    error: blocking.length === 0 ? null : "product_profile_contract_mismatch",
     expected_contract: expectedContract,
     intended: {
       fingerprint_profile_version: requestedVersion,
@@ -595,7 +627,8 @@ function evaluateProductProfileContract(params, profileDiagnostics) {
       network_profile: paramsObject.networkProfile || "",
       ipv6_policy: paramsObject.ipv6Policy || "",
     },
-    mismatches,
+    mismatches: blocking,
+    ignoredLabelMismatches: ignoredLabels,
   };
 }
 
@@ -750,6 +783,20 @@ async function scriptSupportsFlag(scriptPath, flagToken) {
     SCRIPT_FLAG_CACHE.set(key, false);
     return false;
   }
+}
+
+// The ports a generation binds: its range, plus the http mirror (socks - 10000)
+// for a dual batch only — the mirror of a socks-only batch is someone else's.
+function generationBatchPorts(params) {
+  const out = [];
+  const sp = toPositiveInt(params && params.startPort, 0);
+  const n = toPositiveInt(params && params.proxyCount, 0);
+  const dual = String((params && params.proxiesType) || "") === "dual";
+  for (let p = sp; sp > 0 && p < sp + n && p <= 65535; p += 1) {
+    out.push(p);
+    if (dual && p - 10000 >= 1) out.push(p - 10000);
+  }
+  return out;
 }
 
 function buildCfgPathForStartPort(startPort) {
@@ -1916,6 +1963,9 @@ async function checkDns(timeoutMs = 5000) {
 const hygiene = hygieneLib.createHygiene({
   preferRoot: PROXY_ROOT,
   isGenerationBusy: generationBusy,
+  // Audit RES-11 — the reaper's kills and the supervisor's respawns never
+  // interleave (process_lock.js).
+  processLock: withProcessLock,
 });
 
 // Removes THIS batch's generator @reboot line after a /generate. Matched by
@@ -2771,6 +2821,9 @@ async function handleGenerate(req, res) {
     return;
   }
   const contractCheck = evaluateProductProfileContract(params, profileDiagnostics);
+  if (contractCheck.ignoredLabelMismatches.length > 0) {
+    logLabelMismatchesOnce(jobId, contractCheck.ignoredLabelMismatches);
+  }
   if (!contractCheck.ok) {
     console.error(
       "[node-agent] product_profile_contract_mismatch job_id=%s details=%s",
@@ -2838,6 +2891,9 @@ async function handleGenerate(req, res) {
   const lockAttempt = await acquireGenerationLock(lockPath, {
     jobId,
     startPort: params.startPort,
+    // Audit RES-13 — the in-flight batch (firewall.js never blocks its ports).
+    proxyCount: params.proxyCount,
+    proxiesType: params.proxiesType,
     requestedAt: nowIso(),
   });
   if (!lockAttempt.ok) {
@@ -2878,6 +2934,10 @@ async function handleGenerate(req, res) {
   if (credentialLines) {
     console.log("[node-agent] generation job_id=%s explicit credentials count=%s", jobId, credentialLines.length);
   }
+  // Audit RES-11 — a supervisor respawn that began before the lock finishes
+  // first (it re-checks the lock under the same process lock, so none starts
+  // after this point): the process snapshot below sees everything.
+  await withProcessLock(async () => {});
   try {
     const rebindResult = await killOverlappingListeners({
       newStart: params.startPort,
@@ -2922,6 +2982,17 @@ async function handleGenerate(req, res) {
       start_port: params.startPort,
       error: rebindError && rebindError.message ? rebindError.message : String(rebindError),
     });
+  }
+  // Audit RES-13 — the ports of the batch about to be generated are never left
+  // firewalled: an old occupant's ghost / pay-per-GB block or an earlier failed
+  // attempt's block would fail this run's validation (incident 2026-10-07).
+  // Nothing of the old occupant listens any more (kill-on-rebind ran above;
+  // strict mode returned ports_in_use instead).
+  try {
+    const lift = await firewall.liftPorts(generationBatchPorts(params), `generation ${jobId}`);
+    if (lift && lift.lifted) console.log("[firewall] generation job_id=%s lifted %s block(s)", jobId, lift.lifted);
+  } catch (liftError) {
+    console.warn("[firewall] lift before generation failed; proceeding", liftError && liftError.message ? liftError.message : String(liftError));
   }
 
   const runId = makeRunId();
@@ -3706,6 +3777,58 @@ const ipv6Coverage = cfgStatus.createCoverageProbe({
   readCfgs: () => cfgInventory.read(),
 });
 
+// Audit RES-11 — the 3proxy supervisor (supervisor.js): respawns a dead batch,
+// re-adds missing anchors and deprecates anchors (FP-01), every minute.
+const supervisor = supervisorLib.createSupervisor({
+  readCfgs: () => cfgInventory.read(),
+  spawnCfg: (cfgPath) => proxySpawn.spawn3proxyCfg(cfgPath, { bin: path.join(PROXY_CFG_ROOT, "bin", "3proxy") }),
+  isGenerationBusy: generationBusy,
+  processLock: withProcessLock,
+});
+
+// The live generation lock record (null when none / stale), for firewall.js.
+async function liveGenerationLock() {
+  const lockState = await classifyGenerationLock(path.join(JOBS_ROOT, LOCK_FILENAME));
+  return lockState.parsed && !lockState.stale ? lockState.parsed : null;
+}
+
+// Audit RES-13 — the desired-state firewall (firewall.js): POST /firewall/desired,
+// re-applied at start and every 15 min; /generate lifts its batch's blocks.
+const firewall = firewallLib.createFirewall({
+  readCfgs: () => cfgInventory.read(),
+  readLock: liveGenerationLock,
+  ensureInfra: () => accounting.ensurePergbBlockInfra(),
+  updateBlockedList: (fn) => accounting.updateBlockedList(fn),
+  protectedPorts: [PORT, 22, 53, 80, 443],
+});
+
+// Audit FP-01 / speed — node tuning that silently breaks proxies or the
+// fingerprint when an old script resets it: the ephemeral range must stay
+// below every proxy listener (the 2026-10-07 5-7 % failure bug), timestamps
+// on, and the splice pipe budget. Plain /proc reads; null when unreadable.
+const PROXY_LISTEN_FLOOR = Math.max(1024, Number(process.env.NETRUN_MIN_LISTEN_PORT || 8100) || 8100);
+function readProcValue(relPath) {
+  try {
+    return fs.readFileSync(path.join("/proc/sys", relPath), "utf-8").trim().replace(/\s+/g, " ");
+  } catch {
+    return null;
+  }
+}
+function nodeTuningStatus() {
+  const range = readProcValue("net/ipv4/ip_local_port_range");
+  const hi = range ? Number(range.split(" ")[1]) : NaN;
+  const num = (v) => (v === null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
+  return {
+    ipLocalPortRange: range,
+    ephemeralOverlapsProxyPorts: Number.isFinite(hi) ? hi >= PROXY_LISTEN_FLOOR : null,
+    proxyListenFloor: PROXY_LISTEN_FLOOR,
+    tcpTimestamps: num(readProcValue("net/ipv4/tcp_timestamps")),
+    ipDefaultTtl: num(readProcValue("net/ipv4/ip_default_ttl")),
+    tcpRmem: readProcValue("net/ipv4/tcp_rmem"),
+    pipeUserPagesSoft: num(readProcValue("fs/pipe-user-pages-soft")),
+  };
+}
+
 async function handleHealth(req, res) {
   await fsp.mkdir(JOBS_ROOT, { recursive: true });
   const lockPath = path.join(JOBS_ROOT, LOCK_FILENAME);
@@ -3784,6 +3907,12 @@ async function handleHealth(req, res) {
     duplicateStartPort: summary.duplicateStartPort,
   };
   const hygieneStatus = hygiene.status();
+  // Audit FP-01 — static per-cfg checks: third-party resolvers left from the
+  // 2026-05 geo seed, and (ipv6_only egress) a cfg that can leave over IPv4.
+  const egressModeNow = egressMode.readEgressModeState();
+  const cfgChecks = cfgStatus.staticCfgChecks(inventory.cfgs, {
+    expectedFlag: egressModeNow === "ipv6_only" ? "-6" : null,
+  });
 
   sendJson(res, 200, {
     success,
@@ -3832,6 +3961,15 @@ async function handleHealth(req, res) {
     cfgsWithoutProcess: cfgView.cfgsWithoutProcess,
     cfgsError: inventory.ok ? null : inventory.error || "cfg_read_failed",
     ipv6Addresses: { ...ipv6Addresses, ttlSec: Math.round(IPV6_COVERAGE_TTL_MS / 1000) },
+    // Audit RES-11 / RES-13 / FP-01 — additive. supervisor: dead-batch
+    // respawns, re-added and deprecated anchors (supervisor.js); firewall: the
+    // last desired-state push / re-apply (firewall.js); cfgsLegacyDns /
+    // cfgsEgressFamily: static cfg checks; nodeTuning: sysctls that must not drift.
+    supervisor: supervisor.status(),
+    firewall: firewall.status(),
+    cfgsLegacyDns: cfgChecks.cfgsLegacyDns,
+    cfgsEgressFamily: cfgChecks.cfgsEgressFamily,
+    nodeTuning: nodeTuningStatus(),
   });
 }
 
@@ -3858,6 +3996,8 @@ async function handleDescribe(req, res) {
     jobsRoot: JOBS_ROOT,
     proxyRoot: PROXY_ROOT,
     egressRotation: egress.isAvailable(),
+    firewallDesired: firewall.settings().enabled,
+    supervisor: supervisor.settings().enabled,
   });
   sendJson(res, 200, payload);
 }
@@ -4055,6 +4195,28 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Audit RES-13 — desired-state firewall for stale listeners (firewall.js).
+  if (pathname === "/firewall/desired" && (req.method === "POST" || req.method === "GET")) {
+    if (!ensureAuthorized(req)) {
+      return sendJson(res, 401, { success: false, error: "unauthorized" });
+    }
+    if (req.method === "GET") {
+      return sendJson(res, 200, { success: true, ...(await firewall.statusFull()) });
+    }
+    let body;
+    try {
+      body = await parseJsonBody(req);
+    } catch (err) {
+      return sendJson(res, 400, { success: false, error: "invalid_json", detail: String((err && err.message) || err) });
+    }
+    try {
+      const out = await firewall.push(body);
+      return sendJson(res, out.status, out.body);
+    } catch (err) {
+      return sendJson(res, 500, { success: false, error: "firewall_failed", detail: String((err && err.message) || err) });
+    }
+  }
+
   // Wave IPV6-ROTATION — per-port egress IPv6 (rotate / per-connection /
   // reset) through an nftables SNAT table; 3proxy and its cfgs are never
   // touched (egress.js). Any other /egress path falls through to the 404.
@@ -4088,11 +4250,16 @@ if (require.main === module) {
     // PERGB-NFT-ENFORCE — a reboot clears the in-memory nft block set and
     // respawns every 3proxy from cfg; re-assert the persisted pay-per-GB blocks
     // so depleted accounts don't silently come back online until next topup.
+    // Audit RES-13 — then the persisted desired firewall state (full add AND
+    // remove: stale drops on live ports go too), and every 15 min after.
     accounting
       .reapplyPergbBlocks()
       .catch((err) =>
         console.error(`[node-agent] reapplyPergbBlocks on boot failed: ${(err && err.message) || err}`)
-      );
+      )
+      .then(() => firewall.reapply("boot"))
+      .catch((err) => console.error(`[node-agent] firewall re-apply on boot failed: ${(err && err.message) || err}`));
+    firewall.start();
     // Wave IPV6-ROTATION — the kernel forgets the added addresses and the NAT
     // table on reboot: re-add them and rebuild the table from egress_state.json,
     // then run the 30 s GC and the per-connection pool refresh.
@@ -4101,6 +4268,9 @@ if (require.main === module) {
     // duplicate 3proxy a minute after start (the boot restore is done by
     // then); both again every NODE_AGENT_HYGIENE_INTERVAL_SEC (hygiene.js).
     hygiene.start();
+    // Audit RES-11 — dead-batch respawn + anchor re-add / deprecation, every
+    // minute after a first delay (the boot restore runs first).
+    supervisor.start();
   });
 }
 
@@ -4158,4 +4328,11 @@ module.exports = {
   hygiene,
   generationBusy,
   cleanupCronStartup,
+  // Audit RES-11 / RES-13 / CLN-04 — exported for unit tests.
+  supervisor,
+  firewall,
+  generationBatchPorts,
+  evaluateProductProfileContract,
+  buildProfileDiagnostics,
+  nodeTuningStatus,
 };

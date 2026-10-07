@@ -9,7 +9,8 @@
 #     which trips fork EAGAIN when restore-3proxy respawns 4000+ instances);
 #   - DAD/MLD off (98-netrun-ipv6.conf) for thousands of /64 egress addrs;
 #   - bounded parallel 3proxy restore (xargs -P 4 + setsid) vs v1's fork-bomb;
-#   - nftables MSS clamp 1460 (v1 used 1340 → p0f read the link as OpenVPN) +
+#   - no MSS clamp (v1's 1340 read as OpenVPN; v2's later 1460 was a no-op —
+#     the TCP signature is pinned by deploy/node/99-zz-netrun-tcp.conf) +
 #     `nft flush ruleset` to survive UFW xt-compat residue on fresh Ubuntu;
 #   - raised systemd limits (TasksMax/LimitNOFILE/LimitNPROC) via drop-in;
 #   - local recursive resolver (unbound), trend monitor, IPv6 egress restore.

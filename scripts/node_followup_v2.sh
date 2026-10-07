@@ -4,9 +4,12 @@
 # Changes vs v1 (post-2026-05-15 incident, see project memory):
 #   - watchdog NO LONGER reboots — it restarts netrun-node-agent.
 #     v1 watchdog rebooted nodes daily because /health periodically stalled.
-#   - restore_3proxy spawns 3proxy in bounded parallel batches instead of
+#   - the restore spawns 3proxy in bounded parallel batches instead of
 #     blasting 4000+ forks at once. v1 hit fork EAGAIN at boot and left
-#     phantom inventory.
+#     phantom inventory. Since audit RES-11 the unit runs the repo's
+#     scripts/restore_3proxy.sh (one restore script for the whole fleet),
+#     which starts each batch via scripts/netrun-3proxy-spawn.sh in its own
+#     systemd scope.
 #   - kernel pids / threads / FD / conntrack limits raised. Old defaults
 #     (pid_max=65536, threads-max=65536) topple over with 4000 3proxy.
 #   - systemd unit gets TasksMax=infinity + LimitNOFILE=1048576 so the
@@ -128,6 +131,35 @@ printf '# NETRUN — re-apply net.netfilter.* sysctls whenever nf_conntrack is (
   > /etc/udev/rules.d/90-netrun-conntrack.rules
 udevadm control --reload >/dev/null 2>&1 || true
 merge_sysctl_conf /etc/sysctl.d/99-netrun.conf "net.netfilter.nf_conntrack_max=$CONNTRACK_MAX"
+
+# Speed audit — splice pipe budget of uid 65535 (all 3proxy), sized by RAM (same
+# formula as install_node_v2.sh pipe_pages_for_mem_kb; see there).
+pipe_pages_for_mem_kb() {
+  local kb="${1:-0}" v=16384
+  case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+  while [ "$v" -lt 262144 ] && [ $((v * 2)) -le $((kb / 32)) ]; do v=$((v * 2)); done
+  echo "$v"
+}
+PIPE_PAGES="${NETRUN_PIPE_USER_PAGES_SOFT:-$(pipe_pages_for_mem_kb "$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || true)")}"
+log "Pipes: fs.pipe-user-pages-soft=$PIPE_PAGES"
+merge_sysctl_conf /etc/sysctl.d/99-netrun.conf "fs.pipe-user-pages-soft=$PIPE_PAGES"
+
+# Audit FP-01 — the pinned TCP signature (deploy/node/99-zz-netrun-tcp.conf; it
+# sorts after /etc/sysctl.conf) and the same keys out of /etc/sysctl.conf, where
+# the old generator wrote tcp_timestamps = 0 / a smaller tcp_rmem.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+TCP_SRC="$SELF_DIR/../deploy/node/99-zz-netrun-tcp.conf"
+if [ -f "$TCP_SRC" ]; then
+  install -m 0644 "$TCP_SRC" /etc/sysctl.d/99-zz-netrun-tcp.conf
+  for key in net.ipv4.ip_default_ttl net.ipv4.tcp_timestamps net.ipv4.tcp_sack net.ipv4.tcp_window_scaling \
+             net.ipv4.tcp_ecn net.ipv4.tcp_rmem net.ipv4.route.min_adv_mss net.ipv4.tcp_mtu_probing; do
+    ek="$(printf '%s' "$key" | sed 's/[.]/\\./g')"
+    if [ -f /etc/sysctl.conf ]; then sed -i -E "/^[[:space:]]*${ek}[[:space:]]*=/d" /etc/sysctl.conf || true; fi
+  done
+  sysctl -p /etc/sysctl.d/99-zz-netrun-tcp.conf >/dev/null 2>&1 || warn "sysctl -p 99-zz-netrun-tcp.conf had warnings"
+else
+  warn "TCP signature file $TCP_SRC not found — run from the repo checkout"
+fi
 modprobe nf_conntrack 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-netrun.conf >/dev/null 2>&1 || warn "sysctl -p had warnings (likely nf_conntrack module not loaded yet — applied on next boot)"
 
@@ -144,83 +176,29 @@ root hard nproc  unlimited
 LIMITS
 
 # ── 3) Install netrun-3proxy-restore.service (bounded parallel) ──
-log "Installing netrun-3proxy-restore (v2 — bounded parallel, no fork-bomb)"
+# Audit RES-11 / CLN-03 — the repo's scripts/restore_3proxy.sh + its unit file
+# (deploy/node/netrun-3proxy-restore.service); this script used to write its
+# own heredoc copy (restore_3proxy.sh) next to the installer's
+# (restore-3proxy.sh). A legacy cfg layout found above goes in a drop-in.
+log "Installing netrun-3proxy-restore (repo scripts/restore_3proxy.sh + spawn helper)"
 mkdir -p /opt/netrun/scripts
-RESTORE_SCRIPT="/opt/netrun/scripts/restore_3proxy.sh"
-
-cat > "$RESTORE_SCRIPT" <<RESTORESH
-#!/usr/bin/env bash
-# v2: bounded parallel spawn (4 streams), no fork-bomb.
-# Sleeps every batch to give scheduler/cgroup time to absorb new pids.
-set -u
-PROXY_BIN="$PROXY_BIN"
-PROXY_CFG_DIR="$PROXY_CFG_DIR"
-LOG_TAG="netrun-3proxy-restore"
-PARALLEL=4
-SLEEP_MS=300
-
-if [ ! -x "\$PROXY_BIN" ]; then
-  logger -t "\$LOG_TAG" "skip: 3proxy binary not found at \$PROXY_BIN"
-  exit 0
-fi
-
-# Crank up our own FD/proc limits early
-ulimit -n 1048576 2>/dev/null || true
-ulimit -u unlimited 2>/dev/null || true
-
-# Snapshot what's already listening — one ss call, not per-port
-listening=\$(ss -tln 2>/dev/null | awk '{print \$4}' | awk -F: '{print \$NF}' | sort -u)
-
-# Build worklist
-shopt -s nullglob
-worklist=\$(mktemp)
-trap 'rm -f \$worklist' EXIT
-for cfg in "\$PROXY_CFG_DIR"/3proxy_*.cfg; do
-  [ -f "\$cfg" ] || continue
-  port=\$(basename "\$cfg" .cfg | sed 's/3proxy_//')
-  if ! echo "\$listening" | grep -qx "\$port"; then
-    printf '%s\n' "\$cfg" >> "\$worklist"
+for f in restore_3proxy.sh netrun-3proxy-spawn.sh; do
+  if [ "$SELF_DIR/$f" != "/opt/netrun/scripts/$f" ] && [ -f "$SELF_DIR/$f" ]; then
+    install -m 0755 "$SELF_DIR/$f" "/opt/netrun/scripts/$f"
   fi
+  chmod +x "/opt/netrun/scripts/$f" 2>/dev/null || true
 done
-
-total=\$(wc -l < "\$worklist")
-logger -t "\$LOG_TAG" "starting: \$total cfgs need 3proxy spawn, parallel=\$PARALLEL"
-
-# Spawn in batches via xargs — controlled parallelism, never explodes
-started=0
-< "\$worklist" xargs -n 1 -P "\$PARALLEL" -I {} bash -c '
-  "'"\$PROXY_BIN"'" "{}" </dev/null >/dev/null 2>&1 & disown 2>/dev/null || true
-  sleep 0.'"\$SLEEP_MS"'
-' 2>/dev/null || true
-
-sleep 3
-active=\$(ss -tln 2>/dev/null | grep -cE ':[1-9][0-9]{3,4} ' || echo 0)
-logger -t "\$LOG_TAG" "done: queued=\$total, total_listening_after=\$active"
-exit 0
-RESTORESH
-chmod +x "$RESTORE_SCRIPT"
-
-cat > /etc/systemd/system/netrun-3proxy-restore.service <<EOF
-[Unit]
-Description=NETRUN — restore all 3proxy instances from saved cfg files (v2)
-After=network-online.target netrun-node-agent.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=$RESTORE_SCRIPT
-RemainAfterExit=yes
-StandardOutput=journal
-StandardError=journal
-TimeoutStartSec=900
-# v2: don't let our own cgroup throttle the respawn
-TasksMax=infinity
-LimitNOFILE=1048576
-LimitNPROC=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
+rm -f /opt/netrun/scripts/restore-3proxy.sh
+RESTORE_UNIT_SRC="$SELF_DIR/../deploy/node/netrun-3proxy-restore.service"
+[ -f "$RESTORE_UNIT_SRC" ] || fail "missing $RESTORE_UNIT_SRC"
+install -m 0644 "$RESTORE_UNIT_SRC" /etc/systemd/system/netrun-3proxy-restore.service
+RESTORE_DROPIN=/etc/systemd/system/netrun-3proxy-restore.service.d/10-paths.conf
+if [ "$PROXY_CFG_DIR" != "/opt/netrun/proxyserver/3proxy" ] || [ "$PROXY_BIN" != "/opt/netrun/proxyserver/3proxy/bin/3proxy" ]; then
+  mkdir -p "$(dirname "$RESTORE_DROPIN")"
+  printf '[Service]\nEnvironment=NETRUN_PROXY_CFG_DIR=%s\nEnvironment=NETRUN_3PROXY_BIN=%s\n' "$PROXY_CFG_DIR" "$PROXY_BIN" > "$RESTORE_DROPIN"
+else
+  rm -f "$RESTORE_DROPIN"
+fi
 
 # ── 4) Install netrun-watchdog v3 (two-tier: restart, then reboot) ────
 log "Installing netrun-watchdog (v3 — restart-then-reboot for Vultr abuse-block)"

@@ -4,8 +4,10 @@
 #      fork EAGAIN when restore-3proxy respawns 4400+ instances at boot)
 #   2. systemd: restore service gets TasksMax=infinity + LimitNOFILE=1048576
 #      + LimitNPROC=infinity (so its own cgroup doesn't throttle the spawn)
-#   3. restore-3proxy.sh: bounded parallel via `xargs -P 4` + setsid detach
-#      (old version `for cfg; do 3proxy & done` was the fork-bomb)
+#   3. 3proxy restore: bounded parallel via `xargs -P 4` (the old
+#      `for cfg; do 3proxy & done` was the fork-bomb). Since audit RES-11 the
+#      unit runs the repo's scripts/restore_3proxy.sh, which starts each batch
+#      through scripts/netrun-3proxy-spawn.sh (own systemd scope per batch).
 #   4. node-agent service gets the same raised limits (1M FDs, infinity pids)
 #
 # Diff against install_node.sh is intentionally minimal — only the functions
@@ -21,13 +23,19 @@ SERVICE_NAME="netrun-node-agent"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-netrun.conf"
 SYSCTL_IPV6_FILE="/etc/sysctl.d/98-netrun-ipv6.conf"
+# Audit FP-01 — the pinned TCP signature (deploy/node/99-zz-netrun-tcp.conf).
+SYSCTL_TCP_FILE="/etc/sysctl.d/99-zz-netrun-tcp.conf"
 LIMITS_FILE="/etc/security/limits.d/99-netrun.conf"
 CONNTRACK_MODULES_FILE="/etc/modules-load.d/netrun-conntrack.conf"
 CONNTRACK_UDEV_RULE="/etc/udev/rules.d/90-netrun-conntrack.rules"
 RESOLV_CONF="/etc/resolv.conf"
 RESTORE_SERVICE_NAME="netrun-3proxy-restore"
 RESTORE_SERVICE_FILE="/etc/systemd/system/${RESTORE_SERVICE_NAME}.service"
-RESTORE_SCRIPT="/opt/netrun/scripts/restore-3proxy.sh"
+# Audit RES-11 / CLN-03 — ONE restore script, shipped in the repo (a code deploy
+# updates it); this installer used to write its own heredoc copy
+# (restore-3proxy.sh) next to node_followup_v2.sh's (restore_3proxy.sh).
+RESTORE_SCRIPT="/opt/netrun/scripts/restore_3proxy.sh"
+LEGACY_RESTORE_SCRIPT="/opt/netrun/scripts/restore-3proxy.sh"
 DOCTOR_SCRIPT="/opt/netrun/scripts/netrun-doctor.sh"
 HEALTH_URL="http://127.0.0.1:8085/health"
 
@@ -179,6 +187,22 @@ conntrack_max_for_mem_kb() {
   echo "$v"
 }
 
+# Speed audit — every 3proxy runs as uid 65535 and relays with splice(): two
+# pipes per connection. Past fs.pipe-user-pages-soft (default 16384 pages =
+# 64 MiB per user, i.e. ~512 relayed connections node-wide) every NEW pipe of
+# that user gets 2 pages (8 KiB) instead of 16, so each relay step moves 8 KiB
+# (more syscalls / CPU per byte on a 2-vCPU box). The limit only bounds what
+# pipes MAY pin (in-flight data of slow readers), so it is sized by RAM: the
+# largest power of two <= MemTotal/32 in pages (1/8 of RAM), 16384..262144.
+# 2c/4GB (MemTotal ~3.8 GiB) -> 65536 pages = 256 MiB worst case, full 64 KiB
+# pipes for ~2048 concurrent relays. NETRUN_PIPE_USER_PAGES_SOFT overrides.
+pipe_pages_for_mem_kb() {
+  local kb="${1:-0}" v=16384
+  case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+  while [ "$v" -lt 262144 ] && [ $((v * 2)) -le $((kb / 32)) ]; do v=$((v * 2)); done
+  echo "$v"
+}
+
 # KEY VALUE into $SYSCTL_FILE: replaced in place or appended (other lines kept).
 set_sysctl_kv() {
   local key="$1" value="$2" ek tmp
@@ -260,12 +284,9 @@ net.core.somaxconn = 8192
 net.ipv4.ip_local_port_range = 1024 8000
 fs.file-max = 2097152
 
-# === TCP/IP fingerprint normalization (Android-like) ===
-# tcp_timestamps=1: Linux/Android default. =0 makes p0f read OS as Windows.
-# tcp_mtu_probing=1: PLPMTUD — discovers PMTU dynamically; safer than fixed
-# MSS-clamp (which produced MTU=1380 → p0f classified link as OpenVPN).
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_mtu_probing = 1
+# TCP/IP signature (timestamps, TTL, SACK, window, MTU probing): NOT here —
+# /etc/sysctl.d/99-zz-netrun-tcp.conf (deploy/node/99-zz-netrun-tcp.conf, audit
+# FP-01), which sorts after /etc/sysctl.conf.
 
 # === IPv6 multi-homed ===
 net.ipv6.conf.all.accept_ra = 2
@@ -286,15 +307,37 @@ net.ipv6.conf.default.accept_dad = 0
 net.ipv6.mld_max_msf = 1
 EOF
   configure_conntrack_persistence
-  # Strip any legacy tcp_timestamps line from /etc/sysctl.conf — old generator
-  # wrote =0 there, which is processed AFTER sysctl.d and would override our =1.
-  if [ -f /etc/sysctl.conf ]; then
-    sed -i -E '/^[[:space:]]*net\.ipv4\.tcp_timestamps[[:space:]]*=/d' /etc/sysctl.conf || true
-  fi
+  configure_pipe_limit
+  configure_tcp_signature
   # Tolerate "cannot stat" warnings (e.g. if a netfilter key still not exposed)
   sysctl --system >/dev/null 2>&1 || true
   sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" || true
   sysctl -p "$SYSCTL_IPV6_FILE" >/dev/null 2>&1 || true
+  sysctl -p "$SYSCTL_TCP_FILE" >/dev/null 2>&1 || true
+}
+
+configure_pipe_limit() {
+  local mem_kb pages
+  mem_kb="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || true)"
+  pages="${NETRUN_PIPE_USER_PAGES_SOFT:-$(pipe_pages_for_mem_kb "$mem_kb")}"
+  log "pipes: fs.pipe-user-pages-soft = $pages (MemTotal ${mem_kb:-?} kB)"
+  set_sysctl_kv fs.pipe-user-pages-soft "$pages"
+}
+
+# Audit FP-01 — the pinned TCP signature, from the repo, and the matching keys
+# out of /etc/sysctl.conf: the old generator wrote tcp_timestamps = 0 (and a
+# smaller tcp_rmem) there, which is applied AFTER /etc/sysctl.d.
+TCP_SIGNATURE_KEYS="net.ipv4.ip_default_ttl net.ipv4.tcp_timestamps net.ipv4.tcp_sack net.ipv4.tcp_window_scaling net.ipv4.tcp_ecn net.ipv4.tcp_rmem net.ipv4.route.min_adv_mss net.ipv4.tcp_mtu_probing"
+configure_tcp_signature() {
+  local src="$NETRUN_HOME/deploy/node/99-zz-netrun-tcp.conf" key ek
+  [ -f "$src" ] || die "missing $src"
+  install -m 0644 "$src" "$SYSCTL_TCP_FILE"
+  if [ -f /etc/sysctl.conf ]; then
+    for key in $TCP_SIGNATURE_KEYS; do
+      ek="$(printf '%s' "$key" | sed 's/[.]/\\./g')"
+      sed -i -E "/^[[:space:]]*${ek}[[:space:]]*=/d" /etc/sysctl.conf || true
+    done
+  fi
 }
 
 configure_file_limits() {
@@ -355,10 +398,14 @@ EOF
   chattr +i "$RESOLV_CONF" 2>/dev/null || true
 }
 
-# Local recursive resolver so proxy DNS egresses from THIS node (resolver IP ==
-# exit IP, geo/ASN-consistent) instead of leaking to Cloudflare/Google.
-# NOTE: this 3proxy build IGNORES the `nserver` directive and resolves via
-# /etc/resolv.conf — so the real lever is resolv.conf, not the cfg nserver lines.
+# Local recursive resolver so customer lookups stay on THIS node (same network
+# and ASN as the proxies) instead of leaking to Cloudflare/Google. The bundled
+# 3proxy 0.9.3 HONOURS the cfg `nserver` directive (h_nserver sets resolvfunc =
+# myresolver): every batch cfg says `nserver 127.0.0.1` / `nserver ::1`, i.e.
+# this unbound; resolv.conf is for the node's own tools. The recursion leaves
+# from the node's PRIMARY address, not a proxy's exit address: proxy anchors
+# are added deprecated (preferred_lft 0, audit FP-01), so the kernel never
+# picks one as a source.
 configure_unbound() {
   log "Installing local recursive resolver (unbound)"
   DEBIAN_FRONTEND=noninteractive apt-get install -y unbound >/dev/null 2>&1 \
@@ -403,7 +450,7 @@ nameserver 1.1.1.1
 options edns0 trust-ad timeout:2 attempts:1
 EOF
   chattr +i "$RESOLV_CONF" 2>/dev/null || true
-  log "unbound active; resolv.conf -> 127.0.0.1 (recursion egress = node IP)"
+  log "unbound active; resolv.conf -> 127.0.0.1 (recursion egress = node's primary IP)"
 }
 
 configure_nftables() {
@@ -416,17 +463,14 @@ configure_nftables() {
   # Flush the inherited ruleset first so we install ONLY our accounting tables.
   nft flush ruleset 2>/dev/null || true
   systemctl enable nftables >/dev/null 2>&1 || true
-  nft add table inet proxy_normalization 2>/dev/null || true
-  nft add chain inet proxy_normalization output '{ type filter hook output priority -150; policy accept; }' 2>/dev/null || true
-  nft add chain inet proxy_normalization postrouting '{ type filter hook postrouting priority -150; policy accept; }' 2>/dev/null || true
   nft add table inet proxy_accounting 2>/dev/null || true
   nft add chain inet proxy_accounting input '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
   nft add chain inet proxy_accounting output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
-  # MSS clamp 1460 (NOT 1340). Previous 1340 produced effective MTU=1380 which
-  # p0f classified as OpenVPN UDP link. 1460 = standard Ethernet MSS for MTU
-  # 1500 (Android default). PMTU edge cases are handled by tcp_mtu_probing=1
-  # in configure_sysctl above. (Incident 2026-05-23: TCP/IP fingerprint = Win+VPN)
-  nft add rule inet proxy_normalization output meta l4proto tcp tcp flags syn tcp option maxseg size set 1460 2>/dev/null || true
+  # Audit CLN-03 / FP-01 — no MSS rule and no inet proxy_normalization table any
+  # more: `tcp option maxseg size set 1460` was a no-op (nft can only LOWER an
+  # MSS, and the kernel already advertises 1460/1440 at MTU 1500), and the old
+  # 1340 clamp read as OpenVPN (incident 2026-05-23). The SYN is pinned by
+  # 99-zz-netrun-tcp.conf instead.
   # Now ruleset has ONLY our tables (no xt-compat) → valid for nft -f on boot
   nft list ruleset > /etc/nftables.conf
   systemctl restart nftables 2>/dev/null || systemctl start nftables 2>/dev/null || true
@@ -529,81 +573,12 @@ EOF
 
 # === CHANGES 2 + 3: bounded parallel restore + raised service limits ===
 install_3proxy_restore_unit() {
-  log "Installing 3proxy auto-restore systemd unit (v2: bounded parallel)"
-  mkdir -p "$(dirname "$RESTORE_SCRIPT")"
-  cat > "$RESTORE_SCRIPT" <<'RESTORESH'
-#!/usr/bin/env bash
-# v2: bounded parallel via xargs -P 4 + setsid detach.
-# v1 was `for cfg; do 3proxy & done` — that hit fork EAGAIN with 4000+ cfgs.
-set -u
+  log "Installing 3proxy auto-restore systemd unit (repo scripts/restore_3proxy.sh)"
+  [ -f "$RESTORE_SCRIPT" ] || die "missing $RESTORE_SCRIPT (copy_repo_to_opt)"
+  chmod +x "$RESTORE_SCRIPT" "$NETRUN_HOME/scripts/netrun-3proxy-spawn.sh" 2>/dev/null || true
+  rm -f "$LEGACY_RESTORE_SCRIPT"
 
-PROXY_BIN="/opt/netrun/proxyserver/3proxy/bin/3proxy"
-PROXY_CFG_DIR="/opt/netrun/proxyserver/3proxy"
-LOG_TAG="netrun-3proxy-restore"
-PARALLEL=4
-SLEEP_BETWEEN=0.3
-
-if [ ! -x "$PROXY_BIN" ]; then
-  logger -t "$LOG_TAG" "skip: 3proxy binary not found at $PROXY_BIN"
-  exit 0
-fi
-
-# Crank our own FD/proc limits
-ulimit -n 1048576 2>/dev/null || true
-ulimit -u unlimited 2>/dev/null || true
-
-# Snapshot what's already listening — one ss call, not per-port
-listening_ports=$(ss -tln 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | sort -u)
-
-# Build worklist of cfgs whose base-port isn't yet listening
-shopt -s nullglob
-worklist=$(mktemp)
-trap 'rm -f $worklist' EXIT
-for cfg in "$PROXY_CFG_DIR"/3proxy_*.cfg; do
-  [ -f "$cfg" ] || continue
-  port=$(basename "$cfg" .cfg | sed 's/3proxy_//')
-  if ! echo "$listening_ports" | grep -qx "$port"; then
-    printf '%s\n' "$cfg" >> "$worklist"
-  fi
-done
-
-total=$(wc -l < "$worklist")
-logger -t "$LOG_TAG" "v2 starting: total=$total, parallel=$PARALLEL"
-
-# Bounded parallel spawn with setsid (detach from systemd cgroup so each
-# 3proxy lives in its own session.scope — won't deplete service TasksMax)
-< "$worklist" xargs -n 1 -P "$PARALLEL" -I {} bash -c '
-  setsid "'"$PROXY_BIN"'" "{}" </dev/null >/dev/null 2>&1 & disown 2>/dev/null || true
-  sleep '"$SLEEP_BETWEEN"'
-' 2>/dev/null || true
-
-sleep 5
-active=$(ss -tln 2>/dev/null | grep -cE ':[1-9][0-9]{3,4} ' || echo 0)
-logger -t "$LOG_TAG" "v2 done: queued=$total, total_listening_after=$active"
-exit 0
-RESTORESH
-  chmod +x "$RESTORE_SCRIPT"
-
-  cat > "$RESTORE_SERVICE_FILE" <<EOF
-[Unit]
-Description=NETRUN — restore all 3proxy instances from saved cfg files (v2)
-After=network-online.target ${SERVICE_NAME}.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${RESTORE_SCRIPT}
-RemainAfterExit=yes
-StandardOutput=journal
-StandardError=journal
-TimeoutStartSec=900
-TasksMax=infinity
-LimitNOFILE=1048576
-LimitNPROC=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
+  install -m 0644 "$NETRUN_HOME/deploy/node/netrun-3proxy-restore.service" "$RESTORE_SERVICE_FILE"
 
   systemctl daemon-reload
   systemctl enable "$RESTORE_SERVICE_NAME" >/dev/null
@@ -686,8 +661,9 @@ echo "$ts threads=$threads 3proxy=$proc3 listen=$listening estab=$estab ipv6=$ip
 TREND
   chmod +x /opt/netrun/scripts/trend_monitor.sh
 
-  # cron.d (NOT root crontab — the generator owns its @reboot proxy-startup
-  # entries there; we must not touch them). cron.d format has a user field.
+  # cron.d (NOT root crontab: the generator still writes @reboot proxy-startup
+  # lines there and the agent's crontab hygiene removes them — batches start at
+  # boot from netrun-3proxy-restore). cron.d format has a user field.
   cat > /etc/cron.d/netrun-trend-monitor <<'EOF'
 # NETRUN trend monitor — метрики ноды каждые 5 мин в /var/log/netrun-trend.log
 */5 * * * * root /opt/netrun/scripts/trend_monitor.sh

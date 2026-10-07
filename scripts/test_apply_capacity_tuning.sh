@@ -118,6 +118,9 @@ case "\$*" in
   "list map inet proxy_accounting cmap_in") cat "$FIX/map_in.txt" ;;
   "list map inet proxy_accounting cmap_out") cat "$FIX/map_out.txt" ;;
   "list ruleset") echo "# ruleset after cleanup" ;;
+  "list table inet proxy_normalization") [ -n "\${NORM_DIR:-}" ] && [ -f "\$NORM_DIR/table.txt" ] && { cat "\$NORM_DIR/table.txt"; exit 0; }; exit 1 ;;
+  "-a list chain inet proxy_normalization output") [ -n "\${NORM_DIR:-}" ] && cat "\$NORM_DIR/output.txt" ;;
+  "-a list chain inet proxy_normalization postrouting") [ -n "\${NORM_DIR:-}" ] && cat "\$NORM_DIR/postrouting.txt" ;;
   -f\ *) cp "\$2" "$TMP/nft_batch.applied"; [ "\${NFT_FAIL:-0}" = 1 ] && { echo "Error: Could not process rule" >&2; exit 1; }; exit 0 ;;
   *) exit 1 ;;
 esac
@@ -130,6 +133,7 @@ if [ "\$1" = "-w" ]; then
   case "\$k" in
     net.ipv4.ip_local_port_range) printf '%s\t%s\n' "\${v%% *}" "\${v##* }" > "\$NETRUN_TUNE_ROOT/proc/sys/net/ipv4/ip_local_port_range" ;;
     net.netfilter.nf_conntrack_max) [ "\${SYSCTL_CT_FAIL:-0}" = 1 ] && exit 1; echo "\$v" > "\$NETRUN_TUNE_ROOT/proc/sys/net/netfilter/nf_conntrack_max" ;;
+    fs.pipe-user-pages-soft) echo "\$v" > "\$NETRUN_TUNE_ROOT/proc/sys/fs/pipe-user-pages-soft" ;;
   esac
 fi
 EOF
@@ -419,5 +423,102 @@ R="$(new_root ctfail)"
 rc="$(PATH="$BIN:$PATH" NETRUN_TUNE_ROOT="$R" SYSCTL_CT_FAIL=1 bash "$SCRIPT" --apply --only conntrack > "$TMP/out" 2>&1; echo $?)"
 [ "$rc" = 1 ] && grep -qE 'conntrack +FAILED' "$TMP/out" || { cat "$TMP/out"; fail "sysctl -w failure must be FAILED"; }
 ok "conntrack: --conntrack-max override/validation; no MemTotal refuses (exit 2); sysctl failure reports FAILED"
+
+# ── 16. units (opt-in, RES-11): restore unit -> repo, https-sync KillMode, no restarts ─
+REPO_ROOT="$(cd "$HERE/.." && pwd -P)"
+R="$(new_root units)"
+printf '[Service]\nExecStart=/opt/netrun/scripts/restore-3proxy.sh\n' > "$R/etc/systemd/system/netrun-3proxy-restore.service"
+printf '#!/usr/bin/env bash\n# heredoc copy\n' > "$R/opt/netrun/scripts/restore-3proxy.sh"
+printf '[Service]\nType=oneshot\nExecStart=/usr/local/sbin/netrun-https sync\n' > "$R/etc/systemd/system/netrun-https-sync.service"
+mkdir -p "$R/usr/local/sbin"; printf '#!/usr/bin/env bash\n# copy taken at setup\n' > "$R/usr/local/sbin/netrun-https"
+rc="$(run_tool "$R" --apply --only units)"
+[ "$rc" = 2 ] && grep -qE 'units +REFUSED .*restore_3proxy.sh' "$TMP/out" || { cat "$TMP/out"; fail "units must refuse before the code is deployed"; }
+cp "$REPO_ROOT/scripts/restore_3proxy.sh" "$REPO_ROOT/scripts/netrun-3proxy-spawn.sh" "$R/opt/netrun/scripts/"
+before="$(snapshot "$R")"
+rc="$(run_tool "$R" --only units)"
+[ "$rc" = 0 ] && [ "$before" = "$(snapshot "$R")" ] || { cat "$TMP/out"; fail "units dry-run changed files"; }
+chmod 0644 "$R/opt/netrun/scripts/restore_3proxy.sh"   # a deploy that lost the exec bit
+grep -qE 'units +would-apply .*restore-unit' "$TMP/out" || { cat "$TMP/out"; fail "units plan"; }
+rc="$(run_tool "$R" --only units)"
+grep -qE 'units +would-apply .*restore-unit exec-bits legacy-restore-script https-sync-killmode netrun-https-copy' "$TMP/out" || { cat "$TMP/out"; fail "units plan"; }
+rc="$(run_tool "$R" --apply --only units)"
+[ "$rc" = 0 ] || { cat "$TMP/out"; fail "units apply exit $rc"; }
+cmp -s "$REPO_ROOT/deploy/node/netrun-3proxy-restore.service" "$R/etc/systemd/system/netrun-3proxy-restore.service" || fail "restore unit not the repo unit"
+grep -qx 'ExecStart=/opt/netrun/scripts/restore_3proxy.sh' "$R/etc/systemd/system/netrun-3proxy-restore.service" || fail "restore unit ExecStart"
+[ ! -e "$R/opt/netrun/scripts/restore-3proxy.sh" ] || fail "legacy restore-3proxy.sh kept"
+grep -qx 'KillMode=process' "$R/etc/systemd/system/netrun-https-sync.service.d/10-killmode.conf" || fail "https-sync KillMode drop-in"
+cmp -s "$REPO_ROOT/scripts/netrun-https.sh" "$R/usr/local/sbin/netrun-https" || fail "netrun-https copy not refreshed"
+[ -x "$R/opt/netrun/scripts/restore_3proxy.sh" ] || fail "restore script not executable"
+grep -qx 'systemctl daemon-reload' "$CALLS" || fail "no daemon-reload"
+! grep -qE 'systemctl (start|stop|restart|reload) ' "$CALLS" || { cat "$CALLS"; fail "units step started/stopped something"; }
+rc="$(run_tool "$R" --apply --only units)"
+[ "$rc" = 0 ] && grep -qE '\] units +ok ' "$TMP/out" || { cat "$TMP/out"; fail "units rerun not ok"; }
+ok "units: restore unit -> repo restore_3proxy.sh (+ legacy copy gone), https-sync KillMode=process, netrun-https refreshed, daemon-reload only; refuses before the code deploy"
+
+# ── 17. fingerprint (opt-in, FP-01): TCP pins, sysctl.conf purge, normalization rules ─
+R="$(new_root fp)"
+printf 'net.ipv4.tcp_timestamps = 0\nnet.ipv4.tcp_rmem = 4096 87380 6291456\nnet.ipv4.icmp_echo_ignore_all = 1\nvm.swappiness = 10\n' > "$R/etc/sysctl.conf"
+mkdir -p "$R/opt/netrun/node_runtime/soft/generator"
+echo '# new generator' > "$R/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh"
+ND="$TMP/norm"; mkdir -p "$ND"
+printf 'table inet proxy_normalization {\n\tchain output {\n\t\ttcp flags syn tcp option maxseg size set 1340\n\t}\n}\n' > "$ND/table.txt"
+printf 'table inet proxy_normalization { # handle 9\n\tchain output { # handle 1\n\t\ttype filter hook output priority -150; policy accept;\n\t\tmeta l4proto tcp tcp flags syn tcp option maxseg size set 1340 # handle 4\n\t\tct state invalid drop # handle 5\n\t}\n}\n' > "$ND/output.txt"
+printf 'table inet proxy_normalization { # handle 9\n\tchain postrouting { # handle 2\n\t\ttype filter hook postrouting priority -150; policy accept;\n\t\tmeta l4proto tcp ip6 hoplimit set 64 # handle 7\n\t}\n}\n' > "$ND/postrouting.txt"
+before="$(snapshot "$R")"
+rc="$(NORM_DIR="$ND" run_tool "$R" --only fingerprint)"
+[ "$rc" = 0 ] && [ "$before" = "$(snapshot "$R")" ] || { cat "$TMP/out"; fail "fingerprint dry-run changed files"; }
+grep -q '1340 = reads as OpenVPN' "$TMP/out" || { cat "$TMP/out"; fail "audit: 1340 clamp not flagged"; }
+grep -qE 'fingerprint +would-apply .*tcp-signature-file sysctl.conf:net.ipv4.tcp_timestamps net.ipv4.tcp_rmem nft-normalization-rules:3 nft-normalization-table' "$TMP/out" || { cat "$TMP/out"; fail "fingerprint plan"; }
+: > "$R/opt/netrun/jobs/.generation.lock"
+rc="$(NORM_DIR="$ND" run_tool "$R" --apply --only fingerprint)"
+[ "$rc" = 2 ] && grep -qE 'fingerprint +REFUSED .*generation' "$TMP/out" || { cat "$TMP/out"; fail "fingerprint must refuse under the genlock"; }
+rm -f "$R/opt/netrun/jobs/.generation.lock" "$TMP/nft_batch.applied"
+rc="$(NORM_DIR="$ND" run_tool "$R" --apply --only fingerprint)"
+[ "$rc" = 0 ] || { cat "$TMP/out"; fail "fingerprint apply exit $rc"; }
+cmp -s "$REPO_ROOT/deploy/node/99-zz-netrun-tcp.conf" "$R/etc/sysctl.d/99-zz-netrun-tcp.conf" || fail "TCP signature file"
+! grep -qE 'tcp_timestamps|tcp_rmem' "$R/etc/sysctl.conf" || fail "pinned keys left in /etc/sysctl.conf"
+grep -qx 'net.ipv4.icmp_echo_ignore_all = 1' "$R/etc/sysctl.conf" && grep -qx 'vm.swappiness = 10' "$R/etc/sysctl.conf" || fail "unrelated sysctl.conf lines removed"
+ls "$R/etc/" | grep -q '^sysctl.conf.bak-fingerprint-' || fail "no sysctl.conf backup"
+grep -qx "sysctl -p $R/etc/sysctl.d/99-zz-netrun-tcp.conf" "$CALLS" || fail "pins not applied at runtime"
+printf 'delete rule inet proxy_normalization output handle 4\ndelete rule inet proxy_normalization output handle 5\ndelete rule inet proxy_normalization postrouting handle 7\ndelete table inet proxy_normalization\n' > "$TMP/want_norm"
+cmp -s "$TMP/want_norm" "$TMP/nft_batch.applied" || { cat "$TMP/nft_batch.applied"; fail "normalization batch"; }
+grep -q 'ruleset after cleanup' "$R/etc/nftables.conf" || fail "ruleset not persisted"
+! grep -qi '3proxy' "$CALLS" || fail "fingerprint touched 3proxy"
+# An OLD generator (still checks for the table): rules go, the table stays.
+echo 'nft list table inet proxy_normalization' > "$R/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh"
+rm -f "$TMP/nft_batch.applied"
+rc="$(NORM_DIR="$ND" run_tool "$R" --apply --only fingerprint)"
+[ "$rc" = 0 ] && ! grep -q 'delete table' "$TMP/nft_batch.applied" || { cat "$TMP/out"; fail "table deleted although the generator still needs it"; }
+rc="$(run_tool "$R" --apply --only fingerprint)"
+[ "$rc" = 0 ] && grep -qE '\] fingerprint +ok ' "$TMP/out" || { cat "$TMP/out"; fail "fingerprint rerun not ok"; }
+ok "fingerprint: 99-zz TCP pins + runtime, pinned keys out of /etc/sysctl.conf (backup; others kept), MSS 1340/ct/hoplimit rules + table removed in one nft -f; genlock refuses"
+
+# ── 18. pipes (opt-in): RAM-sized fs.pipe-user-pages-soft, only raised ─
+R="$(new_root pipes)"
+mkdir -p "$R/proc/sys/fs"; echo 16384 > "$R/proc/sys/fs/pipe-user-pages-soft"
+rc="$(run_tool "$R" --only pipes)"
+[ "$rc" = 0 ] && grep -qE "pipes +would-apply +fs.pipe-user-pages-soft -> 65536 pages \(MemTotal 3911456 kB\)" "$TMP/out" || { cat "$TMP/out"; fail "pipes plan"; }
+rc="$(run_tool "$R" --apply --only pipes)"
+[ "$rc" = 0 ] && [ "$(cat "$R/proc/sys/fs/pipe-user-pages-soft")" = 65536 ] || { cat "$TMP/out"; fail "pipes not raised"; }
+grep -qx 'fs.pipe-user-pages-soft = 65536' "$R/etc/sysctl.d/99-netrun.conf" || fail "pipes not persisted"
+echo 262144 > "$R/proc/sys/fs/pipe-user-pages-soft"
+rc="$(run_tool "$R" --apply --only pipes)"
+[ "$rc" = 0 ] && [ "$(cat "$R/proc/sys/fs/pipe-user-pages-soft")" = 262144 ] || fail "pipes lowered a higher runtime value"
+rc="$(run_tool "$R" --only pipes --pipe-pages 100)"; [ "$rc" = 1 ] || fail "--pipe-pages below 16384 accepted"
+for src in "$HERE/../install_node_v2.sh" "$HERE/node_followup_v2.sh" "$SCRIPT"; do
+  ( eval "$(sed -n '/^pipe_pages_for_mem_kb() {/,/^}/p' "$src")"
+    [ "$(pipe_pages_for_mem_kb 3911456)" = 65536 ] && [ "$(pipe_pages_for_mem_kb 1011712)" = 16384 ] \
+      && [ "$(pipe_pages_for_mem_kb 7990000)" = 131072 ] && [ "$(pipe_pages_for_mem_kb 64000000)" = 262144 ] \
+      && [ "$(pipe_pages_for_mem_kb "")" = 16384 ] ) || fail "pipe formula differs in $src"
+done
+ok "pipes: 2c/4GB -> 65536 pages persisted + raised, never lowered, same formula in installer / follow-up / tuning"
+
+# ── 19. audit: legacy third-party nserver + ephemeral overlap are reported ─
+R="$(new_root dnsaudit)"
+printf 'daemon\nnserver 1.0.0.19\nnserver 2a0d:2a00:1::\nflush\nsocks -6 -a -p33000 -i45.32.10.20 -e2001:db8::9\n' > "$R/opt/netrun/proxyserver/3proxy/3proxy_33000.cfg"
+rc="$(run_tool "$R" --only unbound)"
+grep -q 'WARNING 1 batch cfg(s) send customer DNS to third-party resolvers (legacy geo seed): 3proxy_33000.cfg' "$TMP/out" || { cat "$TMP/out"; fail "legacy DNS audit"; }
+grep -q 'ip_local_port_range 10000 65000 overlaps the proxy ports' "$TMP/out" || { cat "$TMP/out"; fail "ephemeral overlap audit"; }
+ok "audit: third-party nserver cfgs and an ephemeral range overlapping the proxy ports are reported (read-only)"
 
 echo "test_apply_capacity_tuning.sh — all $PASS checks passed"

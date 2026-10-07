@@ -22,7 +22,7 @@ The script does **not** reimplement install logic. It only invokes the baked v2
 scripts already in this repo:
 
 - `install_node_v2.sh --clean --remove-legacy-root` — unbound recursive
-  resolver, nftables Android-like TCP fingerprint (MSS 1460), raised
+  resolver, pinned TCP signature (deploy/node/99-zz-netrun-tcp.conf; no MSS clamp), raised
   sysctl/pid/FD limits, `netrun-node-agent` + `netrun-3proxy-restore` units,
   `/health` gate on `:8085`.
 - `scripts/node_followup_v2.sh` — `netrun-watchdog` (v3, two-tier:

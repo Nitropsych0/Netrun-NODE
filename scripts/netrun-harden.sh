@@ -23,6 +23,7 @@ set -euo pipefail
 PROXY_ROOT="${NODE_AGENT_PROXY_ROOT:-/opt/netrun/proxyserver}"
 CFG_DIR="$PROXY_ROOT/3proxy"
 BIN="$CFG_DIR/bin/3proxy"
+SPAWN_HELPER="${NETRUN_3PROXY_SPAWN:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/netrun-3proxy-spawn.sh}"
 AGENT_UNIT="netrun-node-agent"
 AGENT_DROPIN_DIR="/etc/systemd/system/${AGENT_UNIT}.service.d"
 AGENT_KEY_FILE="$AGENT_DROPIN_DIR/20-api-key.conf"
@@ -78,9 +79,15 @@ restart_cfg() {
   pids="$(pgrep -f "3proxy[^ ]* [^ ]*/$(basename "$cfg")\$" || true)"
   [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
   case "$cfg" in *.disabled) return 0 ;; esac   # disabled batches stay down
-  # Respawn in its OWN systemd scope (the cfg has `daemon`, so 3proxy forks and
-  # systemd-run returns): run from an SSH session, a plain nohup would leave the
-  # batch inside that session's scope.
+  # Audit RES-11 — the node's one spawn helper: its own systemd scope (run from
+  # an SSH session, a plain nohup would leave the batch inside that session's
+  # scope), idempotent, never a duplicate.
+  if [ -f "$SPAWN_HELPER" ]; then
+    NETRUN_3PROXY_BIN="$BIN" bash "$SPAWN_HELPER" "$cfg" >/dev/null 2>&1 \
+      || log "WARNING: spawn helper failed for $(basename "$cfg") (the agent's supervisor retries)"
+    return 0
+  fi
+  # No helper on this node: the previous inline start.
   # No fallback after systemd-run: the daemonizing parent's exit code is not a
   # launch failure, and a second spawn would start a duplicate 3proxy.
   if command -v systemd-run >/dev/null 2>&1; then
