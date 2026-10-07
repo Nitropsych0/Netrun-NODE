@@ -263,6 +263,13 @@ bash scripts/apply_capacity_tuning.sh --only units,fingerprint,pipes,ipv6restore
 bash scripts/apply_capacity_tuning.sh --apply --only units,fingerprint,pipes,ipv6restore   # no restarts
 ```
 
+Before the first agent restart with the supervisor on an existing node: if
+`/health cfgsDown > 0`, check those start ports against the orchestrator's
+inventory for the node. A down cfg whose cfg file predates the boot is
+respawned about 3 min after the restart; one the orchestrator does not know (a
+ghost or a failed generation's leftover) should be renamed to `*.cfg.disabled`
+first (never started), or watch `/health supervisor.pendingDown` in that window.
+
 Tests: `bash scripts/test_3proxy_spawn.sh`, `bash scripts/test_generator_flags.sh`,
 `bash scripts/test_apply_capacity_tuning.sh`, `bash scripts/test_capacity_18k_node.sh`,
 `cd node_runtime/node_agent && node --test` (`supervisor`, `firewall`, `proxy_spawn`,

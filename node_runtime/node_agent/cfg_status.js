@@ -113,7 +113,8 @@ function parseCfgSummary(text) {
 
 // "[2001:db8::1]" / "127.0.0.1%lo" / "::FFFF:1.2.3.4" -> the bare lowercase address.
 function normalizeListenAddr(addr) {
-  return String(addr || "").trim().replace(/^\[/, "").replace(/\]$/, "").replace(/%.*$/, "").toLowerCase();
+  // The zone first: ss prints a device-bound socket as "[::1]%lo".
+  return String(addr || "").trim().replace(/%.*$/, "").replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
 }
 
 const WILDCARD_ADDRS = new Set(["", "*", "0.0.0.0", "::"]);

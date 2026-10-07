@@ -41,10 +41,11 @@ const VALID_MODES = new Set(["ipv6_only", "dualstack"]);
 // Egress family flag per mode. dualstack = -64 (v4+v6), ipv6_only = -6.
 const FLAG_FOR_MODE = { dualstack: "-64", ipv6_only: "-6" };
 
-// 3proxy treats SIGTERM as GRACEFUL (it keeps in-flight connections alive and
-// HOLDS the listening socket until they drain). Mirror accounting.disablePort:
-// after SIGTERM wait this grace, then SIGKILL survivors so the -p<port> socket
-// is actually free before we respawn (same lesson as the metering SIGKILL fix).
+// 3proxy treats SIGTERM as GRACEFUL: 0.9.3 pauses its services (conf.paused++)
+// and closes the listening sockets within about 1 s, but keeps in-flight
+// connections alive while they drain. Mirror accounting.disablePort: after
+// SIGTERM wait this grace, then SIGKILL survivors so nothing of the old
+// process is left when we respawn (same lesson as the metering SIGKILL fix).
 const EGRESS_RESTART_GRACE_MS = Number(process.env.EGRESS_RESTART_GRACE_MS) || 2000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

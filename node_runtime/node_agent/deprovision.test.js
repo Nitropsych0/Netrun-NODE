@@ -123,4 +123,27 @@ const CFG = [
   eq(plan.wholeBatch, false, "not a whole-batch drop");
 }
 
-console.log(`deprovision.test.js: ${passed} assertions passed`);
+// ── 6. kill waits until a SIGKILLed process is really gone ──────────
+// (audit N2 review correctness#1: the spawn helper must never see the dying
+// process as the running batch). A child that ignores SIGTERM stands in.
+async function killWaitTest() {
+  const { spawn } = require("child_process");
+  const sp = 59000 + (process.pid % 900);
+  const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)", `3proxy_${sp}.cfg`], {
+    stdio: "ignore",
+  });
+  await new Promise((r) => setTimeout(r, 300));
+  try {
+    const res = await deprov.killCfgProcess(sp);
+    eq(res.killed, 1, "one process found");
+    eq(res.forceKilled, 1, "SIGTERM ignored -> SIGKILLed");
+    eq(res.stillAlive, 0, "gone before killCfgProcess returns");
+  } finally {
+    try { child.kill("SIGKILL"); } catch {}
+  }
+}
+
+killWaitTest().then(
+  () => console.log(`deprovision.test.js: ${passed} assertions passed`),
+  (err) => { console.error(err); process.exitCode = 1; }
+);

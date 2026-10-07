@@ -37,7 +37,7 @@ fi
 DEPRECATE="${NETRUN_ANCHOR_DEPRECATE:-}"
 ENV_FILE="${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}"
 if [ -z "$DEPRECATE" ] && [ -r "$ENV_FILE" ]; then
-  DEPRECATE="$(awk -F= '{ sub(/^[ \t]+/, "", $1) } $1 == "NETRUN_ANCHOR_DEPRECATE" { v = $2 } END { gsub(/["\047 \t\r]/, "", v); print v }' "$ENV_FILE")"
+  DEPRECATE="$(awk -F= '{ sub(/^[ \t]+/, "", $1); sub(/[ \t]+$/, "", $1) } $1 == "NETRUN_ANCHOR_DEPRECATE" { v = $2 } END { gsub(/["\047 \t\r]/, "", v); print v }' "$ENV_FILE")"
 fi
 LFT=""
 case "$(printf '%s' "${DEPRECATE:-1}" | tr '[:upper:]' '[:lower:]')" in 0|off|false|no) ;; *) LFT=" preferred_lft 0" ;; esac

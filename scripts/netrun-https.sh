@@ -120,8 +120,8 @@ restart_cfg() {
   local cfg="$1" pids survivors
   pids="$(pids_for_cfg "$cfg")"
   if [ -n "$pids" ]; then
-    # SIGTERM is graceful in 3proxy (it holds the listener while connections
-    # drain) — SIGKILL survivors so the ports are free for the respawn.
+    # SIGTERM is graceful in 3proxy (listeners close within ~1 s, open
+    # connections drain) — SIGKILL survivors so nothing old is left at the respawn.
     kill $pids 2>/dev/null || true
     sleep 2
     survivors="$(pids_for_cfg "$cfg")"
@@ -138,7 +138,8 @@ restart_cfg() {
     NETRUN_3PROXY_BIN="$PROXY_BIN" bash "$SPAWN_HELPER" "$cfg" >/dev/null 2>&1 \
       || log "WARNING: spawn helper failed for $(basename "$cfg") (the agent's supervisor retries)"
   else
-    bash -c "ulimit -n 600000; ulimit -u 600000; exec '$PROXY_BIN' '$cfg'" </dev/null >/dev/null 2>&1 &
+    # 9>&-: the sync lock fd (with_sync_lock) must not live on in the daemon.
+    bash -c "ulimit -n 600000; ulimit -u 600000; exec '$PROXY_BIN' '$cfg'" </dev/null >/dev/null 2>&1 9>&- &
     sleep 1
   fi
 }

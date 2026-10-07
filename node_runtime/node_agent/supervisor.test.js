@@ -512,6 +512,20 @@ test("planAnchors: preferred nodad addresses no active cfg lists (deprovisioned 
   const noIface = sup.planAnchors([{ egress: ["2001:db8:0:1::a"] }], rows, { iface: null });
   assert.strictEqual(noIface.orphans, 0, "no egress interface known: only cfg anchors");
   assert.strictEqual(noIface.preferredNodad, null);
+  // A primary that itself carries nodad (hand-added, DAD off): no preferred
+  // address without nodad is left, so no orphan is deprecated (cfg anchors still are).
+  const nodadPrimary = sup.parseIfInet6Rows(
+    [
+      inet6Line("2001:db8:0:1:5400:6ff:febe:b5cf", { plen: 64, flags: 0x02 }), // primary, nodad
+      inet6Line("2001:db8:0:1::a", { flags: 0x82 }),
+      inet6Line("2001:db8:0:1::e", { flags: 0x82 }),
+    ].join("\n")
+  );
+  const held = sup.planAnchors([{ egress: ["2001:db8:0:1::a"] }], nodadPrimary, { iface: "enp1s0" });
+  assert.deepStrictEqual(held.pendingDeprecate.map((p) => p.addr), ["2001:db8:0:1:0:0:0:a"]);
+  assert.strictEqual(held.orphans, 0);
+  assert.strictEqual(held.orphansHeld, 2, "the primary and the old anchor are held back");
+  assert.strictEqual(held.preferredNonNodad, 0);
 });
 
 test("tick: orphan anchors deprecated in the same batch; /health preferredNodad reaches 0", async () => {

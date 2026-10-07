@@ -213,11 +213,13 @@ function planAnchors(cfgs, rows, { iface = null } = {}) {
     }
   }
   let orphans = 0;
+  let orphansHeld = 0;
   let preferredNodad = null;
   let preferredNonNodad = null;
   if (iface) {
     preferredNodad = 0;
     preferredNonNodad = 0;
+    const orphanRows = [];
     for (const [hex, r] of rows) {
       if (r.ifname !== iface || r.scope !== 0 || (r.flags & (IFA_F_DEPRECATED | IFA_F_TENTATIVE))) continue;
       if (!(r.flags & IFA_F_NODAD)) {
@@ -226,11 +228,21 @@ function planAnchors(cfgs, rows, { iface = null } = {}) {
       }
       preferredNodad += 1;
       if (expected.has(hex)) continue; // in the list above already
-      pendingDeprecate.push({ addr: hexToIpv6(hex), plen: r.plen, ifname: r.ifname, orphan: true });
-      orphans += 1;
+      orphanRows.push([hex, r]);
+    }
+    // The primary is the one address without nodad. With none left preferred
+    // (a primary that itself carries nodad: hand-added / DAD off), an orphan
+    // could be the primary — deprecate no orphan then (logged by the tick).
+    if (preferredNonNodad > 0) {
+      for (const [hex, r] of orphanRows) {
+        pendingDeprecate.push({ addr: hexToIpv6(hex), plen: r.plen, ifname: r.ifname, orphan: true });
+        orphans += 1;
+      }
+    } else {
+      orphansHeld = orphanRows.length;
     }
   }
-  return { expected: expected.size, missing, pendingDeprecate, orphans, preferredNodad, preferredNonNodad };
+  return { expected: expected.size, missing, pendingDeprecate, orphans, orphansHeld, preferredNodad, preferredNonNodad };
 }
 
 function readdBatchText(addrs, iface, { deprecate = true } = {}) {
@@ -344,6 +356,7 @@ function createSupervisor({
   // the forget must not mark the port seen again from it.
   const forgotten = new Map();
   let forgetEpoch = 0;
+  let orphansHeldLogged = false; // the "no preferred primary" warning, once per process
   // The batches seen serving since boot, the respawn history of the last hour
   // and the failed marks survive an agent restart (a watchdog restart, an OOM
   // kill, a deploy): the status file lives on /run (tmpfs), so a reboot starts
@@ -592,6 +605,13 @@ function createSupervisor({
     stats.addressesMissing = plan.missing.length;
     stats.preferredNonNodad = plan.preferredNonNodad;
     stats.preferredNodad = plan.preferredNodad;
+    if (plan.orphansHeld > 0 && !orphansHeldLogged) {
+      orphansHeldLogged = true;
+      log.warn(
+        `[supervisor] ${plan.orphansHeld} preferred nodad address(es) on ${iface} no cfg lists, but no preferred address without nodad ` +
+          "(the primary) — not deprecating them (one could be the primary)"
+      );
+    }
     let outcome = "ok";
     if (settings.readdAnchors && plan.missing.length > 0) {
       if (!iface) {

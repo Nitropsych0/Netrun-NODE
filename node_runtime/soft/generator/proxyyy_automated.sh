@@ -14,7 +14,7 @@ fi
 function netrun_setting() {
   local key="$1" def="$2" v="${!1:-}" f="${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}"
   if [ -z "$v" ] && [ -r "$f" ]; then
-    v="$(awk -v k="$key" '{ sub(/^[ \t]+/, "") } index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { gsub(/^["\047 \t]+|["\047 \t\r]+$/, "", v); print v }' "$f")"
+    v="$(awk -v k="$key" '{ sub(/^[ \t]+/, "") } match($0, "^" k "[ \t]*=") { v = substr($0, RLENGTH + 1) } END { gsub(/^["\047 \t]+|["\047 \t\r]+$/, "", v); print v }' "$f")"
   fi
   printf '%s' "${v:-$def}"
 }

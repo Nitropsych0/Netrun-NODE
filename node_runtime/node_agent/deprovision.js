@@ -52,6 +52,8 @@ const HTTP_PORT_OFFSET = 10000; // paired http port = socks port - 10000
 // only multiplies across every affected cfg (a 250-port spread can touch dozens
 // of cfgs), which is what timed out the first prod run at 1500ms × N.
 const KILL_GRACE_MS = Number(process.env.NODE_AGENT_DEPROV_GRACE_MS || 300);
+// After SIGKILL: how long to wait for the process to be gone (polled every 50 ms).
+const KILL_WAIT_MS = Number(process.env.NODE_AGENT_DEPROV_KILL_WAIT_MS || 5000);
 const CFG_NAME_RE = /^3proxy_(\d+)\.cfg$/;
 
 function sleep(ms) {
@@ -177,15 +179,27 @@ async function killCfgProcess(startPort) {
   await sleep(KILL_GRACE_MS);
   let survivors = await findCfgPids(startPort);
   for (const pid of survivors) { try { process.kill(pid, "SIGKILL"); } catch {} }
-  if (survivors.length) await sleep(200);
-  return { killed: pids.length, forceKilled: survivors.length };
+  const forceKilled = survivors.length;
+  // Audit N2 review (correctness#1) — a SIGKILLed 3proxy (thousands of
+  // threads) can take a moment to go: wait, bounded, until pgrep no longer sees
+  // it, so the spawn helper's idempotency check never takes the dying process
+  // for the running batch and skips the respawn.
+  const deadline = Date.now() + KILL_WAIT_MS;
+  while (survivors.length && Date.now() < deadline) {
+    await sleep(50);
+    survivors = await findCfgPids(startPort);
+  }
+  return { killed: pids.length, forceKilled, stillAlive: survivors.length };
 }
 
 // Audit RES-11 — through the node's spawn helper (own systemd scope; the
 // direct detached start where the helper is absent).
-async function spawnCfg(cfgPath) {
+// After a kill, "already-running" / "already-listening" means the helper saw
+// the old process, not a new one: a failure, never an ok.
+async function spawnCfg(cfgPath, { afterKill = false } = {}) {
   const res = await proxySpawn.spawn3proxyCfg(cfgPath, { bin: PROXY_BIN });
   if (!res.ok) throw new Error(`respawn_failed:${res.detail || res.outcome}`);
+  if (afterKill && /^already/.test(String(res.outcome || ""))) throw new Error(`respawn_failed:${res.outcome}_after_kill`);
   return res.pid;
 }
 
@@ -315,8 +329,9 @@ async function deprovisionPorts(rawPorts) {
           const tmp = cfgPath + ".deprov.tmp";
           fs.writeFileSync(tmp, body);
           fs.renameSync(tmp, cfgPath);
-          await killCfgProcess(startPort);
-          rec.respawnPid = await spawnCfg(cfgPath);
+          const kill = await killCfgProcess(startPort);
+          if (kill.stillAlive) throw new Error("respawn_failed:old_process_still_running");
+          rec.respawnPid = await spawnCfg(cfgPath, { afterKill: kill.killed > 0 });
         }
       });
       for (const b of removeBlocks) {
@@ -369,6 +384,7 @@ module.exports = {
   parseCfg,
   planRewrite,
   nftCleanup,
+  killCfgProcess,
   PROXY_CFG_DIR,
   NFT_TABLE,
 };
