@@ -3634,6 +3634,14 @@ async function handleGenerate(req, res) {
       },
     });
   } finally {
+    // Audit N2 review — a ready batch is supervised at once (see markServing).
+    if (jobReady) {
+      try {
+        supervisor.markServing([params.startPort]);
+      } catch (markError) {
+        console.warn("[supervisor] markServing after generation failed", markError && markError.message ? markError.message : String(markError));
+      }
+    }
     if (credentialsFileCreated && !jobReady) {
       try {
         if (!(await fileExists(cfgPath))) await safeUnlink(credentialsPath);
@@ -3875,7 +3883,8 @@ const firewall = firewallLib.createFirewall({
   readLock: liveGenerationLock,
   ensureInfra: () => accounting.ensurePergbBlockInfra(),
   updateBlockedList: (fn) => accounting.updateBlockedList(fn),
-  protectedPorts: [PORT, 22, 53, 80, 443],
+  // 8953: unbound-control (127.0.0.1) sits inside the http-mirror window.
+  protectedPorts: [PORT, 22, 53, 80, 443, 8953],
 });
 
 // Audit FP-01 / speed — node tuning that silently breaks proxies or the

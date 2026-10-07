@@ -504,12 +504,38 @@ function createFirewall({
     return { ok: true, ports: hygieneLib.parseListeningPorts(res.stdout) };
   }
 
+  // Ports a generation lift kept (an old occupant still listened on them;
+  // `exclude`): while that generation holds the lock they are NOT in-flight —
+  // a push or re-apply in that window keeps their drops instead of lifting
+  // them. Cleared once no generation holds the lock, and by the next lift.
+  let liftKept = new Set();
+
   async function inFlightPorts() {
+    let ports;
     try {
-      return inFlightFromLock(await readLock());
+      ports = inFlightFromLock(await readLock());
     } catch {
-      return new Set();
+      ports = new Set();
     }
+    if (ports.size === 0) {
+      liftKept = new Set();
+      return ports;
+    }
+    for (const p of liftKept) ports.delete(p);
+    return ports;
+  }
+
+  // After nft -f: a toggle that landed while it ran (seq > planSeq) may have
+  // been overwritten by the plan's own add / destroy of the same port (the
+  // accounting nft call and ours race). Put its intent back.
+  async function reassertLate(applied, planSeq, label) {
+    const late = expandToggles(toggles, newerThan(planSeq));
+    if (late.size === 0) return;
+    const add = applied.remove.filter((p) => late.has(p) && late.get(p).blocked);
+    const remove = applied.add.filter((p) => late.has(p) && !late.get(p).blocked);
+    if (add.length === 0 && remove.length === 0) return;
+    const res = await applyNft({ add, remove });
+    log.warn(`[firewall] ${label}: ${add.length + remove.length} port(s) toggled during nft -f re-asserted${res.ok ? "" : ` — FAILED: ${res.error}`}`);
   }
 
   // Ports of cfgs written at/after cutoffMs (a batch the push cannot know).
@@ -641,7 +667,9 @@ function createFirewall({
         return { status: 409, body: { success: false, error: refusal, maxNewBlocks: settings.maxNewBlocks, ...extra, report: base } };
       }
       if (dryRun) return { status: 200, body: { success: true, applied: false, report: report("push", base) } };
-      const nft = await applyNft(dropOvertaken(plan, planSeq));
+      const applied = dropOvertaken(plan, planSeq);
+      const nft = await applyNft(applied);
+      if (nft.ok) await reassertLate(applied, planSeq, "push");
       if (!nft.ok) {
         log.error(`[firewall] push: nft -f failed: ${nft.error}`);
         return { status: 500, body: { success: false, error: "nft_failed", detail: nft.error, report: report("push", { ...base, ok: false }) } };
@@ -705,7 +733,9 @@ function createFirewall({
         protectedPorts: protectedSet,
         ghostPorts: new Set(state.ghostPorts || []),
       });
-      const nft = await applyNft(dropOvertaken(plan, planSeq));
+      const applied = dropOvertaken(plan, planSeq);
+      const nft = await applyNft(applied);
+      if (nft.ok) await reassertLate(applied, planSeq, `re-apply (${reason})`);
       if (!nft.ok) {
         log.error(`[firewall] re-apply (${reason}): nft -f failed: ${nft.error}`);
         return report("reapply", { reason, ok: false, error: nft.error });
@@ -746,6 +776,7 @@ function createFirewall({
     for (const p of exclude || []) {
       if (want.delete(p)) kept.push(p);
     }
+    liftKept = new Set(kept);
     if (kept.length) {
       log.warn(`[firewall] lift (${reason}): ${kept.length} port(s) still have a listener — their blocks stay, e.g. ${sorted(kept).slice(0, 5).join(",")}`);
     }

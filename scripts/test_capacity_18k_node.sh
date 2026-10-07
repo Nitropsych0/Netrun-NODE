@@ -221,6 +221,20 @@ ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -
   exit 0
 ) || fail "netrun-https: reload-on-change + reload stamp"
 grep -q 'with_sync_lock cmd_sync' "$HTTPS" || fail "netrun-https: sync not serialized with flock"
+# renew: the ACME exchange (lego, minutes when the CA is slow) runs OUTSIDE the
+# sync lock; only the PEM swap + reload + stamp take it.
+(
+  eval "$(sed -n '/^cmd_renew() {/,/^}/p' "$HTTPS")"
+  CALLS="$TMP/renew_calls"; : > "$CALLS"
+  lego_obtain() { echo "lego locked=${LOCKED:-0}" >> "$CALLS"; }
+  with_sync_lock() { LOCKED=1 "$@"; }
+  cmd_renew_apply() { echo "apply locked=${LOCKED:-0}" >> "$CALLS"; }
+  cmd_renew
+  [ "$(tr '\n' ' ' < "$CALLS")" = "lego locked=0 apply locked=1 " ] || { cat "$CALLS"; exit 1; }
+) || fail "netrun-https renew: lego must run outside the sync lock"
+grep -qE '^  renew\) cmd_renew ;;' "$HTTPS" || fail "netrun-https: renew must not take the lock around lego"
+grep -q 'NETRUN_HTTPS_LOCK_WAIT_SEC=60 /usr/local/sbin/netrun-https sync' "$ROOT_DIR/node_runtime/soft/generator/proxyyy_automated.sh" \
+  || fail "generator: in-line netrun-https sync without a short lock wait"
 grep -q '^KillMode=process$' "$HTTPS" || fail "netrun-https: sync unit without KillMode=process"
 grep -q 'bash "$SPAWN_HELPER" "$cfg"' "$HTTPS" || fail "netrun-https: restart_cfg not via the spawn helper"
 grep -q 'bash "$SPAWN_HELPER" "$cfg"' "$ROOT_DIR/scripts/netrun-harden.sh" || fail "netrun-harden: restart_cfg not via the spawn helper"

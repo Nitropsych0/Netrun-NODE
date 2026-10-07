@@ -839,7 +839,8 @@ $dns_nserver_lines
 
 	# HTTPS frontend: put this instance's HTTP ports behind haproxy right away
 	# (the netrun-https-sync timer would otherwise pick them up within 5 min).
-	if [ -x /usr/local/sbin/netrun-https ]; then /usr/local/sbin/netrun-https sync >/dev/null 2>&1 || true; fi
+	# A short lock wait: never stall the generation behind another sync for long.
+	if [ -x /usr/local/sbin/netrun-https ]; then NETRUN_HTTPS_LOCK_WAIT_SEC=60 /usr/local/sbin/netrun-https sync >/dev/null 2>&1 || true; fi
 
 	# NOTE: We do NOT delete old IPv6 addresses - they belong to other instances!
 

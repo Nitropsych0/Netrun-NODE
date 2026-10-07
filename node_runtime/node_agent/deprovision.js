@@ -62,14 +62,14 @@ function sleep(ms) {
 
 // Self-contained exec helper (mirrors accounting.js; intentionally NOT shared so
 // this never perturbs the money-path module). Never throws — returns {code,stdout,stderr}.
-function execCapture(cmd, args, { timeoutMs = 8000 } = {}) {
+function execCapture(cmd, args, { timeoutMs = 8000, env = undefined } = {}) {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
     let settled = false;
     let child;
     try {
-      child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...(env ? { env } : {}) });
     } catch (err) {
       resolve({ code: -1, stdout: "", stderr: String((err && err.message) || err) });
       return;
@@ -372,7 +372,12 @@ async function deprovisionPorts(rawPorts) {
   // frontends are rewritten — release them now, so a later generate that reuses
   // this port range can bind. Best-effort (the 5-min sync timer is the backstop).
   if (result.cfgs.some((c) => c.ok) && fs.existsSync(HTTPS_SYNC_BIN)) {
-    const sync = await execCapture(HTTPS_SYNC_BIN, ["sync"], { timeoutMs: 120000 });
+    // The script's own lock wait stays under the timeout: a SIGKILLed bash
+    // leaves its `flock -w` child holding our pipes until that wait ends.
+    const sync = await execCapture(HTTPS_SYNC_BIN, ["sync"], {
+      timeoutMs: 120000,
+      env: { ...process.env, NETRUN_HTTPS_LOCK_WAIT_SEC: "90" },
+    });
     result.https_sync = { code: sync.code };
   }
   return result;

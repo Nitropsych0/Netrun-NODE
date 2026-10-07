@@ -98,16 +98,21 @@ build_pem() {
   mv -f "$PEM.tmp" "$PEM"
 }
 
-issue_or_renew() {
+# `lego run` obtains the certificate or renews it once due (half of the
+# 6-day lifetime for short-lived certificates). HTTP-01 needs :80 free.
+# Network I/O that can take minutes: `renew` runs it OUTSIDE the sync lock.
+lego_obtain() {
   local ip
   ip="$(public_ipv4)"
   [ -n "$ip" ] || die "cannot detect the public IPv4"
   install -d -m 0700 "$LEGO_DIR"
-  # `lego run` obtains the certificate or renews it once due (half of the
-  # 6-day lifetime for short-lived certificates). HTTP-01 needs :80 free.
   lego run --path "$LEGO_DIR" --accept-tos --domains "$ip" --http --profile shortlived \
     --no-random-sleep >/dev/null
-  build_pem "$ip"
+}
+
+issue_or_renew() {
+  lego_obtain
+  build_pem "$(public_ipv4)"
 }
 
 # ── 3proxy HTTP listeners → 127.0.0.1 ─────────────────────────────
@@ -477,10 +482,18 @@ cmd_sync() {
   fi
 }
 
+# renew: the ACME exchange without the lock (it can take minutes when the CA
+# is slow, and a /generate's sync must not wait on it), then the PEM swap +
+# reload + stamp under the lock.
 cmd_renew() {
+  lego_obtain
+  with_sync_lock cmd_renew_apply
+}
+
+cmd_renew_apply() {
   local before after
   before="$(sha256sum "$PEM" 2>/dev/null | cut -d' ' -f1 || true)"
-  issue_or_renew
+  build_pem "$(public_ipv4)"
   after="$(sha256sum "$PEM" | cut -d' ' -f1)"
   if [ "$before" != "$after" ] && systemctl is-active --quiet haproxy; then
     systemctl reload haproxy
@@ -491,7 +504,8 @@ cmd_renew() {
   fi
 }
 
-# sync / renew / setup one at a time (generator, timer, /deprovision).
+# sync / renew's apply step / setup one at a time (generator, timer,
+# /deprovision). NETRUN_HTTPS_LOCK_WAIT_SEC (300): in-line callers pass less.
 with_sync_lock() {
   if command -v flock >/dev/null 2>&1; then
     mkdir -p "$(dirname "$SYNC_LOCK")" 2>/dev/null || true
@@ -618,7 +632,7 @@ cmd_status() {
 case "${1:-}" in
   setup) with_sync_lock cmd_setup ;;
   sync) with_sync_lock cmd_sync ;;
-  renew) with_sync_lock cmd_renew ;;
+  renew) cmd_renew ;;
   status) cmd_status ;;
   accounting) fix_accounting ;;
   units) cmd_units ;;

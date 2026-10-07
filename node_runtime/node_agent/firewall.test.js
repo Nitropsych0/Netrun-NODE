@@ -382,6 +382,40 @@ test("liftPorts: exclude keeps the drop and the list entry of a port that still 
   assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000]);
 });
 
+test("a disable whose nft add races the re-apply's own destroy of that port is re-asserted after nft -f", async () => {
+  const { host, firewall } = fakeFirewall("toggle-destroy-race");
+  host.listening = new Set([40000, 30000]);
+  await firewall.push({ livePorts: [40000, 30000], pergbBlocked: [], window: [40000, 65535] });
+  host.blocked = new Set([40000, 30000]); // stale drops on live ports: the re-apply destroys them
+  let release;
+  host.gate = new Promise((r) => { release = r; });
+  const pending = firewall.reapply("periodic");
+  await new Promise((r) => setTimeout(r, 20)); // the plan (remove 40000, 30000) waits in nft -f
+  await firewall.recordAccountToggle(40000, true, accountingToggle(host, 40000, true)); // accounting adds first
+  release();
+  host.gate = null;
+  const r = await pending;
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000], "the destroy landed after the disable's add — re-asserted");
+  assert.deepStrictEqual(sortedOf(host.list), [30000, 40000]);
+});
+
+test("a port the generation's lift kept (old occupant still listens) keeps its drop through a re-apply while the lock is held", async () => {
+  const { host, firewall } = fakeFirewall("lift-kept-lock");
+  host.listening = new Set([40000, 40001, 30000, 30001]);
+  await firewall.push({ livePorts: [40000, 40001, 30000, 30001], pergbBlocked: [40000], window: [40000, 65535] });
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000]);
+  host.lock = { startPort: 40000, proxyCount: 2, proxiesType: "dual" }; // the generation holds the lock
+  const lift = await firewall.liftPorts([40000, 40001, 30000, 30001], "generation test", { exclude: new Set([40000, 30000]) });
+  assert.strictEqual(lift.kept, 2);
+  await firewall.reapply("periodic");
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000], "kept ports are not in-flight: the depleted account stays blocked");
+  assert.deepStrictEqual(sortedOf(host.list), [30000, 40000]);
+  host.lock = null; // released
+  await firewall.reapply("periodic");
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000]);
+});
+
 test("ephemeral guard: a push adding blocks inside ip_local_port_range is refused (409) unless force; re-apply only reports", async () => {
   const { host, firewall, stateFile } = fakeFirewall("ephemeral");
   host.listening = new Set([18100, 40000]);

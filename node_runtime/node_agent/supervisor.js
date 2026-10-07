@@ -694,6 +694,26 @@ function createSupervisor({
     return n;
   }
 
+  // /generate ended `ready` (validation saw every port listen): the batch at
+  // these start ports serves now. Supervised from this moment, not only once
+  // a tick observes it — during a refill burst no tick runs (the generation
+  // lock is held), and a batch that dies before the first tick would
+  // otherwise stay `unsupervised` until a reboot.
+  function markServing(startPorts) {
+    let n = 0;
+    for (const raw of startPorts || []) {
+      const sp = Number(raw);
+      if (!Number.isInteger(sp) || sp <= 0) continue;
+      forgotten.delete(sp);
+      state.seen.add(sp);
+      state.downSince.delete(sp);
+      state.failed.delete(sp);
+      n += 1;
+    }
+    if (n > 0) writeStatus();
+    return n;
+  }
+
   function tick() {
     if (!settings.enabled) return Promise.resolve({ skipped: true, outcome: "disabled" });
     if (inFlight) return inFlight;
@@ -787,7 +807,7 @@ function createSupervisor({
     return out;
   }
 
-  return { start, stop, tick, status, forget, settings: () => ({ ...settings }) };
+  return { start, stop, tick, status, forget, markServing, settings: () => ({ ...settings }) };
 }
 
 module.exports = {

@@ -394,6 +394,29 @@ test("forget: a start port regenerated after serving is a NEW batch — a failed
   assert.deepStrictEqual(second.status().unsupervised, [18100]);
 });
 
+test("markServing: a batch a ready /generate made is supervised at once — it dies during a refill burst (no tick ran) and is still respawned", async () => {
+  const boot = Date.now() - 3600_000;
+  const { dir, host, supervisor, statusPath } = fakeNode("mark-serving", { cfgs: {}, bootTimeMs: () => boot });
+  // /generate at 18100: forget() under the lock, the generator writes the cfg,
+  // validation sees the ports listen, the job ends ready -> markServing.
+  supervisor.forget([18100]);
+  fs.writeFileSync(path.join(dir, "3proxy_18100.cfg"), CFG(18100, "2001:db8:0:1::a")); // after the boot
+  assert.strictEqual(supervisor.markServing([18100, "x"]), 1);
+  assert.deepStrictEqual(supervisor.status().seenServing, [18100]);
+  // No tick saw it listening (the next jobs held the lock); it is OOM-killed.
+  host.listening = new Set();
+  host.procs = [];
+  host.nowMs = Date.now() + 10 * 60_000; // past the settle window
+  for (let i = 0; i < 2; i += 1) {
+    await supervisor.tick();
+    host.nowMs += 60_000;
+  }
+  assert.strictEqual(host.spawned.length, 1, "respawned on the second tick");
+  assert.deepStrictEqual(supervisor.status().unsupervised, []);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(statusPath, "utf-8")).seenServing, [18100], "persisted for an agent restart");
+});
+
 test("without forget a rewrite of a served batch (deprovision rewrite / egress_mode) keeps it supervised", async () => {
   const boot = Date.now() - 3600_000;
   const { dir, host, supervisor } = fakeNode("rewrite-kept", {
