@@ -313,12 +313,58 @@ Returns a single JSON snapshot the orchestrator consumes via `POST /v1/nodes/enr
 - `geo_code` (ISO 3166-1 alpha-2, cached 1h via ipapi.co)
 - `ipv6`, `ipv6_egress` (same shape as `/health`)
 - `api_key_required`, `jobs_root`, `proxy_root`
-- `supports.{describe,enroll,accounting,egress_rotation,firewall_desired,supervisor}`
+- `supports.{describe,enroll,accounting,egress_rotation,firewall_desired,supervisor,https_hostnames}`
   (`egress_rotation` is true once the egress module below has its nft NAT table up;
   `firewall_desired`: `POST /firewall/desired` is served; `supervisor`: dead batches are
-  respawned — audit N2)
+  respawned — audit N2; `https_hostnames`: `POST /https/hostnames` is switched on — FO-08)
 
 Open access (mirrors `/health`); set `NODE_AGENT_API_KEY` only if you want auth on the write endpoints.
+
+## HTTPS certificates for the node's DNS names (audit FO-08)
+
+Customers get `https://login:pass@us1.proxy.netrun.lol:port` (TLS to the proxy); the
+node's Let's Encrypt certificate named only its IPv4, so those lines failed verification.
+haproxy's TLS terminator now loads a crt-list and picks the certificate by SNI.
+
+- `POST /https/hostnames` (API key) `{"hostnames": ["us1.proxy.netrun.lol"]}` — 0..8
+  lowercase FQDNs (normalized, deduplicated). The list goes to
+  `/etc/netrun/https-hostnames` (atomically, only when the set changed); when it changed or a
+  name has no good certificate (missing / not for the name / < 7 days left), the agent starts
+  `systemd-run --unit netrun-https-certs --collect /usr/local/sbin/netrun-https certs`
+  detached (never a second one while it runs) and answers at once:
+  `200 {success, changed, hostnames, issuing, started, certs: [{hostname, ok, notAfter, error, lastError}]}`.
+  `400` bad body, `404 https_hostnames_disabled`, `409 https_frontend_missing` (no
+  netrun-https) / `https_frontend_outdated` (an installed copy without `certs`),
+  `500 issue_start_failed`. `GET /https/hostnames` and `/health httpsHostnames` (cached 5 s)
+  show the list, the certificate per name and `issuing`.
+- `netrun-https certs` (also run by `renew`, twice a day, after the IP certificate): for every
+  listed name whose A record (the node's resolver) is exactly the public IPv4, `lego run`
+  (default profile, same `--path /etc/netrun/lego`) when its certificate is missing or within
+  `NETRUN_HTTPS_HOST_RENEW_DAYS` (30) of expiry — outside the sync lock, under
+  `/run/netrun/https-acme.lock` (the IP renewal takes it too: one HTTP-01 client on :80). A
+  name pointing elsewhere is skipped and never sent to the CA; a failed name waits
+  `NETRUN_HTTPS_ACME_RETRY_MIN` (60) minutes; one failing name never stops the others. The
+  outcome per name: `/etc/netrun/tls/hosts/<name>.error` (`lastError`). Then, under the sync
+  lock: `/etc/netrun/tls/hosts/<name>.pem` (0600), PEMs of unlisted names deleted, and
+  `/etc/netrun/tls/crt-list` — the IP certificate FIRST (the default: IP clients send no SNI),
+  then `<pem> <name>` per valid name. haproxy is reloaded only when the crt-list or a PEM in it
+  changed (the reload stamp covers them); a set `haproxy -c` rejects falls back to the IP line.
+- `netrun-https sync` writes the crt-list before any `haproxy -c` and rewrites `haproxy.cfg`
+  whenever it differs from the managed one (validated first), so an existing node moves from
+  `ssl crt node.pem` to `ssl crt-list` on its next 5-min sync (one reload).
+  `netrun-https status` lists the hostname certificates.
+
+Existing nodes: deploy the code, refresh the `/usr/local/sbin` copy
+(`bash scripts/apply_capacity_tuning.sh --apply --only units`, or `netrun-https units`),
+restart the agent; the next sync migrates `haproxy.cfg`.
+Switch: `NODE_AGENT_HTTPS_HOSTNAMES=0` (agent env) — POST answers 404, nothing is issued.
+Rollback: `POST /https/hostnames {"hostnames": []}` (PEMs removed, crt-list back to the IP
+line, one reload) — a crt-list with only `node.pem` serves exactly what `crt node.pem` did.
+A code rollback keeps working: the old script leaves a managed `haproxy.cfg` alone and the
+crt-list still names `node.pem` (which its renew keeps rebuilding) — do not delete
+`/etc/netrun/tls/crt-list`; the old `netrun-https setup` writes the `crt node.pem` config back.
+Tests: `bash scripts/test_https_hostnames.sh`, `node --test` (`https_hostnames`,
+`server.https_hostnames`).
 
 ## Capacity tuning (18k proxies on a 2c/4GB node)
 

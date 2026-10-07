@@ -19,6 +19,7 @@ const { withProcessLock } = require("./process_lock.js");
 const supervisorLib = require("./supervisor.js");
 const firewallLib = require("./firewall.js");
 const proxySpawn = require("./proxy_spawn.js");
+const httpsHostnamesLib = require("./https_hostnames.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 // Wave FLEET-HEALTH (RES-10) — bind address. The unit template has always set
@@ -3976,6 +3977,10 @@ const firewall = firewallLib.createFirewall({
   protectedPorts: [PORT, 22, 53, 80, 443, 8953],
 });
 
+// Audit FO-08 — hostname certificates (SNI) for the HTTPS frontend:
+// POST/GET /https/hostnames, /health httpsHostnames (https_hostnames.js).
+const httpsHostnames = httpsHostnamesLib.createHttpsHostnames();
+
 // Audit FP-01 / speed — node tuning that silently breaks proxies or the
 // fingerprint when an old script resets it: the ephemeral range must stay
 // below every proxy listener (the 2026-10-07 5-7 % failure bug), timestamps
@@ -4041,11 +4046,12 @@ async function handleHealth(req, res) {
     if (p > 0) probePorts.add(p);
   }
   for (const c of inventory.cfgs) probePorts.add(probeOf(c.startPort));
-  const [ipv6Check, dnsCheck, listenState, ipv6Addresses] = await Promise.all([
+  const [ipv6Check, dnsCheck, listenState, ipv6Addresses, httpsHostnamesStatus] = await Promise.all([
     checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
     checkDns(5000),
     listListeningExactPorts([...probePorts]),
     ipv6Coverage.get(),
+    httpsHostnames.healthStatus(),
   ]);
   // Wave NODE-GENLOCK-HARDENING — 3proxy readiness, additive. Lets the
   // orchestrator distinguish "agent up but 3proxy not listening yet" (fresh
@@ -4151,6 +4157,10 @@ async function handleHealth(req, res) {
     // IPv4, the address unbound and the agent use too (FP-02).
     egressMode: egressModeNow,
     ipv4ExitSharedWithNode: egressModeNow === "dualstack" ? true : egressModeNow === "ipv6_only" ? false : null,
+    // Audit FO-08 — additive. The node's DNS names (POST /https/hostnames), the
+    // certificate haproxy serves for each by SNI ({hostname, ok, notAfter,
+    // error, lastError}) and whether `netrun-https certs` runs (cached 5 s).
+    httpsHostnames: httpsHostnamesStatus,
   });
 }
 
@@ -4179,6 +4189,7 @@ async function handleDescribe(req, res) {
     egressRotation: egress.isAvailable(),
     firewallDesired: firewall.settings().enabled,
     supervisor: supervisor.settings().enabled,
+    httpsHostnames: httpsHostnames.settings().enabled,
   });
   sendJson(res, 200, payload);
 }
@@ -4411,6 +4422,12 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Audit FO-08 — the node's DNS names for the HTTPS frontend (SNI
+  // certificates); netrun-https does the ACME work (https_hostnames.js).
+  if (pathname === "/https/hostnames") {
+    if (await httpsHostnames.handleHttp(req, res, url, { sendJson, parseJsonBody, ensureAuthorized })) return;
+  }
+
   // Wave IPV6-ROTATION — per-port egress IPv6 (rotate / per-connection /
   // reset) through an nftables SNAT table; 3proxy and its cfgs are never
   // touched (egress.js). Any other /egress path falls through to the 404.
@@ -4525,6 +4542,8 @@ module.exports = {
   // Audit RES-11 / RES-13 / CLN-04 — exported for unit tests.
   supervisor,
   firewall,
+  // Audit FO-08 — exported for unit tests.
+  httpsHostnames,
   generationBatchPorts,
   selectOccupiedBatchPorts,
   parseEtime,

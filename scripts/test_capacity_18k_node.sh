@@ -150,7 +150,9 @@ ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -
 (
   for f in netrun_setting setting_off http_port_ranges localize_http_listeners write_frontends frontend_sets_equal \
            sha256_stream haproxy_config_hash stamp_read stamp_write stamp_expired frontend_first_ports \
-           frontend_ports_missing verify_frontends_listening cmd_sync; do
+           frontend_ports_missing verify_frontends_listening cmd_sync \
+           https_hostnames host_cert_ok write_crt_list crt_list_pems base_config_text write_base_config \
+           base_config_current update_base_config; do
     pat="/^$f() {/,/^}/p"   # (bash 3.2 brace-expands the pattern inline)
     eval "$(sed -n "$pat" "$HTTPS")"
     type "$f" >/dev/null 2>&1 || { echo "netrun-https: $f not found"; exit 1; }
@@ -171,6 +173,8 @@ ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -
   ss() { [ "${HAPROXY_LISTENS:-1}" = 1 ] || return 0; for p in $(printf '%s\n' "$2" | grep -oE ':[0-9]+' | tr -d :); do echo "LISTEN 0 4096 45.32.10.20:$p 0.0.0.0:*"; done; }
   PROXY_DIR="$TMP/sync/3proxy"; FRONTEND_DIR="$TMP/sync/netrun.d"; mkdir -p "$PROXY_DIR"
   PEM="$TMP/sync/node.pem"; echo pem > "$PEM"; HAPROXY_CFG="$TMP/sync/haproxy.cfg"; echo '# Managed by netrun-https' > "$HAPROXY_CFG"
+  # Audit FO-08 — the crt-list (IP certificate only: no hostname list here).
+  TLS_DIR="$TMP/sync"; CRT_LIST="$TMP/sync/crt-list"; HOSTS_DIR="$TMP/sync/hosts"; HOSTNAMES_FILE="$TMP/sync/no-hostnames"
   APPLIED_STAMP="$TMP/sync/run/haproxy-applied.sha"
   batch() { printf 'socks -6 -a -p%s -i45.32.10.20 -e2001:db8::1\nproxy -6 -n -a -p%s -i127.0.0.1 -e2001:db8::1\n' "$1" "$(($1 - 10000))" > "$PROXY_DIR/3proxy_$1.cfg"; }
   reloads() { grep -c '^reload$' "$RELOADS"; }
@@ -214,6 +218,9 @@ ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -
   ( cmd_sync ); want 11 "a fresh stamp reloaded"
   rm -f "$APPLIED_STAMP"; ( cmd_sync ); want 12 "no stamp (reboot) must reload once"
   ( cmd_sync ); want 12 "after the stamp is back: quiet"
+  # Audit FO-08 — the first sync migrated the managed base config to the crt-list.
+  grep -qx "    bind abns@netrun_tls accept-proxy ssl crt-list $CRT_LIST alpn http/1.1" "$HAPROXY_CFG" || { echo "base config not migrated"; exit 1; }
+  [ "$(cat "$CRT_LIST")" = "$PEM" ] || { echo "crt-list"; exit 1; }
   # frontend_first_ports / frontend_ports_missing
   [ "$(frontend_first_ports | sort -n | tr '\n' ' ')" = "8100 8300 8400 8500 " ] || { frontend_first_ports; echo "first ports"; exit 1; }
   [ -z "$(frontend_ports_missing 45.32.10.20 8100 8300)" ] || { echo "listening ports reported missing"; exit 1; }
@@ -222,11 +229,16 @@ ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -
 ) || fail "netrun-https: reload-on-change + reload stamp"
 grep -q 'with_sync_lock cmd_sync' "$HTTPS" || fail "netrun-https: sync not serialized with flock"
 # renew: the ACME exchange (lego, minutes when the CA is slow) runs OUTSIDE the
-# sync lock; only the PEM swap + reload + stamp take it.
+# sync lock (under the ACME lock, FO-08); only the PEM swap + reload + stamp
+# take the sync lock. (scripts/test_https_hostnames.sh: the hostname step.)
 (
   eval "$(sed -n '/^cmd_renew() {/,/^}/p' "$HTTPS")"
+  eval "$(sed -n '/^renew_obtain() {/,/^}/p' "$HTTPS")"
   CALLS="$TMP/renew_calls"; : > "$CALLS"
+  log() { :; }; public_ipv4() { echo 45.32.10.20; }
   lego_obtain() { echo "lego locked=${LOCKED:-0}" >> "$CALLS"; }
+  certs_obtain() { :; }
+  with_acme_lock() { "$@"; }
   with_sync_lock() { LOCKED=1 "$@"; }
   cmd_renew_apply() { echo "apply locked=${LOCKED:-0}" >> "$CALLS"; }
   cmd_renew

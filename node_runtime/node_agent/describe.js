@@ -11,7 +11,15 @@ const GEO_CACHE_TTL_MS = 60 * 60 * 1000;
 let _geoCache = null;
 let _geoCacheAt = 0;
 
-async function buildDescribe({ healthSnapshot, jobsRoot, proxyRoot, egressRotation = false, firewallDesired = false, supervisor = false } = {}) {
+async function buildDescribe({
+  healthSnapshot,
+  jobsRoot,
+  proxyRoot,
+  egressRotation = false,
+  firewallDesired = false,
+  supervisor = false,
+  httpsHostnames = false,
+} = {}) {
   const ipv6 = healthSnapshot?.ipv6 || null;
   const ipv6Egress = healthSnapshot?.ipv6Egress || null;
   const dns = healthSnapshot?.dns || null;
@@ -47,6 +55,9 @@ async function buildDescribe({ healthSnapshot, jobsRoot, proxyRoot, egressRotati
       firewall_desired: Boolean(firewallDesired),
       // Audit RES-11 — dead-batch respawn + anchor re-add (/health supervisor).
       supervisor: Boolean(supervisor),
+      // Audit FO-08 — POST /https/hostnames (SNI certificates for the node's
+      // DNS names); false when NODE_AGENT_HTTPS_HOSTNAMES=0.
+      https_hostnames: Boolean(httpsHostnames),
     },
   };
 }

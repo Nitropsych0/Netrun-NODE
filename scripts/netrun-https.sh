@@ -19,10 +19,34 @@
 #   netrun-https sync    # idempotent: move HTTP listeners, (re)write frontends;
 #                        # haproxy is reloaded ONLY when what it loaded differs
 #                        # from the files (see "reload stamp" below)
-#   netrun-https renew   # timer: renew the certificate when due, reload haproxy
+#   netrun-https renew   # timer: renew the IP certificate when due, then the
+#                        # hostname certificates; reload haproxy on a change
+#   netrun-https certs   # hostname certificates only (the agent starts it)
 #   netrun-https status  # short report
 #   netrun-https accounting  # only (re)write the two per-port counter map rules
 #   netrun-https units   # (re)write the renew/sync units (KillMode=process); no restarts
+#
+# Audit FO-08 — hostname certificates chosen by SNI. The orchestrator gives the
+# node DNS names (us1.proxy.netrun.lol -> the node's IPv4) and customers dial
+# https://login:pass@<name>:port; the IP certificate does not name them. The
+# agent (POST /https/hostnames) writes the names, one lowercase FQDN per line,
+# to $HOSTNAMES_FILE and starts `certs` detached:
+#   1. outside the sync lock, under the ACME lock (/run/netrun/https-acme.lock,
+#      also taken by the IP renewal: one HTTP-01 client on :80 at a time): every
+#      listed name whose A record (the node's own resolver) is exactly the
+#      public IPv4 gets `lego run` (default profile, LEGO_DIR kept, so a renewal
+#      is `run` again) once its certificate is missing or within
+#      NETRUN_HTTPS_HOST_RENEW_DAYS (30) of expiry. A name that does not point
+#      here is skipped and never sent to the CA (failed validations count
+#      against Let's Encrypt limits); a name whose lego run failed waits
+#      NETRUN_HTTPS_ACME_RETRY_MIN (60) before the next try; one failing name
+#      never stops the others. The outcome per name: $HOSTS_DIR/<name>.error.
+#   2. under the sync lock: $HOSTS_DIR/<name>.pem (0600) per listed name with a
+#      valid certificate, PEMs of names no longer listed deleted, and the
+#      crt-list the TLS terminator loads — the IP certificate FIRST (the
+#      default: IP clients send no SNI), then one `<pem> <name>` line per valid
+#      hostname PEM. haproxy is reloaded only when the crt-list or a PEM in it
+#      changed (the reload stamp covers them all).
 #
 # Settings (environment, else ${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}):
 #   NETRUN_ACCOUNTING_MATCH_IPV4=1  meter only client legs: the map rules also
@@ -52,9 +76,14 @@ PROXY_BIN="$PROXY_DIR/bin/3proxy"
 # Audit RES-11 — the node's one 3proxy spawn helper (own systemd scope per
 # batch, idempotent); the repo copy, not a copy taken at setup time.
 SPAWN_HELPER="${NETRUN_3PROXY_SPAWN:-/opt/netrun/scripts/netrun-3proxy-spawn.sh}"
-TLS_DIR=/etc/netrun/tls
-LEGO_DIR=/etc/netrun/lego
+TLS_DIR="${NETRUN_HTTPS_TLS_DIR:-/etc/netrun/tls}"
+LEGO_DIR="${NETRUN_HTTPS_LEGO_DIR:-/etc/netrun/lego}"
 PEM="$TLS_DIR/node.pem"
+# Audit FO-08 — hostname certificates (see the header).
+HOSTS_DIR="$TLS_DIR/hosts"
+CRT_LIST="$TLS_DIR/crt-list"
+HOSTNAMES_FILE="${NETRUN_HTTPS_HOSTNAMES_FILE:-/etc/netrun/https-hostnames}"
+ACME_LOCK="${NETRUN_HTTPS_ACME_LOCK:-/run/netrun/https-acme.lock}"
 HAPROXY_CFG=/etc/haproxy/haproxy.cfg
 FRONTEND_DIR=/etc/haproxy/netrun.d
 LEGO_VERSION="${LEGO_VERSION:-v5.5.2}"
@@ -100,7 +129,8 @@ build_pem() {
 
 # `lego run` obtains the certificate or renews it once due (half of the
 # 6-day lifetime for short-lived certificates). HTTP-01 needs :80 free.
-# Network I/O that can take minutes: `renew` runs it OUTSIDE the sync lock.
+# Network I/O that can take minutes: `renew` runs it OUTSIDE the sync lock
+# (and under the ACME lock: see with_acme_lock).
 lego_obtain() {
   local ip
   ip="$(public_ipv4)"
@@ -111,8 +141,185 @@ lego_obtain() {
 }
 
 issue_or_renew() {
-  lego_obtain
+  with_acme_lock lego_obtain
   build_pem "$(public_ipv4)"
+}
+
+# ── hostname certificates (audit FO-08) ───────────────────────────
+
+# The listed hostnames: lowercase FQDNs (letters, digits, hyphens; labels of
+# 1-63, at most 253 in all, a TLD that starts with a letter — so never an IP),
+# deduplicated, in file order. Anything else in the file is ignored. Validated
+# here as well as in the agent: the name becomes a file name and a lego argument.
+https_hostnames() {
+  [ -s "$HOSTNAMES_FILE" ] || return 0
+  tr -d ' \t\r' < "$HOSTNAMES_FILE" | tr '[:upper:]' '[:lower:]' \
+    | awk '
+        !/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]([a-z0-9-]*[a-z0-9])?$/ { next }
+        length($0) > 253 || seen[$0]++ { next }
+        { n = split($0, l, "."); for (i = 1; i <= n; i++) if (length(l[i]) > 63) next; print }'
+}
+
+# The IPv4 addresses (A records) the node's own resolver gives for $1, sorted,
+# one per line; nothing when it does not resolve. getent (nsswitch: /etc/hosts,
+# then the system resolver), else dig. Never fails.
+resolve_ipv4() {
+  if command -v getent >/dev/null 2>&1; then
+    { getent ahostsv4 "$1" 2>/dev/null || true; } | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $1 }' | sort -u
+  elif command -v dig >/dev/null 2>&1; then
+    { dig +short +time=3 +tries=2 A "$1" 2>/dev/null || true; } | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' | sort -u
+  fi
+  return 0
+}
+
+# 0 when certificate file $2 (key: $3, default the same file — a PEM holds
+# both) is for hostname $1 (a DNS name in its subjectAltName), has not
+# expired (or, with $4 seconds, does not expire within them) and matches the key.
+host_cert_ok() {
+  local h="$1" crt="$2" key="${3:-$2}" within="${4:-0}" names a b
+  [ -s "$crt" ] && [ -s "$key" ] || return 1
+  openssl x509 -in "$crt" -noout -checkend "$within" >/dev/null 2>&1 || return 1
+  names="$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed 's/^[[:space:]]*//')" || return 1
+  case $'\n'"$names"$'\n' in *$'\n'"DNS:$h"$'\n'*) ;; *) return 1 ;; esac
+  a="$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null)" || return 1
+  b="$(openssl pkey -in "$key" -pubout 2>/dev/null)" || return 1
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
+# Per-name outcome of the last `certs` run (none = fine): "dns: ..." (skipped,
+# no CA call) or "acme: ..." (lego failed). The agent shows it.
+host_note() {
+  install -d -m 0700 "$HOSTS_DIR"
+  printf '%s\n' "$2" > "$HOSTS_DIR/$1.error"
+}
+
+# 0 while the last lego run for $1 failed less than NETRUN_HTTPS_ACME_RETRY_MIN
+# (60) minutes ago: at most one failed validation per name and hour (Let's
+# Encrypt allows 5). Delete the .error file to retry at once.
+host_acme_backoff() {
+  local f="$HOSTS_DIR/$1.error" min
+  min="$(netrun_setting NETRUN_HTTPS_ACME_RETRY_MIN 60)"
+  case "$min" in ''|*[!0-9]*) min=60 ;; esac
+  [ "$min" -gt 0 ] && [ -f "$f" ] || return 1
+  [ "$(head -c 5 "$f")" = "acme:" ] || return 1
+  [ -z "$(find "$f" -mmin +"$min" 2>/dev/null)" ]
+}
+
+lego_obtain_host() {
+  install -d -m 0700 "$LEGO_DIR"
+  lego run --path "$LEGO_DIR" --accept-tos --domains "$1" --http --no-random-sleep >/dev/null
+}
+
+# The ACME step of `certs` (call it under the ACME lock, outside the sync
+# lock): `lego run` for every listed name that points here and needs it.
+# Returns 1 when a lego run failed (or a name still backs off) — after
+# trying every name; a name pointing elsewhere is not a failure.
+certs_obtain() {
+  local ip="$1" h addrs days crt errf rc failed=0
+  [ -n "$ip" ] || { log "ERROR: cannot detect the public IPv4 — no hostname certificate"; return 1; }
+  days="$(netrun_setting NETRUN_HTTPS_HOST_RENEW_DAYS 30)"
+  case "$days" in ''|*[!0-9]*) days=30 ;; esac
+  for h in $(https_hostnames); do
+    addrs="$(resolve_ipv4 "$h" | tr '\n' ' ')"
+    addrs="${addrs% }"
+    if [ "$addrs" != "$ip" ]; then
+      log "skip $h: its A record is ${addrs:-missing}, not $ip — not sent to the CA"
+      host_note "$h" "dns: A ${addrs:-missing}, not $ip"
+      continue
+    fi
+    crt="$LEGO_DIR/certificates/$h.crt"
+    if host_cert_ok "$h" "$crt" "$LEGO_DIR/certificates/$h.key" $((days * 86400)); then
+      rm -f "$HOSTS_DIR/$h.error"
+      continue
+    fi
+    if host_acme_backoff "$h"; then
+      log "skip $h: its last ACME attempt failed less than $(netrun_setting NETRUN_HTTPS_ACME_RETRY_MIN 60) min ago"
+      failed=1
+      continue
+    fi
+    errf="$(mktemp)"
+    if lego_obtain_host "$h" 2>"$errf"; then
+      rm -f "$HOSTS_DIR/$h.error"
+      log "certificate for $h obtained / renewed"
+    else
+      rc=$?
+      cat "$errf" >&2 || true
+      host_note "$h" "acme: lego exit $rc: $(tail -n 1 "$errf" | cut -c1-300)"
+      log "WARNING: lego failed for $h (exit $rc) — the other names go on"
+      failed=1
+    fi
+    rm -f "$errf"
+  done
+  return "$failed"
+}
+
+# Under the sync lock: $HOSTS_DIR/<name>.pem for every listed name with a
+# valid certificate (rewritten only when the content differs), and no PEM (or
+# .error) of a name no longer listed.
+build_host_pems() {
+  local h pem keep=" " crt key
+  install -d -m 0700 "$HOSTS_DIR"
+  for h in $(https_hostnames); do
+    keep="$keep$h "
+    crt="$LEGO_DIR/certificates/$h.crt"
+    key="$LEGO_DIR/certificates/$h.key"
+    [ -s "$crt" ] || continue
+    if ! host_cert_ok "$h" "$crt" "$key"; then
+      log "WARNING: $crt is expired, not for $h or not its key's — not served"
+      continue
+    fi
+    pem="$HOSTS_DIR/$h.pem"
+    (umask 077 && cat "$crt" "$key" > "$pem.tmp")
+    if cmp -s "$pem.tmp" "$pem"; then
+      rm -f "$pem.tmp"
+    else
+      mv -f "$pem.tmp" "$pem"
+      log "certificate of $h installed"
+    fi
+  done
+  for pem in "$HOSTS_DIR"/*.pem; do
+    [ -e "$pem" ] || continue
+    h="$(basename "$pem" .pem)"
+    case "$keep" in
+      *" $h "*) ;;
+      *) rm -f "$pem" "$HOSTS_DIR/$h.error"; log "certificate of $h removed (no longer listed)" ;;
+    esac
+  done
+  for pem in "$HOSTS_DIR"/*.error; do
+    [ -e "$pem" ] || continue
+    h="$(basename "$pem" .error)"
+    case "$keep" in *" $h "*) ;; *) rm -f "$pem" ;; esac
+  done
+}
+
+# The crt-list of the TLS terminator: the IP certificate FIRST — haproxy's
+# default for a client without SNI (IP clients send none) or with an SNI no
+# line names — then `<pem> <name>` for every listed name whose PEM is in place
+# and valid. Always leaves a crt-list (at least the IP line) behind: the base
+# config names it, so it must exist before any `haproxy -c` / reload. With
+# "ip-only": the IP line alone. Replaced atomically, only when it differs.
+write_crt_list() {
+  local h pem
+  install -d -m 0700 "$TLS_DIR"
+  {
+    printf '%s\n' "$PEM"
+    if [ "${1:-}" != ip-only ]; then
+      for h in $(https_hostnames); do
+        pem="$HOSTS_DIR/$h.pem"
+        if host_cert_ok "$h" "$pem"; then printf '%s %s\n' "$pem" "$h"; fi
+      done
+    fi
+  } > "$CRT_LIST.tmp"
+  if cmp -s "$CRT_LIST.tmp" "$CRT_LIST"; then
+    rm -f "$CRT_LIST.tmp"
+  else
+    mv -f "$CRT_LIST.tmp" "$CRT_LIST"
+  fi
+}
+
+# The hostname PEMs named by the crt-list (the IP PEM is hashed on its own).
+crt_list_pems() {
+  awk -v pem="$PEM" '$1 != "" && $1 !~ /^#/ && $1 != pem { print $1 }' "$CRT_LIST" 2>/dev/null || true
 }
 
 # ── 3proxy HTTP listeners → 127.0.0.1 ─────────────────────────────
@@ -176,8 +383,10 @@ http_port_ranges() {
 
 # ── haproxy ───────────────────────────────────────────────────────
 
-write_base_config() {
-  cat > "$HAPROXY_CFG" <<'EOF'
+# The base config. Audit FO-08 — the TLS terminator loads the crt-list (the IP
+# certificate first = the default, then the hostname certificates by SNI).
+base_config_text() {
+  cat <<EOF
 # Managed by netrun-https — per-batch frontends live in /etc/haproxy/netrun.d.
 global
     log /dev/log local0 warning
@@ -202,7 +411,7 @@ defaults
 # abstract socket; the PROXY v2 header carries the original destination, so the
 # port-less server below reaches 127.0.0.1:<the port the client dialed>.
 frontend netrun_tls
-    bind abns@netrun_tls accept-proxy ssl crt /etc/netrun/tls/node.pem alpn http/1.1
+    bind abns@netrun_tls accept-proxy ssl crt-list ${CRT_LIST} alpn http/1.1
     no log
     default_backend netrun_local
 
@@ -212,6 +421,38 @@ backend netrun_tls_loop
 backend netrun_local
     server local 127.0.0.1
 EOF
+}
+
+write_base_config() {
+  base_config_text > "$HAPROXY_CFG.tmp"
+  mv -f "$HAPROXY_CFG.tmp" "$HAPROXY_CFG"
+}
+
+# 0 when haproxy.cfg is exactly what base_config_text gives.
+base_config_current() {
+  [ -s "$HAPROXY_CFG" ] && base_config_text | cmp -s - "$HAPROXY_CFG"
+}
+
+# cmd_sync: (re)write haproxy.cfg when it differs from base_config_text — so
+# an existing node moves from `crt node.pem` to the crt-list on its next sync.
+# A file of ours is replaced only once haproxy accepts the new one with the
+# live frontends (a rejected one never goes live: the running haproxy, the
+# next reload and the next boot keep the old); a missing or foreign file is
+# written as before. 0 when it was written. Needs the crt-list (write_crt_list).
+update_base_config() {
+  if [ -s "$HAPROXY_CFG" ] && grep -q "netrun-https" "$HAPROXY_CFG"; then
+    install -d -m 0755 "$FRONTEND_DIR"
+    base_config_text > "$HAPROXY_CFG.new"
+    if ! haproxy_check "$FRONTEND_DIR" "$HAPROXY_CFG.new"; then
+      rm -f "$HAPROXY_CFG.new"
+      log "WARNING: haproxy rejects the new base config — $HAPROXY_CFG left as it was"
+      return 1
+    fi
+    mv -f "$HAPROXY_CFG.new" "$HAPROXY_CFG"
+  else
+    write_base_config
+  fi
+  log "base config written ($HAPROXY_CFG)"
 }
 
 write_frontends() {
@@ -268,9 +509,10 @@ frontend_sets_equal() {
   return 0
 }
 
-# `haproxy -c` of the base config + a frontend directory.
+# `haproxy -c` of the base config ($2, default haproxy.cfg) + a frontend
+# directory. The base config names the crt-list: write_crt_list first.
 haproxy_check() {
-  haproxy -c -q -f "$HAPROXY_CFG" -f "$1"
+  haproxy -c -q -f "${2:-$HAPROXY_CFG}" -f "$1"
 }
 
 reload_haproxy() {
@@ -288,12 +530,14 @@ sha256_stream() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
 }
 
-# sha256 over haproxy.cfg, the certificate and the sorted frontend files
-# (names + contents): the files a reload makes haproxy load.
+# sha256 over haproxy.cfg, the certificate, the crt-list and every hostname
+# PEM it names (FO-08), and the sorted frontend files (names + contents): the
+# files a reload makes haproxy load.
 haproxy_config_hash() {
   local f
   {
-    for f in "$HAPROXY_CFG" "$PEM"; do
+    # shellcheck disable=SC2046
+    for f in "$HAPROXY_CFG" "$PEM" "$CRT_LIST" $(crt_list_pems); do
       printf '== %s\n' "$f"
       cat "$f" 2>/dev/null || true
     done
@@ -435,8 +679,10 @@ cmd_sync() {
   ip="$(public_ipv4)"
   [ -n "$ip" ] || die "cannot detect the public IPv4"
   [ -s "$PEM" ] || die "no certificate at $PEM — run: netrun-https setup"
-  if ! { [ -s "$HAPROXY_CFG" ] && grep -q "netrun-https" "$HAPROXY_CFG"; }; then
-    write_base_config
+  # Audit FO-08 — the crt-list before anything runs `haproxy -c` (the base
+  # config names it); a name dropped from the list leaves it here already.
+  write_crt_list
+  if ! base_config_current && update_base_config; then
     base_changed=1
   fi
   fix_accounting
@@ -482,30 +728,89 @@ cmd_sync() {
   fi
 }
 
-# renew: the ACME exchange without the lock (it can take minutes when the CA
-# is slow, and a /generate's sync must not wait on it), then the PEM swap +
-# reload + stamp under the lock.
+# renew: the ACME exchange without the sync lock (it can take minutes when the
+# CA is slow, and a /generate's sync must not wait on it) but under the ACME
+# lock, then the PEM swap + reload + stamp under the sync lock. Audit FO-08 —
+# the hostname certificates ride along: same ACME step (after the IP one, also
+# when that failed), same apply step (one reload for both). Exits non-zero
+# when the IP renewal or a hostname's lego run failed.
 cmd_renew() {
-  lego_obtain
+  local rc=0
+  with_acme_lock renew_obtain || rc=$?
   with_sync_lock cmd_renew_apply
+  return "$rc"
+}
+
+renew_obtain() {
+  local rc=0
+  lego_obtain || rc=$?
+  [ "$rc" = 0 ] || log "WARNING: IP certificate renewal failed (exit $rc)"
+  certs_obtain "$(public_ipv4)" || rc=1
+  return "$rc"
 }
 
 cmd_renew_apply() {
-  local before after
-  before="$(sha256sum "$PEM" 2>/dev/null | cut -d' ' -f1 || true)"
-  build_pem "$(public_ipv4)"
-  after="$(sha256sum "$PEM" | cut -d' ' -f1)"
-  if [ "$before" != "$after" ] && systemctl is-active --quiet haproxy; then
-    systemctl reload haproxy
-    # The stamp covers the certificate: an unverified reload here is retried
-    # by the next sync.
-    if verify_frontends_listening "$(public_ipv4)"; then stamp_write "$(haproxy_config_hash)"; fi
-    log "certificate renewed, haproxy reloaded"
-  fi
+  certs_apply ip
 }
 
-# sync / renew's apply step / setup one at a time (generator, timer,
-# /deprovision). NETRUN_HTTPS_LOCK_WAIT_SEC (300): in-line callers pass less.
+# `certs` (the agent starts it after POST /https/hostnames): the hostname
+# certificates alone. A list rewritten while it ran (the agent never starts
+# a second run) is picked up by another pass, at most 3 in all.
+cmd_certs() {
+  local ip rc pass=0 seen
+  ip="$(public_ipv4 || true)"
+  [ -n "$ip" ] || die "cannot detect the public IPv4"
+  while :; do
+    rc=0
+    seen="$(cat "$HOSTNAMES_FILE" 2>/dev/null || true)"
+    with_acme_lock certs_obtain "$ip" || rc=$?
+    with_sync_lock certs_apply
+    pass=$((pass + 1))
+    [ "$pass" -lt 3 ] && [ "$(cat "$HOSTNAMES_FILE" 2>/dev/null || true)" != "$seen" ] || break
+    log "the hostname list changed during the run — one more pass"
+  done
+  return "$rc"
+}
+
+# Under the sync lock: the IP PEM (with "ip": renew), the hostname PEMs and
+# the crt-list; haproxy is reloaded only when one of them changed — and then
+# only once `haproxy -c` accepts them. A hostname set haproxy rejects is
+# dropped (crt-list back to the IP line alone, hostname PEMs deleted; returns
+# 1) so the 5-min sync never trips over it; the next `certs` rebuilds them
+# from lego's files.
+certs_apply() {
+  local ip before rc=0
+  ip="$(public_ipv4)"
+  before="$(haproxy_config_hash)"
+  [ "${1:-}" != ip ] || build_pem "$ip"
+  build_host_pems
+  write_crt_list
+  if [ "$(haproxy_config_hash)" = "$before" ]; then
+    return 0
+  fi
+  if ! systemctl is-active --quiet haproxy; then
+    log "certificates changed; haproxy is not running (the next sync starts it)"
+    return 0
+  fi
+  if ! haproxy_check "$FRONTEND_DIR"; then
+    log "ERROR: haproxy rejects the hostname certificates — serving the IP certificate alone"
+    rm -f "$HOSTS_DIR"/*.pem
+    write_crt_list ip-only
+    haproxy_check "$FRONTEND_DIR" || die "haproxy config check failed"
+    rc=1
+    [ "$(haproxy_config_hash)" != "$before" ] || return "$rc"
+  fi
+  systemctl reload haproxy
+  # The stamp covers the certificates: an unverified reload here is retried
+  # by the next sync.
+  if verify_frontends_listening "$ip"; then stamp_write "$(haproxy_config_hash)"; fi
+  log "certificates changed, haproxy reloaded"
+  return "$rc"
+}
+
+# sync / renew's apply step / certs' apply step / setup one at a time
+# (generator, timers, agent, /deprovision). NETRUN_HTTPS_LOCK_WAIT_SEC (300):
+# in-line callers pass less.
 with_sync_lock() {
   if command -v flock >/dev/null 2>&1; then
     mkdir -p "$(dirname "$SYNC_LOCK")" 2>/dev/null || true
@@ -513,6 +818,23 @@ with_sync_lock() {
     flock -w "${NETRUN_HTTPS_LOCK_WAIT_SEC:-300}" 9 || die "another netrun-https run still holds $SYNC_LOCK"
   fi
   "$@"
+}
+
+# Audit FO-08 — one HTTP-01 client on :80 at a time (the IP renewal, hostname
+# issuance; never under the sync lock, which may be held around this one by
+# setup only — so no lock-order cycle). A subshell holds fd 8: the lock goes
+# with it, and nothing started later (3proxy, haproxy) can inherit it.
+# NETRUN_HTTPS_ACME_LOCK_WAIT_SEC (1800).
+with_acme_lock() {
+  if ! command -v flock >/dev/null 2>&1; then
+    "$@"
+    return
+  fi
+  mkdir -p "$(dirname "$ACME_LOCK")" 2>/dev/null || true
+  (
+    flock -w "${NETRUN_HTTPS_ACME_LOCK_WAIT_SEC:-1800}" 8 || die "another ACME run still holds $ACME_LOCK"
+    "$@"
+  ) 8>"$ACME_LOCK"
 }
 
 install_lego() {
@@ -624,6 +946,17 @@ cmd_status() {
   echo "public ip : $ip"
   echo "haproxy   : $(systemctl is-active haproxy 2>/dev/null)"
   [ -s "$PEM" ] && openssl x509 -in "$PEM" -noout -enddate | sed 's/^/cert      : /'
+  # Audit FO-08 — hostname certificates (SNI) and the crt-list haproxy loads.
+  local h pem
+  for h in $(https_hostnames); do
+    pem="$HOSTS_DIR/$h.pem"
+    if [ -s "$pem" ]; then
+      echo "host cert : $h $(openssl x509 -in "$pem" -noout -enddate 2>/dev/null)$(grep -qxF "$pem $h" "$CRT_LIST" 2>/dev/null || echo ' (not in the crt-list)')"
+    else
+      echo "host cert : $h none$( [ -s "$HOSTS_DIR/$h.error" ] && printf ' — %s' "$(cat "$HOSTS_DIR/$h.error")")"
+    fi
+  done
+  echo "crt-list  : $( [ -s "$CRT_LIST" ] && wc -l < "$CRT_LIST" | tr -d ' ' || echo 0) line(s)$(grep -q 'ssl crt-list' "$HAPROXY_CFG" 2>/dev/null || echo ' — haproxy.cfg not migrated yet (next sync)')"
   echo "frontends : $(ls "$FRONTEND_DIR"/*.cfg 2>/dev/null | wc -l)"
   echo "3proxy http on public ip : $(cat "$PROXY_DIR"/3proxy_*.cfg 2>/dev/null | grep -cE "^proxy .* -i${ip//./\\.}[[:space:]]" || true)"
   echo "3proxy http on 127.0.0.1 : $(cat "$PROXY_DIR"/3proxy_*.cfg 2>/dev/null | grep -cE '^proxy .* -i127\.0\.0\.1[[:space:]]' || true)"
@@ -633,8 +966,9 @@ case "${1:-}" in
   setup) with_sync_lock cmd_setup ;;
   sync) with_sync_lock cmd_sync ;;
   renew) cmd_renew ;;
+  certs) cmd_certs ;;
   status) cmd_status ;;
   accounting) fix_accounting ;;
   units) cmd_units ;;
-  *) echo "usage: $0 {setup|sync|renew|status|accounting|units}" >&2; exit 2 ;;
+  *) echo "usage: $0 {setup|sync|renew|certs|status|accounting|units}" >&2; exit 2 ;;
 esac
