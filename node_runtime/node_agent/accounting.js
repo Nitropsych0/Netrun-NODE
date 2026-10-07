@@ -154,6 +154,10 @@ const COUNTERS_CACHE_MAX_MS = Number(process.env.NODE_AGENT_COUNTERS_CACHE_MAX_M
 // to 36k counters on an 18k-proxy node; under generation load the old 5 s
 // execCapture default SIGKILLed it and the whole poll cycle failed. 20 s by
 // default, NODE_AGENT_NFT_DUMP_TIMEOUT_MS to tune (min 5 s).
+// Coupling: the first /accounting chunk of a cycle sends nothing until the dump
+// is parsed, so the orchestrator's TRAFFIC_POLL_REQUEST_TIMEOUT_SEC (default
+// 10) must stay ABOVE this / 1000 + parse time (30 recommended) — otherwise a
+// 10-20 s dump still fails the cycle as a client read timeout.
 const NFT_DUMP_TIMEOUT_MS = Math.max(5000, Number(process.env.NODE_AGENT_NFT_DUMP_TIMEOUT_MS || 20000) || 20000);
 // The cache holds the dump already PARSED into Map(port -> {in, out, in6}):
 // every chunk of a cycle is a few Map lookups instead of a regex pass over all
@@ -336,74 +340,128 @@ function _writeBlockedList(set) {
 // Set membership (which ports are blocked) is managed separately and NOT gated,
 // so enforcement stays correct.
 let _blockInfraEnsured = false;
+// Overridable exec seam for the block path's nft calls (unit tests stub nft,
+// which is absent in the test env).
+let _nftExec = execCapture;
+function _setNftExec(fn) {
+  _nftExec = typeof fn === "function" ? fn : execCapture;
+  _blockInfraEnsured = false;
+}
+
 async function ensurePergbBlockInfra() {
   if (_blockInfraEnsured) return;
-  await execCapture("nft", ["add", "table", "inet", NFT_TABLE]);
-  await execCapture("nft", [
+  await _nftExec("nft", ["add", "table", "inet", NFT_TABLE]);
+  await _nftExec("nft", [
     "add", "chain", "inet", NFT_TABLE, "input",
     "{", "type", "filter", "hook", "input", "priority", "filter", ";", "policy", "accept", ";", "}",
   ]);
-  await execCapture("nft", [
+  await _nftExec("nft", [
     "add", "set", "inet", NFT_TABLE, NFT_BLOCK_SET,
     "{", "type", "inet_service", ";", "}",
   ]);
-  const cur = await execCapture("nft", ["list", "chain", "inet", NFT_TABLE, "input"]);
+  const cur = await _nftExec("nft", ["list", "chain", "inet", NFT_TABLE, "input"]);
   if (new RegExp("@" + NFT_BLOCK_SET + "[\\s\\S]*drop").test(cur.stdout || "")) {
     _blockInfraEnsured = true;
     return;
   }
-  const ins = await execCapture("nft", [
+  const ins = await _nftExec("nft", [
     "insert", "rule", "inet", NFT_TABLE, "input",
     "tcp", "dport", "@" + NFT_BLOCK_SET, "drop",
   ]);
   if (ins.code === 0) _blockInfraEnsured = true;
 }
 
+// Returns execCapture's result ({code, stdout, stderr}); never throws.
 async function _nftSetElement(op, portNum) {
-  await execCapture("nft", [
+  return _nftExec("nft", [
     op, "element", "inet", NFT_TABLE, NFT_BLOCK_SET, "{", String(portNum), "}",
   ]);
 }
 
+// Wave FLEET-HEALTH (RES-08 hardening) — `add element` with one self-heal: the
+// infra latch survives an nftables flush/restart that drops our set, so on a
+// failed add re-ensure the table/set/drop rule once and retry.
+async function _nftAddBlockElement(portNum) {
+  const first = await _nftSetElement("add", portNum);
+  if (first.code === 0) return first;
+  _blockInfraEnsured = false;
+  await ensurePergbBlockInfra();
+  return _nftSetElement("add", portNum);
+}
+
 // Apply (blocked=true) or lift (blocked=false) the firewall block for a port +
-// its paired http port. Best-effort: nft failures are logged, never thrown —
-// the orchestrator reconciles and reapplyPergbBlocks restores on boot.
+// its paired http port. The blocked list is ALWAYS persisted (reapplyPergbBlocks
+// re-asserts it on boot).
+// Wave FLEET-HEALTH (RES-08 hardening) — a block that did not land THROWS
+// NftablesError("nft_block_failed") after the list write: the 200 of
+// POST /accounts/{port}/disable is what the orchestrator stamps
+// node_blocked_at on (and never re-sends), so it must mean the drop is in the
+// kernel. Unblock stays best-effort: `delete element` on a never-blocked port
+// fails with ENOENT, which must not turn every enable into a 500.
 async function _enforceBlock(portNum, blocked) {
   const http = _httpFor(portNum);
+  const ports = http ? [portNum, http] : [portNum];
+  const failures = [];
   try {
     await ensurePergbBlockInfra();
-    await _nftSetElement(blocked ? "add" : "delete", portNum);
-    if (http) await _nftSetElement(blocked ? "add" : "delete", http);
+    for (const p of ports) {
+      if (blocked) {
+        const res = await _nftAddBlockElement(p);
+        if (!res || res.code !== 0) {
+          failures.push(`add ${p}: ${String((res && res.stderr) || "").trim() || `exit ${res ? res.code : "?"}`}`);
+        }
+      } else {
+        await _nftSetElement("delete", p);
+      }
+    }
+    if (blocked && !_blockInfraEnsured) failures.push("drop rule not confirmed");
   } catch (err) {
-    console.error(
-      `[accounting] nft ${blocked ? "block" : "unblock"} port ${portNum} failed: ${(err && err.message) || err}`
-    );
+    failures.push(String((err && err.message) || err));
   }
   const list = _readBlockedList();
-  if (blocked) {
-    list.add(portNum);
-    if (http) list.add(http);
-  } else {
-    list.delete(portNum);
-    if (http) list.delete(http);
+  for (const p of ports) {
+    if (blocked) list.add(p);
+    else list.delete(p);
   }
   _writeBlockedList(list);
+  if (blocked && failures.length > 0) {
+    const detail = failures.join("; ").slice(0, 500);
+    console.error(`[accounting] nft block port ${portNum} failed: ${detail}`);
+    throw new NftablesError("nft_block_failed", detail);
+  }
 }
 
 // Re-assert every persisted block. Call on agent startup: a reboot clears the
 // in-memory nft set and respawns all 3proxy from cfg, which would otherwise
-// silently un-block depleted pay-per-GB accounts.
+// silently un-block depleted pay-per-GB accounts. Best-effort (boot must not
+// fail); failed adds are counted and logged.
 async function reapplyPergbBlocks() {
   const list = _readBlockedList();
-  if (list.size === 0) return { reapplied: 0 };
+  if (list.size === 0) return { reapplied: 0, failed: 0 };
+  let failed = 0;
+  let healed = false;
   try {
     await ensurePergbBlockInfra();
-    for (const p of list) await _nftSetElement("add", p);
+    for (const p of list) {
+      // Self-heal at most once per reapply: with nft broken, thousands of
+      // persisted ports must not each re-run the infra setup.
+      let res = await _nftSetElement("add", p);
+      if ((!res || res.code !== 0) && !healed) {
+        healed = true;
+        _blockInfraEnsured = false;
+        await ensurePergbBlockInfra();
+        res = await _nftSetElement("add", p);
+      }
+      if (!res || res.code !== 0) failed += 1;
+    }
   } catch (err) {
     console.error(`[accounting] reapplyPergbBlocks failed: ${(err && err.message) || err}`);
   }
-  console.log(`[accounting] reapplied ${list.size} pergb firewall block(s)`);
-  return { reapplied: list.size };
+  if (failed > 0) {
+    console.error(`[accounting] reapplyPergbBlocks: ${failed}/${list.size} block(s) did not apply`);
+  }
+  console.log(`[accounting] reapplied ${list.size - failed} pergb firewall block(s)`);
+  return { reapplied: list.size - failed, failed };
 }
 
 // Block a pay-per-GB port: firewall-drop it (works for every port, incl.
@@ -426,22 +484,36 @@ async function disablePort(port) {
   if (!Number.isInteger(portNum) || portNum <= 0) {
     throw new PortNotFoundError(port);
   }
-  await _enforceBlock(portNum, true);
+  // Wave FLEET-HEALTH (RES-08 hardening) — a failed nft block is held until the
+  // per-port cfg teardown below has run (a single-port 3proxy is still killed),
+  // then thrown: the route answers 500 disable_failed instead of a 200 the
+  // orchestrator would stamp node_blocked_at on and never retry.
+  let nftError = null;
+  try {
+    await _enforceBlock(portNum, true);
+  } catch (err) {
+    nftError = err;
+  }
   // Security audit 2026-10-02 — disabling a batch's START port used to SIGTERM
   // the whole batch (every other customer in it lost the proxy) AND demote its
   // cfg, so a reboot never brought the batch back. For a batch the nft drop is
   // the whole enforcement; the shared process and cfg are never touched.
   if (_isBatchCfg(configPathForPort(portNum))) {
+    if (nftError) throw nftError;
     return { action: "blocked_nft_only", port: portNum, batch: true };
   }
+  let result;
   try {
-    return await _disablePortCfg(portNum);
+    result = await _disablePortCfg(portNum);
   } catch (err) {
     if (err && err.code === "PORT_NOT_FOUND") {
+      if (nftError) throw nftError;
       return { action: "blocked_nft_only", port: portNum };
     }
-    throw err;
+    throw nftError || err;
   }
+  if (nftError) throw nftError;
+  return result;
 }
 
 async function _disablePortCfg(port) {
@@ -619,6 +691,7 @@ module.exports = {
   reapplyPergbBlocks,
   ensurePergbBlockInfra,
   _enforceBlock,
+  _setNftExec,
   _readBlockedList,
   _isBatchCfg,
   // Metering-cache test hooks (accounting.meter_cache.test.js).

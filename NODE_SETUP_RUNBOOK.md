@@ -189,7 +189,8 @@ ssh root@<NODE_IP> 'tail -10 /var/log/netrun-trend.log'
 Для нод с крупными pergb-клиентами (1000+ портов):
 
 ```ini
-TRAFFIC_POLL_REQUEST_TIMEOUT_SEC=30   # default 10 — мало для опроса 2000+ портов
+TRAFFIC_POLL_REQUEST_TIMEOUT_SEC=30   # default 10 — мало для опроса 2000+ портов; должен быть
+                                      # БОЛЬШЕ NODE_AGENT_NFT_DUMP_TIMEOUT_MS/1000 (20 с) + парсинг — нужен на ЛЮБОЙ ноде
 TRAFFIC_POLL_DEGRADE_AFTER=15         # default 5 — не валить degraded по мелочи
 PROXY_ALLOW_DEGRADED_NODES=true       # degraded ноды продолжают участвовать в reserve/refill
 ```

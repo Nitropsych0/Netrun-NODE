@@ -1191,6 +1191,33 @@ function perStartPortFiles(startPort) {
   ];
 }
 
+// Wave FLEET-HEALTH (RES-12) — is the cfg path a running 3proxy was started with
+// (from `ps`) the agent's own cfg for that start port? Compared by directory
+// IDENTITY, not by string: the generator launches 3proxy as
+// `/root/proxyserver/3proxy/bin/3proxy /root/proxyserver/3proxy/3proxy_<P>.cfg`
+// (`cd ~` = /root), and install_node_v2.sh makes /root/proxyserver a symlink
+// to /opt/netrun/proxyserver = PROXY_ROOT — path.normalize never resolves that,
+// so every generator-launched batch used to be killed but left uncleaned
+// (netrun-harden.sh / deprovision.js match by basename for the same reason).
+// Basename must be exactly 3proxy_<P>.cfg and both directories must realpath
+// to the same place; if realpath fails, only an exact normalized match counts.
+async function isCanonicalCfgPath(cfgPath, startPort) {
+  const sp = toPositiveInt(startPort, 0);
+  if (!sp || !cfgPath) return false;
+  const expected = buildCfgPathForStartPort(sp);
+  if (path.normalize(expected) === path.normalize(cfgPath)) return true;
+  if (path.basename(cfgPath) !== path.basename(expected)) return false;
+  try {
+    const [actualDir, expectedDir] = await Promise.all([
+      fsp.realpath(path.dirname(cfgPath)),
+      fsp.realpath(path.dirname(expected)),
+    ]);
+    return actualDir === expectedDir;
+  } catch (_error) {
+    return false;
+  }
+}
+
 // Wave FLEET-HEALTH (RES-12) — which stale 3proxy pids a rebind may kill.
 // pids = the 3proxy pids listening inside the new socks/http ranges
 // (selectGenerationRebindPids); instances = collectRunningInstances() taken
@@ -1350,7 +1377,7 @@ async function killOverlappingListeners({ newStart, newCount, reclaimStartPorts 
     if (seenStart.has(startPort)) continue;
     seenStart.add(startPort);
     const expectedCfg = buildCfgPathForStartPort(startPort);
-    if (path.normalize(expectedCfg) !== path.normalize(cfgPath)) {
+    if (!(await isCanonicalCfgPath(cfgPath, startPort))) {
       console.warn("[kill-on-rebind] stale cfg path mismatch; left for manual cleanup", { pid, cfgPath, startPort });
       continue;
     }
@@ -4086,6 +4113,7 @@ module.exports = {
   LISTEN_HOST,
   planRebindKills,
   perStartPortFiles,
+  isCanonicalCfgPath,
   killOverlappingListeners,
   parseCredentialsField,
   credentialsFileState,

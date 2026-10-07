@@ -22,6 +22,9 @@ fs.writeFileSync(path.join(BIN, "pgrep"), "#!/bin/sh\nexit 1\n", { mode: 0o755 }
 process.env.PATH = `${BIN}:${process.env.PATH}`;
 const acct = require("./accounting.js");
 fs.mkdirSync(path.join(ROOT, "3proxy"), { recursive: true });
+// nft is absent here: the block path's nft calls succeed via the exec seam
+// (a failed block now throws — see accounting.block_fail.test.js).
+acct._setNftExec(async () => ({ code: 0, stdout: "", stderr: "" }));
 
 let passed = 0;
 function ok(cond, msg) {

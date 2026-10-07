@@ -155,6 +155,85 @@ test("legacy caller (no reclaimStartPorts): kills as before, now also cleans the
   for (const f of files) assert.ok(!fs.existsSync(f), `removed ${path.basename(f)}`);
 });
 
+// The generator launches 3proxy as `~/proxyserver/3proxy/bin/3proxy
+// ~/proxyserver/3proxy/3proxy_<P>.cfg` with ~ = /root, and /root/proxyserver is
+// a symlink to PROXY_ROOT (install_node_v2.sh). ps shows that symlinked path.
+const LEGACY = path.join(TMP, "root", "proxyserver");
+fs.mkdirSync(path.dirname(LEGACY), { recursive: true });
+fs.symlinkSync(PROXY_ROOT, LEGACY);
+const LEGACY_CFG = (p) => path.join(LEGACY, "3proxy", `3proxy_${p}.cfg`);
+
+test("isCanonicalCfgPath: canonical and symlinked dirs match, others never", async () => {
+  fs.writeFileSync(CFG(18200), "");
+  const elsewhere = path.join(TMP, "elsewhere", "3proxy");
+  fs.mkdirSync(elsewhere, { recursive: true });
+  assert.strictEqual(await srv.isCanonicalCfgPath(CFG(18200), 18200), true);
+  assert.strictEqual(await srv.isCanonicalCfgPath(LEGACY_CFG(18200), 18200), true);
+  // the cfg file itself need not exist: identity is decided by its directory
+  assert.strictEqual(await srv.isCanonicalCfgPath(LEGACY_CFG(18300), 18300), true);
+  assert.strictEqual(await srv.isCanonicalCfgPath(LEGACY_CFG(18200), 18300), false, "start port must match the name");
+  assert.strictEqual(await srv.isCanonicalCfgPath(path.join(LEGACY, "3proxy", "x3proxy_18200.cfg"), 18200), false);
+  assert.strictEqual(await srv.isCanonicalCfgPath(path.join(elsewhere, "3proxy_18200.cfg"), 18200), false);
+  assert.strictEqual(await srv.isCanonicalCfgPath(path.join(TMP, "missing", "3proxy_18200.cfg"), 18200), false);
+  assert.strictEqual(await srv.isCanonicalCfgPath("", 18200), false);
+  fs.rmSync(CFG(18200));
+});
+
+test("generator-launched batch (ps shows the /root/proxyserver symlink): killed AND cleaned, egress forgotten", { timeout: 15_000 }, async () => {
+  const egress = require("./egress.js");
+  const realForget = egress.forgetPorts;
+  const forgotten = [];
+  egress.forgetPorts = async (ports) => {
+    forgotten.push(...ports);
+    return { ok: true, forgotten: ports.length };
+  };
+  const child = startDummy();
+  const exited = new Promise((r) => child.once("exit", r));
+  try {
+    writeStubs(child.pid, 18100);
+    fs.writeFileSync(
+      path.join(BIN, "ps"),
+      `#!/bin/sh\necho '  PID ARGS'\necho '${child.pid} ${LEGACY}/3proxy/bin/3proxy ${LEGACY_CFG(18100)}'\n`,
+      { mode: 0o755 }
+    );
+    const files = seedBatchFiles(18100);
+    const r = await srv.killOverlappingListeners({ newStart: 18100, newCount: 1500 });
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual(r.killedPids, [child.pid]);
+    assert.deepStrictEqual(r.cleanedStartPorts, [18100]);
+    await exited;
+    for (const f of files) assert.ok(!fs.existsSync(f), `removed ${path.basename(f)}`);
+    assert.deepStrictEqual(forgotten, [18100, 18101]);
+  } finally {
+    egress.forgetPorts = realForget;
+    child.kill("SIGKILL");
+  }
+});
+
+test("a killed 3proxy whose cfg lives in an unrelated dir: files of the agent's batch are kept", { timeout: 15_000 }, async () => {
+  const child = startDummy();
+  const exited = new Promise((r) => child.once("exit", r));
+  const other = path.join(TMP, "other", "3proxy");
+  fs.mkdirSync(other, { recursive: true });
+  try {
+    writeStubs(child.pid, 18100);
+    fs.writeFileSync(
+      path.join(BIN, "ps"),
+      `#!/bin/sh\necho '  PID ARGS'\necho '${child.pid} /usr/bin/3proxy ${path.join(other, "3proxy_18100.cfg")}'\n`,
+      { mode: 0o755 }
+    );
+    const files = seedBatchFiles(18100);
+    const r = await srv.killOverlappingListeners({ newStart: 18100, newCount: 1500 });
+    assert.deepStrictEqual(r.killedPids, [child.pid]);
+    assert.deepStrictEqual(r.cleanedStartPorts, []);
+    await exited;
+    for (const f of files) assert.ok(fs.existsSync(f), `kept ${path.basename(f)}`);
+    for (const f of files) fs.rmSync(f, { force: true });
+  } finally {
+    child.kill("SIGKILL");
+  }
+});
+
 test("haproxy on the paired http port is never a conflict", async () => {
   fs.writeFileSync(
     path.join(BIN, "ss"),

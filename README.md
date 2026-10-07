@@ -164,7 +164,12 @@ Every batch kill-on-rebind tears down now loses ALL its per-start-port files (cf
 `cfg.disabled`, `proxy-startup_<p>.sh`, `ipv6_<p>.list`, `random_users_<p>.list`,
 `running_server_<p>.info`) and its egress rotation state — before, the pid→cfg lookup
 ran after the kill (no file was ever removed), and a later batch at that start port
-reused the old addresses AND the old credentials.
+reused the old addresses AND the old credentials. The killed process is matched to the
+agent's cfg by start port + directory identity (realpath), not by the literal path: the
+generator starts 3proxy as `/root/proxyserver/3proxy/3proxy_<p>.cfg`, and
+`/root/proxyserver` is a symlink to `/opt/netrun/proxyserver`. A 3proxy whose cfg sits in
+an unrelated directory is still killed, but nothing is deleted
+(`stale cfg path mismatch` in the log).
 
 Job directories: `/opt/netrun/jobs` keeps the newest `NODE_AGENT_JOBS_KEEP` (200; 0 =
 off) plus the running generation's, any queued/running job updated within 30 min and
@@ -175,7 +180,15 @@ instance" path). Pruned after each generation and a minute after start.
 
 - The `nft -j list counters` dump runs with a 20 s timeout
   (`NODE_AGENT_NFT_DUMP_TIMEOUT_MS`; was execCapture's 5 s SIGKILL) and is parsed ONCE
-  per poll cycle into `Map(port → counters)`; every 100-port chunk is served from it.
+  per poll cycle into `Map(port → counters)`; every `/accounting` chunk is served from it.
+  The first chunk of a cycle waits for the whole dump before a byte is sent, so the
+  orchestrator's per-request read budget (`TRAFFIC_POLL_REQUEST_TIMEOUT_SEC`, default 10)
+  must be ABOVE `NODE_AGENT_NFT_DUMP_TIMEOUT_MS / 1000` plus parse time — set it to 30 on
+  the orchestrator. With the default 10 s a dump of 10–20 s still fails the whole cycle
+  (client read timeout → `accounting_request_failed`), and the abandoned dump is not
+  reused by the next cycle (the 2 s gap rule starts a fresh one). Measure the real dump
+  time on a node (`time nft -j list counters table inet proxy_accounting >/dev/null`, or
+  the orchestrator repo's `scripts/bench_node.sh`) before relying on either number.
 - Opt-in `NETRUN_ACCOUNTING_MATCH_IPV4=1` in `/etc/netrun/netrun.env` (`KEY=VALUE`
   lines, read by the generator and by `netrun-https`; an environment variable of the same
   name wins, for one-off runs — do not set it only in the agent unit, the 5-min sync
@@ -214,6 +227,13 @@ and are idempotent:
 - disabling an already-disabled port returns 200 `already_disabled`
 - enabling an already-enabled port returns 200 `already_enabled`
 - operations on unknown ports return 404 `port_not_found`
+- disable answers 200 only when the nft drop (`pergb_blocked`, socks + paired http port)
+  is in the kernel; a failed `nft add element` (non-zero exit / timeout, after one
+  table/set re-ensure + retry) or an unconfirmed drop rule returns 500
+  `{success:false, error:"disable_failed", detail:"nft_block_failed"}` so the
+  orchestrator retries. The port is still written to `pergb_blocked.list` (re-applied on
+  boot) and a single-port cfg is still torn down. Enable stays best-effort on the nft
+  side (`delete element` of a never-blocked port fails harmlessly).
 - `GET /accounting` on missing ports returns 200 with the port omitted
   from the response (defensive contract — orchestrator handles partial
   maps gracefully)
