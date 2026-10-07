@@ -279,6 +279,8 @@ table ip6 netrun_egress {
                snat to ip6 saddr map @static_egress }
   chain forward_guard { type filter hook forward priority filter; policy accept;
                ip6 daddr <the node's /64> drop }         # forward guard, see below
+  chain exit_guard { type filter hook input priority filter - 10; policy accept;
+               ... }                                     # exit guard, see below
 }
 ```
 
@@ -289,7 +291,8 @@ is keyed by the client-facing port and does not change. Every nft change is one
 definition rebuild if the kernel no longer matches), so the table is never half
 applied. A new address is the node's /64 + 64 random bits, never one already on the
 NIC, another proxy entry, an anchor or an address of the state. The agent creates the
-(empty) table when it starts; with nothing rotated it changes no packet.
+(empty) table when it starts; with nothing rotated it changes no outgoing packet (the
+exit guard below filters inbound ones from the start).
 
 **Proxy NDP, not NIC addresses.** Rotated, pool and draining addresses are never put
 on the interface. Measured on a production node (Vultr, Ubuntu 24.04, kernel 6.8,
@@ -326,9 +329,73 @@ it) would be forwarded back out the on-link /64 and ping-pong with the router. T
 node forwards for nobody, so `chain forward_guard` drops every forwarded packet to the node's
 /64 (the prefix the module detected or `NODE_EGRESS_PREFIX`). Neighbour solicitations
 to a proxied address are handled before the forward hook and are not affected.
-Unlike anchors, rotated addresses therefore answer no ping and accept no inbound
-connection; the kernel may still send a rate-limited (1/s per destination) ICMPv6
-redirect for such a packet before the hook drops it.
+Rotated addresses therefore answer no ping and accept no inbound connection; the
+kernel may still send a rate-limited (1/s per destination) ICMPv6 redirect for such a
+packet before the hook drops it.
+
+**Exit guard** (audit FP-01, `EGRESS_EXIT_GUARD`, on by default). Every anchor is a
+local address of the node, so without a filter a port scan of a customer's exit IPv6 —
+which anti-fraud services run against a visitor's IP — finds the node's sshd on `:22`
+and the agent on `:8085` (anything listening on `[::]`), and every closed port answers
+with a RST: an obvious server, not a home line. A home router silently drops what nobody asked for;
+`chain exit_guard` does the same for every address of the node's /64 except the node's
+own:
+
+```text
+chain exit_guard {
+    type filter hook input priority filter - 10; policy accept;
+    iif "lo" accept                          # local traffic, also to a local anchor
+    ip6 daddr != <the node's /64> accept     # link-local, multicast, other prefixes
+    ip6 daddr <primary> accept               # the node's own address (none known: no rule)
+    ct state established,related accept      # replies to connections the node opened
+    icmpv6 type echo-request drop            # no ping answers on exit addresses
+    meta l4proto ipv6-icmp accept            # NDP, packet too big, errors
+    drop                                     # SYN to any port, unsolicited UDP
+}
+```
+
+- **What still works.** Every reply to a connection the node opened: proxied TCP, SOCKS
+  UDP ASSOCIATE replies, unbound's recursion (it listens on `::1`/`127.0.0.1` only), the
+  agent's own probes, and the replies to rotated/pool addresses (conntrack de-NATs them
+  back to the anchor in PREROUTING, before this hook). Neighbour discovery: the router's
+  multicast solicitations and router advertisements are not addressed to the /64, its
+  unicast reachability probes (for anchors, and for proxy entries, which
+  `ip6_forward()` hands to local input) are ICMPv6. DHCPv6 needs no rule either: a
+  client talks from its link-local address and servers answer there (Vultr uses SLAAC
+  anyway). Customers reach the proxies on the node's IPv4, which this IPv6 table never
+  sees.
+- **Primary address.** The node's own address(es) inside the /64 keep inbound access, so
+  admin SSH over IPv6 keeps working: global addresses of the egress interface whose
+  prefix length is not 128 and that are not flagged `nodad`, minus every cfg anchor and
+  every address of the egress state. Not the prefix length alone: `netrun-ipv6-restore`
+  re-adds every anchor as a /64 at boot; every anchor is added with `nodad` (the
+  generator's /128s, the restore's /64s) while the host's SLAAC/netplan address never
+  is, and an anchor without the flag (an older restore script) is still a cfg anchor.
+  Recomputed at start and on every 30 s GC tick (one `ip -6 -o addr show dev <if> scope
+  global`); a change is one full table rebuild. More than 8 candidates → none (logged):
+  the /64 then carries something unexpected and the guard must not open it all. With
+  none, every address of the /64 is filtered — IPv4 access is unaffected.
+- **Priority `filter - 10`**: before `inet proxy_accounting`'s input chain (priority 0),
+  whose per-port meter matches `tcp dport` only (IPv6 included, unless
+  `NETRUN_ACCOUNTING_MATCH_IPV4=1`), so a scan of `[exit address]:<a customer's port>`
+  is dropped before it is metered as that customer's traffic.
+- **Behaviour change**: unsolicited inbound to an exit address is gone, as behind a home
+  NAT — SOCKS `BIND` and P2P traffic that expects a peer other than the one contacted
+  to reach the exit address no longer work over IPv6, and a proxied TCP connection idle
+  longer than `nf_conntrack_tcp_timeout_established` (7200 s in `99-netrun.conf`) whose
+  remote side speaks first after the idle is dropped (a rotated port already depends on
+  that entry for its de-NAT).
+- Element deltas (rotations, mode changes) never touch chains; every full rebuild
+  (start, drift repair, primary change) writes the guard. `EGRESS_EXIT_GUARD=off`
+  leaves the chain out at the next start. Between the boot load of
+  `/etc/nftables.conf` (the boot drop-in deletes the whole table) and the agent's
+  start-up rebuild there is no guard for a few seconds; while the module is unavailable
+  (`/egress` answers 503) there is none either.
+
+`scripts/smoke_egress_rotation.sh` checks it against the real kernel: with a listener on
+`[::]:22`, `[anchor]:22` and a closed anchor port time out (no SYN-ACK, no RST), the
+anchor answers no ping and unsolicited UDP to it is dropped, while the node's own address
+accepts `:22` and answers ping and the anchor's upstream connections keep working.
 
 **Upgrade from the version that added NIC addresses.** At start the agent re-adds the
 proxy entry of every current, pool and draining address of its state in one batch,
@@ -383,6 +450,7 @@ Environment (agent unit drop-in):
 | `NODE_EGRESS_PREFIX` | — | the /64 for new addresses (e.g. `2001:db8:1:2::/64`); default: the /64 of the first global address on the default-route IPv6 interface |
 | `EGRESS_NFT_DROPIN` | `/etc/systemd/system/nftables.service.d/netrun-egress.conf` | the boot drop-in below; `off` = do not write it |
 | `EGRESS_SYSCTL_CONF` | `/etc/sysctl.d/99-netrun-egress.conf` | where the proxy-NDP sysctls above are persisted (rewritten at start only when different); `off` = do not write it |
+| `EGRESS_EXIT_GUARD` | `on` | the exit guard above (`chain exit_guard`); `off` = leave it out of the table (at the next start) |
 
 Address count: every extra address is one more proxy entry (and one more
 solicited-node multicast group — the kernel joins it so the router's solicitations
@@ -404,9 +472,11 @@ bounded whatever callers do:
 Addresses and reboots: the state lives in `$PROXY_ROOT/egress_state.json` (atomic
 tmp+fsync+rename, written before a call answers). Retired addresses drain and a 30 s
 GC deletes their proxy entries in one batch; an anchor, a current or a pool address is
-never deleted. The same tick checks that the table still exists (`nft list chain ip6
-netrun_egress post`, only while something is mapped) and rebuilds it from the state
-after an `nft flush ruleset` or a `systemctl restart nftables`, and — while the state
+never deleted. The same tick re-detects the exit guard's primary address (a change →
+one rebuild), checks that the table still exists (`nft list chain ip6 netrun_egress
+exit_guard`; with the guard off `... post`, only while something is mapped) and
+rebuilds it from the state after an `nft flush ruleset` or a `systemctl restart
+nftables`, and — while the state
 holds an address — re-checks the sysctls and lists the proxy entries
 (`ip -6 neigh show proxy dev <if>`), re-adding any that vanished (the kernel drops a
 device's proxy entries when it goes down, and a re-created interface starts with
@@ -428,8 +498,9 @@ drop-in on `nftables.service` deletes the table right after the boot load:
 ExecStartPost=-/usr/sbin/nft delete table ip6 netrun_egress
 ```
 
-Rotated ports then leave from their anchors until the agent's start-up rebuild (a few
-seconds; the proxy entries come back in the same start-up). `install_node_v2.sh` and `node_followup_v2.sh` install it, and the agent
+Rotated ports then leave from their anchors (and the exit guard is off) until the
+agent's start-up rebuild (a few seconds; the proxy entries come back in the same
+start-up). `install_node_v2.sh` and `node_followup_v2.sh` install it, and the agent
 writes it at start when it is missing or different (then a best-effort
 `systemctl daemon-reload`), so a code deploy covers existing nodes.
 
@@ -441,7 +512,7 @@ entries on a node.
 ```bash
 IF="$(ip -6 route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
 ip -6 neigh show proxy dev "$IF" | awk -v d="$IF" 'NF { print "neigh del proxy " $1 " dev " d }' | ip -6 -force -batch -
-nft delete table ip6 netrun_egress          # every port leaves from its anchor again
+nft delete table ip6 netrun_egress          # every port leaves from its anchor again; the exit guard goes too
 rm -f /opt/netrun/proxyserver/egress_state.json /etc/sysctl.d/99-netrun-egress.conf
 nft list ruleset > /etc/nftables.conf       # the saved copy goes too
 # the drop-in may stay (a missing table is ignored); proxy_ndp=1 with no entries is harmless
@@ -467,11 +538,14 @@ The smoke runs the module against the real kernel (iproute2, proxy NDP, nft NAT,
 conntrack) entirely inside throw-away network namespaces — the veth pair is created
 inside them, the module's state and sysctl file go to a temp dir, everything is removed
 on exit — so it leaves the host's addresses, neighbour table, ruleset and sysctls alone.
-It checks the sysctls and the forward guard, that rotated and pool addresses are proxy
-entries and never NIC addresses, open connections across a rotation and across the
-move off the NIC, the GC, that unsolicited packets to a rotated address are dropped at
-the forward hook, that a unicast reachability probe for one is answered, and that the
-saved ruleset loads back at boot.
+It checks the sysctls and the forward guard, the exit guard (a TCP connect from the
+"internet" namespace to `[anchor]:22` with a listener on `[::]:22`, or to a closed port,
+times out with no RST, no ping reply, unsolicited UDP dropped, the node's own address
+still reachable, `EGRESS_EXIT_GUARD=off` and back), that rotated and pool addresses are
+proxy entries and never NIC addresses, open connections across a rotation and across the
+move off the NIC (all with the exit guard on), the GC, that unsolicited packets to a
+rotated address are dropped at the forward hook, that a unicast reachability probe for
+one is answered, and that the saved ruleset (exit guard included) loads back at boot.
 
 ## Smoke Generate
 

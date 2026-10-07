@@ -19,6 +19,8 @@
 //     chain dyn           snat to numgen random mod K map { pool }
 //     chain post          nat postrouting: @dyn_anchors -> dyn, else the map
 //     chain forward_guard filter forward: drop anything to the node's /64
+//     chain exit_guard    filter input: unsolicited inbound to an exit address
+//                         is dropped (EGRESS_EXIT_GUARD, see "Exit guard")
 //   }
 //
 // Only the first packet of a connection is NATed and conntrack carries the
@@ -40,6 +42,33 @@
 // an address (a drained one, a scan) would be FORWARDED — forwarding is on
 // and the /64 is on-link — back out to the router; chain forward_guard drops them (the
 // node forwards for nobody).
+//
+// Exit guard (chain exit_guard, input hook). Every anchor is a local address
+// of the node's /64, so without a filter a port scan of a customer's exit
+// IPv6 finds sshd on :22 and the agent on :8085 — a server, not a home line —
+// and every closed port answers RST. A home router drops what nobody asked
+// for; so does this chain, for every address of the /64 except the node's
+// own (primary) address(es), which keep admin access over IPv6:
+//   iif lo accept                  local traffic (a local connection to an
+//                                  anchor travels over lo with that daddr)
+//   ip6 daddr != <the /64> accept  link-local, multicast (router NS/RA, and
+//                                  DHCPv6 replies, which go to link-local),
+//                                  other prefixes
+//   ip6 daddr <primary> accept     the host's own address (parsePrimaryAddrs)
+//   ct state established,related accept   replies to upstream connections
+//                                  (TCP, SOCKS UDP ASSOCIATE, unbound's
+//                                  recursion, the agent's probes), de-NATed
+//                                  replies to rotated / pool addresses
+//   icmpv6 type echo-request drop  no ping answers on exit addresses
+//   meta l4proto ipv6-icmp accept  NDP (incl. the unicast NS for proxy
+//                                  entries, which ip6_forward() hands to
+//                                  ip6_input()), PMTU, errors
+//   drop                           SYN to any port, unsolicited UDP
+// Priority filter - 10: before the proxy_accounting input chain (priority 0),
+// whose per-port meter matches `tcp dport` only (IPv6 too), so a scan of
+// [exit]:<a customer's port> is dropped before it is metered as theirs.
+// The primary set is recomputed at init and on every GC tick (a change →
+// one full rebuild); element deltas never touch chains.
 //
 // Owned here: the table, $PROXY_ROOT/egress_state.json, the proxy entries
 // for the addresses above, the egress interface's proxy-NDP sysctls (also
@@ -72,7 +101,7 @@
 // /etc/nftables.conf`), this table included, and its proxy entries are gone
 // after a reboot. A drop-in on nftables.service (written at start, see
 // nftDropinText) deletes the table right after the boot load, so ports leave
-// from their anchors until init() rebuilds it.
+// from their anchors (and the exit guard is off) until init() rebuilds it.
 
 const fs = require("fs");
 const path = require("path");
@@ -98,6 +127,9 @@ const DEFAULT_MAX_EXTRA_ADDRS = 40000;
 const DEFAULT_NFT_DROPIN = "/etc/systemd/system/nftables.service.d/netrun-egress.conf";
 const DEFAULT_SYSCTL_CONF = "/etc/sysctl.d/99-netrun-egress.conf";
 const DEFAULT_PROC_SYS = "/proc/sys";
+// More candidate primary addresses than this → none (parsePrimaryAddrs): the
+// /64 then carries something unexpected, and the guard must not open it all.
+const MAX_PRIMARY_ADDRS = 8;
 
 const ERR_PORT_NOT_FOUND = "port_not_found";
 const ERR_ANCHOR_NOT_FOUND = "anchor_not_found";
@@ -262,6 +294,34 @@ function parseNeighProxy(text) {
     if (addr) out.add(addr);
   }
   return out;
+}
+
+// The node's own (primary) address(es) inside `prefix`, for the exit guard,
+// from `ip -6 -o addr show dev <if> scope global`: a global address whose
+// prefix length is not 128 and that is not flagged nodad or dadfailed, minus
+// `exclude` (the cfg anchors and this module's addresses). Not the prefix
+// length alone: netrun-ipv6-restore re-adds every anchor as a /64 at boot.
+// Every anchor is added with nodad (the generator's /128s, the restore's
+// /64s); the host's own address (SLAAC, netplan) never is, and an anchor
+// that lacks the flag (an older restore script) is still a cfg anchor.
+// Sorted, so the rebuild text is stable. Returns { addrs, candidates }:
+// more than MAX_PRIMARY_ADDRS candidates → addrs [] (fail closed).
+// On a full node ~16k anchor lines go by with one regex each: the prefix
+// length and the flags are checked before any address is parsed.
+function parsePrimaryAddrs(text, prefix, exclude = new Set()) {
+  const found = new Set();
+  for (const line of String(text || "").split("\n")) {
+    const m = /\binet6\s+([0-9a-fA-F:.]+)\/(\d+)\s*(.*)$/.exec(line);
+    if (!m || m[2] === "128") continue;
+    // `-o` output: the flags end where the lifetimes' "\" begins
+    const flags = m[3].split("\\")[0];
+    if (!/\bscope global\b/.test(flags) || /\b(?:nodad|dadfailed)\b/.test(flags)) continue;
+    const addr = normalizeIpv6(m[1]);
+    if (!addr || !inPrefix(addr, prefix) || exclude.has(addr)) continue;
+    found.add(addr);
+  }
+  const all = [...found].sort();
+  return { addrs: all.length > MAX_PRIMARY_ADDRS ? [] : all, candidates: all.length };
 }
 
 // ── proxy-NDP sysctls ────────────────────────────────────────────────────
@@ -679,11 +739,37 @@ function elementsBlock(list) {
   return ["\t\telements = {", ...list.map((x, i) => `\t\t\t${x}${i < list.length - 1 ? "," : ""}`), "\t\t}"];
 }
 
+// chain exit_guard (see the header). `primary`: canonical addresses inside
+// the /64 that keep inbound access (none → no such rule).
+function exitGuardLines(prefix, primary) {
+  const lines = [
+    "\tchain exit_guard {",
+    "\t\ttype filter hook input priority filter - 10; policy accept;",
+    "\t\tiif \"lo\" accept",
+    `\t\tip6 daddr != ${prefix} accept`,
+  ];
+  if (primary.length === 1) lines.push(`\t\tip6 daddr ${primary[0]} accept`);
+  else if (primary.length > 1) lines.push(`\t\tip6 daddr { ${primary.join(", ")} } accept`);
+  lines.push(
+    "\t\tct state established,related accept",
+    "\t\ticmpv6 type echo-request drop",
+    "\t\tmeta l4proto ipv6-icmp accept",
+    "\t\tdrop",
+    "\t}",
+  );
+  return lines;
+}
+
 // The whole table as one transaction: `add table` makes the `delete` safe on
 // a node that has none yet. `prefix`: the node's /64 text ("2001:db8::/64"),
-// for the forward guard (chain forward_guard; see the header).
-function nftRebuildScript(state, prefix) {
+// for the forward guard (chain forward_guard; see the header) and the exit
+// guard (chain exit_guard, unless `exitGuard` is false; `primary`: the
+// node's own addresses it lets in).
+function nftRebuildScript(state, prefix, { exitGuard = true, primary = [] } = {}) {
   if (!parsePrefix(prefix)) throw new TypeError(`nftRebuildScript: bad /64 prefix ${prefix}`);
+  for (const a of primary) {
+    if (normalizeIpv6(a) !== a) throw new TypeError(`nftRebuildScript: bad primary address ${a}`);
+  }
   const d = desiredNft(state);
   return [
     `add table ip6 ${TABLE}`,
@@ -709,6 +795,7 @@ function nftRebuildScript(state, prefix) {
     "\t\ttype filter hook forward priority filter; policy accept;",
     `\t\tip6 daddr ${prefix} drop`,
     "\t}",
+    ...(exitGuard ? exitGuardLines(prefix, primary) : []),
     "}",
     "",
   ].join("\n");
@@ -901,6 +988,8 @@ function readConfig(env) {
     sysctlConf: sysctlConf === "off" ? null : path.normalize(sysctlConf || DEFAULT_SYSCTL_CONF),
     // where the sysctls are read and written; only tests point it elsewhere
     procSys: path.normalize(String(env.EGRESS_PROC_SYS || "").trim() || DEFAULT_PROC_SYS),
+    // "off" = no chain exit_guard (anything else, unset included, = on)
+    exitGuard: String(env.EGRESS_EXIT_GUARD || "").trim().toLowerCase() !== "off",
   };
 }
 
@@ -974,6 +1063,14 @@ function createEgressService({
   // entry or their delete failed). They still work there; the GC deletes
   // the NIC copy too once they are due. Rebuilt by every init.
   let nicLeftovers = new Map();
+  // The exit guard's primary address(es) (parsePrimaryAddrs), as the last
+  // table written holds them; recomputed by init and every GC tick.
+  let primary = [];
+  let primaryNote = null; // the last detection result logged
+
+  function rebuildScript(s) {
+    return nftRebuildScript(s, prefix.text, { exitGuard: cfg.exitGuard, primary });
+  }
 
   function markUnavailable(why) {
     if (why !== reason || ready) log.error(`[egress] unavailable: ${why}`);
@@ -1205,30 +1302,71 @@ function createEgressService({
     if (!dev) return { ok: false, reason: "no_default_ipv6_route" };
     if (cfg.prefix) {
       const p = parsePrefix(cfg.prefix);
-      return p ? { ok: true, iface: dev, prefix: p } : { ok: false, reason: `bad_NODE_EGRESS_PREFIX: ${cfg.prefix}` };
+      return p ? { ok: true, iface: dev, prefix: p, listing: null } : { ok: false, reason: `bad_NODE_EGRESS_PREFIX: ${cfg.prefix}` };
     }
     const list = await run("ip", ["-6", "-o", "addr", "show", "dev", dev, "scope", "global"], { timeoutMs: 30000 });
     if (list.code !== 0) return { ok: false, reason: `ip_failed: ${stderrOf(list)}` };
     const first = parseIpAddrShow(list.stdout).find((a) => a.scope === "global" && !/\bdadfailed\b/.test(a.flags));
     if (!first) return { ok: false, reason: `no_global_ipv6_on_${dev}` };
-    return { ok: true, iface: dev, prefix: prefixFromGroups(ipv6Groups(first.addr)) };
+    // the listing serves init's primary detection too (one listing, not two)
+    return { ok: true, iface: dev, prefix: prefixFromGroups(ipv6Groups(first.addr)), listing: list.stdout };
+  }
+
+  // The exit guard's primary address(es) now: from `listing` (`ip -6 -o addr
+  // show dev <if> scope global` the caller already has) or one listing (~40 ms
+  // next to 16k anchors). `exclude`: the cfg anchors and this module's
+  // addresses. null when the listing fails (the caller keeps what it has).
+  // A changed result is logged once.
+  async function detectPrimary(exclude, listing = null) {
+    let text = listing;
+    if (text === null) {
+      const res = await run("ip", ["-6", "-o", "addr", "show", "dev", iface, "scope", "global"], { timeoutMs: 30000 });
+      if (res.code !== 0) {
+        log.error(`[egress] exit guard: ip_addr_show_failed: ${stderrOf(res)}; keeping ${primary.join(",") || "no"} primary address`);
+        return null;
+      }
+      text = res.stdout;
+    }
+    const found = parsePrimaryAddrs(text, prefix, exclude);
+    const note = `${found.addrs.join(",")}/${found.candidates}`;
+    if (note !== primaryNote) {
+      primaryNote = note;
+      if (found.candidates > MAX_PRIMARY_ADDRS) {
+        log.error(
+          `[egress] exit guard: ${found.candidates} candidate primary addresses on ${iface} (over ${MAX_PRIMARY_ADDRS}); `
+          + "letting none in — IPv6 admin access to the node's own address is filtered too"
+        );
+      } else if (found.addrs.length === 0) {
+        log.error(`[egress] exit guard: no primary address of ${prefix.text} on ${iface}; every address of the /64 is filtered`);
+      } else {
+        log.log(`[egress] exit guard: primary ${found.addrs.join(", ")}`);
+      }
+    }
+    return found.addrs;
+  }
+
+  // The cfg anchors and every address this module provisions: never primary.
+  function notPrimary(anchorsAll, s) {
+    return new Set([...anchorsAll, ...addressesOf(s), ...nicLeftovers.keys()]);
   }
 
   // Startup: proxy-NDP sysctls (set, verified, persisted) → load → drop ports
   // whose cfg/anchor is gone → re-add the proxy entry of every current, pool
   // and draining address (one -force batch; after a plain restart they are
   // all still there) → move the ones an older version left on the NIC off it
-  // → rebuild the table. A node without nft NAT (or whose sysctls cannot be
-  // set) stays up with the module unavailable; the GC tick retries.
+  // → the exit guard's primary address(es) → rebuild the table (exit guard
+  // included). A node without nft NAT (or whose sysctls cannot be set) stays
+  // up with the module unavailable — and without the exit guard; the GC tick
+  // retries.
   function init() {
     if (ready) return Promise.resolve(true);
     if (initPromise) return initPromise;
     initPromise = withLock(async () => {
       if (ready) return true;
-      const found = await detectNetwork();
-      if (!found.ok) return markUnavailable(found.reason);
-      iface = found.iface;
-      prefix = found.prefix;
+      const net0 = await detectNetwork();
+      if (!net0.ok) return markUnavailable(net0.reason);
+      iface = net0.iface;
+      prefix = net0.prefix;
       const sys = ensureSysctls();
       if (!sys.ok) return markUnavailable(sys.reason);
       if (sys.changed.length) log.log(`[egress] set ${sys.changed.join(" ")}`);
@@ -1272,7 +1410,11 @@ function createEgressService({
         }
         s = kept.state;
       }
-      const res = await applyNft(nftRebuildScript(s, prefix.text));
+      if (cfg.exitGuard) {
+        const found = await detectPrimary(notPrimary(index.all, s), net0.listing);
+        if (found) primary = found;
+      }
+      const res = await applyNft(rebuildScript(s));
       if (!res.ok) return markUnavailable(`nft_failed: ${res.detail}`);
       state = s;
       diskText = loaded.text;
@@ -1286,7 +1428,8 @@ function createEgressService({
       reason = null;
       log.log(
         `[egress] ready: iface=${iface} prefix=${prefix.text} ports=${Object.keys(s.ports).length} `
-        + `pool=${s.pool.length} draining=${s.draining.length}`
+        + `pool=${s.pool.length} draining=${s.draining.length} `
+        + `exit_guard=${cfg.exitGuard ? `on primary=${primary.join(",") || "none"}` : "off"}`
       );
       return true;
     }).finally(() => {
@@ -1338,11 +1481,11 @@ function createEgressService({
       let res = await applyNft(script);
       if (!res.ok) {
         log.error(`[egress] nft delta refused (${res.detail}); rebuilding the table`);
-        res = await applyNft(nftRebuildScript(next, prefix.text));
+        res = await applyNft(rebuildScript(next));
       }
       if (!res.ok) {
         log.error(`[egress] nft rebuild failed: ${res.detail}`);
-        await applyNft(nftRebuildScript(fallback, prefix.text));
+        await applyNft(rebuildScript(fallback));
         state = fallback;
         return { ok: false, detail: res.detail };
       }
@@ -1351,7 +1494,7 @@ function createEgressService({
       persist(next);
     } catch (err) {
       if (script !== null) {
-        const rb = await applyNft(nftRebuildScript(fallback, prefix.text));
+        const rb = await applyNft(rebuildScript(fallback));
         if (!rb.ok) {
           log.error(`[egress] nft rollback after a failed state write failed: ${rb.detail}`);
           state = next;
@@ -1456,16 +1599,45 @@ function createEgressService({
   // The table can vanish under us: `nft flush ruleset`, `systemctl restart
   // nftables` (its ExecStop flushes the ruleset, the boot drop-in deletes the
   // table). Nothing would map then — rotated ports leave from their anchors —
-  // until the next change, so the GC tick looks for the table (one short `nft
-  // list chain`, only while the state maps something) and rebuilds it.
+  // and no exit guard would filter, until the next change, so the GC tick
+  // looks for the table (one short `nft list chain`: exit_guard while the
+  // guard is on, else post and only while the state maps something) and
+  // rebuilds it. With the guard on, the tick first re-detects the primary
+  // address(es) (one `ip -6 -o addr show ... scope global`): a change (a new
+  // SLAAC address, a renumbered node) is one full rebuild — element deltas
+  // never touch chains. A failed rebuild leaves the kernel's guard as it was,
+  // so the old primary is kept and the next tick tries again.
   async function ensureTable() {
-    const d = desiredNft(state);
-    if (d.staticMap.size === 0 && d.dyn.size === 0 && d.pool.length === 0) return;
-    const res = await run("nft", ["list", "chain", "ip6", TABLE, "post"], { timeoutMs: 30000 });
-    if (res.code === 0) return;
-    log.error(`[egress] table ip6 ${TABLE} is gone (${stderrOf(res)}); rebuilding it`);
-    const rb = await applyNft(nftRebuildScript(state, prefix.text));
-    if (!rb.ok) log.error(`[egress] nft rebuild failed: ${rb.detail}`);
+    const was = primary;
+    let changed = false;
+    if (cfg.exitGuard) {
+      // without the cfg anchors an unflagged /64 anchor could pass for the
+      // host's own address: an unreadable cfg dir keeps the primary as it is
+      let anchorsAll = null;
+      try {
+        anchorsAll = readAnchors().all;
+      } catch (err) {
+        log.error(`[egress] exit guard: cfg anchors unreadable (${errText(err)}); keeping the primary address`);
+      }
+      const found = anchorsAll ? await detectPrimary(notPrimary(anchorsAll, state)) : null;
+      changed = Boolean(found) && found.join(",") !== primary.join(",");
+      if (changed) primary = found;
+    }
+    if (changed) {
+      log.log(`[egress] exit guard primary ${was.join(",") || "none"} -> ${primary.join(",") || "none"}; rebuilding the table`);
+    } else {
+      const d = desiredNft(state);
+      if (!cfg.exitGuard && d.staticMap.size === 0 && d.dyn.size === 0 && d.pool.length === 0) return;
+      const chain = cfg.exitGuard ? "exit_guard" : "post";
+      const res = await run("nft", ["list", "chain", "ip6", TABLE, chain], { timeoutMs: 30000 });
+      if (res.code === 0) return;
+      log.error(`[egress] table ip6 ${TABLE} is gone (${stderrOf(res)}); rebuilding it`);
+    }
+    const rb = await applyNft(rebuildScript(state));
+    if (!rb.ok) {
+      log.error(`[egress] nft rebuild failed: ${rb.detail}`);
+      primary = was;
+    }
   }
 
   // Proxy NDP can vanish under us too: the kernel drops a device's proxy
@@ -1715,7 +1887,10 @@ function createEgressService({
     view,
     handleHttp,
     isAvailable: () => ready,
-    status: () => ({ available: ready, reason, iface, prefix: prefix ? prefix.text : null }),
+    // exit_guard: EGRESS_EXIT_GUARD; primary: what chain exit_guard lets in
+    status: () => ({
+      available: ready, reason, iface, prefix: prefix ? prefix.text : null, exit_guard: cfg.exitGuard, primary: primary.slice(),
+    }),
     snapshot: () => cloneState(state),
     config: () => ({ ...cfg }),
   };
@@ -1746,6 +1921,7 @@ module.exports = {
   parseDefaultRouteDev,
   parseIpAddrShow,
   parseNeighProxy,
+  parsePrimaryAddrs,
   egressSysctls,
   sysctlConfText,
   emptyState,
@@ -1771,4 +1947,5 @@ module.exports = {
   writeFileAtomic,
   TABLE,
   MAX_PORTS_PER_CALL,
+  MAX_PRIMARY_ADDRS,
 };

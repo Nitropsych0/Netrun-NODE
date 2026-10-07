@@ -2,8 +2,8 @@
 
 // Wave IPV6-ROTATION — the pure half of egress.js: IPv6 text, cfg anchors,
 // `ip` output, state transitions, GC selection, the address budget, the exact
-// nft text (with the forward guard), the proxy-NDP sysctls and the
-// nftables.service boot drop-in.
+// nft text (with the forward and exit guards), the exit guard's primary-address
+// parser, the proxy-NDP sysctls and the nftables.service boot drop-in.
 // Run with: node --test node_runtime/node_agent/egress.test.js
 
 const test = require("node:test");
@@ -495,6 +495,23 @@ test("planGc: due proxy entries deleted, NIC leftovers with their real prefix le
   assert.deepStrictEqual(eg.planGc(s, { nowMs: NOW, proxies: new Set([X]), protectedAddrs: new Set() }).deletes.map((d) => d.addr), [X]);
 });
 
+// chain exit_guard as nftRebuildScript writes it (`primaryLine`: the rule
+// for the node's own address(es), or null).
+function exitGuardText(prefix, primaryLine) {
+  return [
+    "\tchain exit_guard {",
+    "\t\ttype filter hook input priority filter - 10; policy accept;",
+    "\t\tiif \"lo\" accept",
+    `\t\tip6 daddr != ${prefix} accept`,
+    ...(primaryLine ? [`\t\t${primaryLine}`] : []),
+    "\t\tct state established,related accept",
+    "\t\ticmpv6 type echo-request drop",
+    "\t\tmeta l4proto ipv6-icmp accept",
+    "\t\tdrop",
+    "\t}",
+  ];
+}
+
 test("nftRebuildScript: the exact table from the plan, one transaction", () => {
   const s = stateWith(
     {
@@ -505,7 +522,7 @@ test("nftRebuildScript: the exact table from the plan, one transaction", () => {
     },
     { pool: [P1, P2] }
   );
-  assert.strictEqual(eg.nftRebuildScript(s, "2001:db8:1:2::/64"), [
+  assert.strictEqual(eg.nftRebuildScript(s, "2001:db8:1:2::/64", { primary: ["2001:db8:1:2::1"] }), [
     "add table ip6 netrun_egress",
     "delete table ip6 netrun_egress",
     "table ip6 netrun_egress {",
@@ -534,12 +551,23 @@ test("nftRebuildScript: the exact table from the plan, one transaction", () => {
     "\t\ttype filter hook forward priority filter; policy accept;",
     "\t\tip6 daddr 2001:db8:1:2::/64 drop",
     "\t}",
+    "\tchain exit_guard {",
+    "\t\ttype filter hook input priority filter - 10; policy accept;",
+    "\t\tiif \"lo\" accept",
+    "\t\tip6 daddr != 2001:db8:1:2::/64 accept",
+    "\t\tip6 daddr 2001:db8:1:2::1 accept",
+    "\t\tct state established,related accept",
+    "\t\ticmpv6 type echo-request drop",
+    "\t\tmeta l4proto ipv6-icmp accept",
+    "\t\tdrop",
+    "\t}",
     "}",
     "",
   ].join("\n"));
 
   // empty state: same shape, no elements, an empty dyn chain (egress = anchor),
-  // the forward guard for whatever /64 the node has
+  // the forward guard for whatever /64 the node has; the exit guard is on by
+  // default, with no primary line when no primary address is known
   const empty = eg.nftRebuildScript(eg.emptyState(), "2001:db8:aaaa:5::/64");
   assert.ok(!empty.includes("elements"));
   assert.ok(empty.includes("\tchain dyn {\n\t}\n"));
@@ -548,13 +576,61 @@ test("nftRebuildScript: the exact table from the plan, one transaction", () => {
     "\t\ttype filter hook forward priority filter; policy accept;",
     "\t\tip6 daddr 2001:db8:aaaa:5::/64 drop",
     "\t}",
+    ...exitGuardText("2001:db8:aaaa:5::/64", null),
     "}",
     "",
   ].join("\n")));
-  // never a table without its guard
+  // several primary addresses → one anonymous set
+  const two = eg.nftRebuildScript(eg.emptyState(), "2001:db8:aaaa:5::/64", { primary: ["2001:db8:aaaa:5::1", "2001:db8:aaaa:5::2"] });
+  assert.ok(two.endsWith([
+    ...exitGuardText("2001:db8:aaaa:5::/64", "ip6 daddr { 2001:db8:aaaa:5::1, 2001:db8:aaaa:5::2 } accept"),
+    "}",
+    "",
+  ].join("\n")));
+  // EGRESS_EXIT_GUARD=off: no chain at all (the primary is then irrelevant)
+  const off = eg.nftRebuildScript(eg.emptyState(), "2001:db8:aaaa:5::/64", { exitGuard: false, primary: ["2001:db8:aaaa:5::1"] });
+  assert.ok(!off.includes("exit_guard") && !off.includes("hook input"));
+  assert.ok(off.endsWith("\t\tip6 daddr 2001:db8:aaaa:5::/64 drop\n\t}\n}\n"));
+  // the element delta never touches a chain: the guard survives every rotation
+  const rotated = stateWith({ 30000: { anchor: A, current: X, mode: "static" } });
+  assert.ok(!/chain|exit_guard|hook/.test(eg.nftDiffScript(eg.emptyState(), rotated)));
+  // never a table without its guard; never a non-canonical address in the text
   for (const bad of [undefined, null, "", "2001:db8:1::/48", "nope"]) {
     assert.throws(() => eg.nftRebuildScript(s, bad), TypeError, String(bad));
   }
+  for (const bad of ["2001:0db8:1:2::1", "2001:db8:1:2::1/64", "2001:db8:1:2::1 accept; drop", "nope"]) {
+    assert.throws(() => eg.nftRebuildScript(s, "2001:db8:1:2::/64", { primary: [bad] }), TypeError, bad);
+  }
+});
+
+test("parsePrimaryAddrs: the node's own /64 address, never an anchor, /128 or nodad; capped", () => {
+  const prefix = eg.parsePrefix("2001:db8:1:2::/64");
+  const line = (a, rest) => `2: eth0    inet6 ${a} ${rest} \\       valid_lft forever preferred_lft forever`;
+  const out = [
+    line("2001:db8:1:2:5400:4ff:fe12:3456/64", "scope global dynamic mngtmpaddr noprefixroute"), // SLAAC: the primary
+    line("2001:0db8:1:2::1/64", "scope global"), // static (netplan), padded text
+    line("2001:db8:1:2:a0a0:b1b:c2c:d3d/128", "scope global nodad"), // generator anchor
+    line("2001:db8:1:2:a0a0:b1b:c2c:d3e/64", "scope global nodad"), // anchor restored as /64 at boot
+    line("2001:db8:1:2:a0a0:b1b:c2c:d3f/64", "scope global"), // anchor from an older restore (no nodad): a cfg anchor
+    line("2001:db8:1:2:aaaa::9/64", "scope global"), // an address of this module (excluded by the caller)
+    line("2001:db8:1:2::bad/64", "scope global dadfailed tentative"),
+    line("2001:db8:1:2::7/128", "scope global"), // a /128 is never the host's own
+    line("2001:db8:9:9::1/64", "scope global"), // another prefix: rule 1 already lets it in
+    line("fe80::5400:4ff:fe12:3456/64", "scope link"),
+    "garbage",
+  ].join("\n");
+  const exclude = new Set(["2001:db8:1:2:a0a0:b1b:c2c:d3f", "2001:db8:1:2:aaaa::9"]);
+  assert.deepStrictEqual(eg.parsePrimaryAddrs(out, prefix, exclude), {
+    addrs: ["2001:db8:1:2:5400:4ff:fe12:3456", "2001:db8:1:2::1"], candidates: 2,
+  });
+  // without the exclusions the unflagged anchor would pass: the caller must give them
+  assert.strictEqual(eg.parsePrimaryAddrs(out, prefix).candidates, 4);
+  assert.deepStrictEqual(eg.parsePrimaryAddrs("", prefix), { addrs: [], candidates: 0 });
+  // a /64 full of unflagged addresses: fail closed (none), never thousands
+  const many = Array.from({ length: eg.MAX_PRIMARY_ADDRS + 1 }, (_, i) => line(`2001:db8:1:2::${(i + 1).toString(16)}/64`, "scope global")).join("\n");
+  assert.deepStrictEqual(eg.parsePrimaryAddrs(many, prefix), { addrs: [], candidates: eg.MAX_PRIMARY_ADDRS + 1 });
+  const max = many.split("\n").slice(1).join("\n");
+  assert.strictEqual(eg.parsePrimaryAddrs(max, prefix).addrs.length, eg.MAX_PRIMARY_ADDRS);
 });
 
 test("nftDiffScript: element deltas, value change = delete + add, pool = flush + rule", () => {

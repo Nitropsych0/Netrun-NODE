@@ -16,7 +16,10 @@
 #              with the client's source address (a fake «what is my IP» site).
 #              On-link with the node, like the provider's router: it finds
 #              the node's rotated addresses through neighbour discovery.
-#   ns "node": 2001:db8:ffff:1::1/64, forwarding on (as the installers leave
+#   ns "node": 2001:db8:ffff:1::1/64 — the host's own (primary) address,
+#              added the way SLAAC / netplan add one: no nodad flag (DAD is
+#              off on the veth instead, as 98-netrun-ipv6.conf turns it off
+#              on a node) — forwarding on (as the installers leave
 #              a node), a default route (the module finds its interface
 #              through it, as on a node), an ANCHOR address added the
 #              generator's way (/128, nodad) and a fake PROXY_ROOT whose one
@@ -28,7 +31,14 @@
 #
 # Checks: the module turns proxy NDP on (all/<if>.proxy_ndp=1,
 # <if>.proxy_delay=0, forwarding=1) and writes the sysctl file; no state → the
-# site sees the anchor; rotate → the new address, which is a proxy entry and
+# site sees the anchor; the exit guard (chain exit_guard, input hook): with a
+# listener on [::]:22 in "node", a TCP connect from "inet" to [anchor]:22 or
+# to a closed anchor port gets no answer at all (timeout: no SYN-ACK, no
+# RST), a ping to the anchor no reply and unsolicited UDP to it never gets
+# past the chain, while the node's own address still accepts :22 and answers
+# ping and the anchor's upstream connection to the "inet" site still works;
+# EGRESS_EXIT_GUARD=off removes the chain (:22 on the anchor answers again)
+# and the next start puts it back; rotate → the new address, which is a proxy entry and
 # NOT a NIC address; a connection opened before a rotation keeps its address;
 # the GC deletes a drained proxy entry; unsolicited packets to a rotated
 # address reach the forward hook and the table's forward guard drops them;
@@ -36,11 +46,14 @@
 # answered; an address left on the NIC by the version before proxy NDP moves
 # to a proxy entry under an open connection; per_connection → pool
 # addresses (several different ones, proxy entries, not on the NIC), never
-# the anchor; reset → the anchor again, the pool kept idle. After a rotate
+# the anchor; reset → the anchor again, the pool kept idle. Every step after
+# the exit-guard one runs with the guard on, so the replies of every upstream
+# connection (the de-NATed ones of rotated and pool addresses included) and
+# the unicast reachability probe pass it. After a rotate
 # and after per_connection, the ruleset as `nft list ruleset >
-# /etc/nftables.conf` saves it loads into an EMPTY third namespace (what
-# nftables.service does at boot) and the boot drop-in's `nft delete table ip6
-# netrun_egress` removes the table there.
+# /etc/nftables.conf` saves it (exit guard included) loads into an EMPTY third
+# namespace (what nftables.service does at boot) and the boot drop-in's `nft
+# delete table ip6 netrun_egress` removes the table there.
 #
 #   sudo bash scripts/smoke_egress_rotation.sh
 set -euo pipefail
@@ -63,6 +76,7 @@ POOL_SIZE=8
 TMP=""
 ECHO_PID=""
 HOLD_PID=""
+LISTEN_PID=""
 
 PASS=0
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -78,6 +92,7 @@ cleanup() {
   trap - EXIT INT TERM HUP
   if [ -n "$HOLD_PID" ]; then kill "$HOLD_PID" 2>/dev/null || true; fi
   if [ -n "$ECHO_PID" ]; then kill "$ECHO_PID" 2>/dev/null || true; fi
+  if [ -n "$LISTEN_PID" ]; then kill "$LISTEN_PID" 2>/dev/null || true; fi
   for ns in "$NS_NODE" "$NS_INET" "$NS_CHK"; do
     pids="$(ip netns pids "$ns" 2>/dev/null || true)"
     if [ -n "$pids" ]; then
@@ -121,7 +136,11 @@ in_node ip link set lo up
 in_inet ip link set lo up
 in_node ip link set "$VETH_NODE" up
 in_inet ip link set "$VETH_INET" up
-in_node ip -6 addr add "$NODE_IP/64" dev "$VETH_NODE" nodad
+# the host's own address: no nodad flag (that flag marks anchors), DAD off
+# on the interface so it is usable at once
+in_node sysctl -qw net.ipv6.conf.all.accept_dad=0
+in_node sysctl -qw "net.ipv6.conf.$VETH_NODE.accept_dad=0"
+in_node ip -6 addr add "$NODE_IP/64" dev "$VETH_NODE"
 in_inet ip -6 addr add "$INET_IP/64" dev "$VETH_INET" nodad
 in_node ip -6 route add default via "$INET_IP" dev "$VETH_NODE"
 in_node ip -6 addr add "$ANCHOR_RAW" dev "$VETH_NODE" nodad
@@ -215,6 +234,64 @@ for _ in range(int(sys.argv[2])):
     s.sendto(b"netrun-smoke", (sys.argv[1], 9))
 PY
 
+# listen.py PORT: a TCP server on [::]:PORT that accepts and closes (sshd's
+# place: on a node sshd listens on [::]:22, so on every anchor too).
+cat > "$TMP/listen.py" <<'PY'
+import socket, sys
+
+s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("::", int(sys.argv[1])))
+s.listen(64)
+while True:
+    c, _ = s.accept()
+    c.close()
+PY
+
+# tcpprobe.py DST PORT: what a port scanner sees — "open" (SYN-ACK),
+# "refused" (RST), "timeout" (no answer: filtered) or "error:<errno>".
+cat > "$TMP/tcpprobe.py" <<'PY'
+import socket, sys
+
+try:
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2).close()
+    print("open")
+except ConnectionRefusedError:
+    print("refused")
+except socket.timeout:
+    print("timeout")
+except OSError as e:
+    print("error:%s" % e.errno)
+PY
+
+# ping6.py DST: exit 0 when DST answers an ICMPv6 echo request within 1.5 s
+# (three requests; a raw socket, the kernel fills in the checksum).
+cat > "$TMP/ping6.py" <<'PY'
+import ipaddress, os, select, socket, struct, sys, time
+
+dst = sys.argv[1]
+want = ipaddress.ip_address(dst)
+ident = os.getpid() & 0xFFFF
+s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+deadline = time.time() + 1.5
+sent = 0
+next_send = 0.0
+while time.time() < deadline:
+    now = time.time()
+    if sent < 3 and now >= next_send:
+        sent += 1
+        s.sendto(struct.pack("!BBHHH", 128, 0, 0, ident, sent) + b"netrun-smoke", (dst, 0))
+        next_send = now + 0.4
+    r, _, _ = select.select([s], [], [], 0.1)
+    if not r:
+        continue
+    data, addr = s.recvfrom(2048)
+    if len(data) >= 8 and data[0] == 129 and struct.unpack("!H", data[4:6])[0] == ident \
+            and ipaddress.ip_address(addr[0].split("%")[0]) == want:
+        sys.exit(0)
+sys.exit(1)
+PY
+
 # driver.js CMD [PORT] [DRAIN_SEC]: one egress call in a fresh process.
 cat > "$TMP/driver.js" <<'JS'
 "use strict";
@@ -242,12 +319,14 @@ const svc = egress.createEgressService({ log: { log() {}, error: (m) => console.
 JS
 
 # The module's sysctl file goes to the temp dir, never /etc/sysctl.d; no
-# nftables.service drop-in (the driver never calls start() anyway).
+# nftables.service drop-in (the driver never calls start() anyway). The exit
+# guard is on (the default) unless a call is made as `EXIT_GUARD=off egress`.
 SYSCTL_CONF="$TMP/sysctl.d/99-netrun-egress.conf"
 egress() {
   in_node env EGRESS_JS="$EGRESS_JS" NODE_AGENT_PROXY_ROOT="$TMP/root" \
     EGRESS_POOL_SIZE="$POOL_SIZE" EGRESS_DRAIN_SEC=600 \
     EGRESS_SYSCTL_CONF="$SYSCTL_CONF" EGRESS_NFT_DROPIN=off \
+    EGRESS_EXIT_GUARD="${EXIT_GUARD:-on}" \
     node "$TMP/driver.js" "$@"
 }
 seen() { in_node python3 "$TMP/whoami.py" "$ANCHOR" "$INET_IP" "$ECHO_PORT"; }
@@ -262,10 +341,12 @@ proxied() {
   printf '%s\n' "$list" | python3 "$TMP/has_addr.py" neigh "$1"
 }
 node_sysctl() { in_node cat "/proc/sys/$1"; }
-# packets counted by a forward-hook chain of the smoke's own table
-fwd_counter() {
+# packets counted by a chain of the smoke's own table
+counter_of() {
   in_node nft list chain ip6 egsmoke "$1" | sed -n 's/.* counter packets \([0-9][0-9]*\) .*/\1/p'
 }
+# what a scanner in "inet" sees on DST PORT (tcpprobe.py)
+probe() { in_inet python3 "$TMP/tcpprobe.py" "$1" "$2"; }
 # the state ("REACHABLE", "STALE", ...) of the inet side's neighbour entry
 nud_state() { in_inet ip -6 neigh show "$1" dev "$VETH_INET" | awk 'NF { print $NF }'; }
 # The saved ruleset must load at boot (nftables.service: `nft -f` into an
@@ -274,6 +355,7 @@ nud_state() { in_inet ip -6 neigh show "$1" dev "$VETH_INET" | awk 'NF { print $
 roundtrip() {
   in_node nft list ruleset > "$TMP/ruleset.nft" || fail "$1: nft list ruleset"
   grep -q '^table ip6 netrun_egress {' "$TMP/ruleset.nft" || fail "$1: the dump lacks table ip6 netrun_egress"
+  grep -q 'chain exit_guard {' "$TMP/ruleset.nft" || fail "$1: the dump lacks chain exit_guard"
   ip netns add "$NS_CHK"
   ip netns exec "$NS_CHK" nft -c -f "$TMP/ruleset.nft" || fail "$1: nft -c rejects the saved ruleset"
   ip netns exec "$NS_CHK" nft -f "$TMP/ruleset.nft" || fail "$1: the saved ruleset does not load into an empty ruleset"
@@ -312,6 +394,68 @@ ok "start-up: proxy NDP on (all/$VETH_NODE proxy_ndp=1, proxy_delay=0, forwardin
 got="$(seen)"
 [ "$got" = "$ANCHOR" ] || fail "no state: the site saw $got, not the anchor $ANCHOR"
 ok "no state: the site sees the anchor"
+
+# ── 1b. exit guard ───────────────────────────────────────────────────────
+# A port scan of an exit address must look like a home line: nothing answers
+# (no SYN-ACK, no RST, no echo reply), while the node's own address still does.
+[ "$(echo "$st" | jget 'd["exit_guard"]')" = True ] || fail "the exit guard is not on by default: $st"
+[ "$(echo "$st" | jget '" ".join(d["primary"])')" = "$NODE_IP" ] || fail "exit guard primary is not $NODE_IP: $st"
+guard="$(in_node nft list chain ip6 netrun_egress exit_guard 2>&1)" || fail "chain exit_guard missing: $guard"
+printf '%s\n' "$guard" | grep -qE 'hook input priority (filter - 10|-10);' \
+  || fail "chain exit_guard is not at input priority filter - 10: $(printf '%s' "$guard" | tr '\n' ' ')"
+for want in "ip6 daddr != $PREFIX accept" "ip6 daddr $NODE_IP accept" \
+  "ct state established,related accept" "icmpv6 type echo-request drop"; do
+  printf '%s\n' "$guard" | grep -qF -- "$want" || fail "chain exit_guard lacks \"$want\": $(printf '%s' "$guard" | tr '\n' ' ')"
+done
+# Not through in_node: `$!` must be python's own pid (see the echo server).
+ip netns exec "$NS_NODE" python3 "$TMP/listen.py" 22 &
+LISTEN_PID=$!
+for _ in $(seq 1 50); do [ "$(probe "$NODE_IP" 22)" = open ] && break; sleep 0.1; done
+got="$(probe "$NODE_IP" 22)"
+[ "$got" = open ] || fail "the node's own address $NODE_IP:22 is $got, want open"
+got="$(probe "$ANCHOR" 22)"
+[ "$got" = timeout ] || fail "[$ANCHOR]:22 (a listener on [::]:22) is $got, want timeout: dropped, no SYN-ACK, no RST"
+got="$(probe "$ANCHOR" 23)"
+[ "$got" = timeout ] || fail "[$ANCHOR]:23 (closed) is $got, want timeout: no RST"
+in_inet python3 "$TMP/ping6.py" "$NODE_IP" || fail "the node's own address $NODE_IP answers no ping"
+! in_inet python3 "$TMP/ping6.py" "$ANCHOR" || fail "the anchor $ANCHOR answered a ping"
+# unsolicited UDP: two counting chains bracket the guard (priority filter - 10)
+in_node nft -f - <<EOF || fail "could not add the input counting chains"
+table ip6 egsmoke {
+	chain before {
+		type filter hook input priority -20; policy accept;
+		ip6 daddr $ANCHOR udp dport 9 counter
+	}
+	chain after {
+		type filter hook input priority 10; policy accept;
+		ip6 daddr $ANCHOR udp dport 9 counter
+	}
+}
+EOF
+in_inet python3 "$TMP/udp.py" "$ANCHOR" 5
+sleep 0.5
+before="$(counter_of before)"
+after="$(counter_of after)"
+in_node nft delete table ip6 egsmoke
+[ -n "$before" ] && [ "$before" -ge 1 ] || fail "unsolicited UDP to $ANCHOR never reached the input hook (${before:-?})"
+[ "$after" = 0 ] || fail "the exit guard let ${after:-?} of $before UDP packet(s) to $ANCHOR through"
+got="$(seen)"
+[ "$got" = "$ANCHOR" ] || fail "under the exit guard the site saw $got, not the anchor (upstream replies dropped?)"
+ok "exit guard: [anchor]:22 and a closed port time out (no RST), no ping reply, $before unsolicited UDP dropped; $NODE_IP:22 open and pinged; upstream from the anchor works"
+
+r="$(EXIT_GUARD=off egress status)" || fail "status with EGRESS_EXIT_GUARD=off"
+[ "$(echo "$r" | jget 'd["exit_guard"]')" = False ] || fail "EGRESS_EXIT_GUARD=off: $r"
+! in_node nft list chain ip6 netrun_egress exit_guard >/dev/null 2>&1 || fail "EGRESS_EXIT_GUARD=off left chain exit_guard"
+got="$(probe "$ANCHOR" 22)"
+[ "$got" = open ] || fail "guard off: [$ANCHOR]:22 is $got, want open"
+egress status >/dev/null || fail "status with the guard on again"
+in_node nft list chain ip6 netrun_egress exit_guard >/dev/null || fail "the next start did not put chain exit_guard back"
+got="$(probe "$ANCHOR" 22)"
+[ "$got" = timeout ] || fail "guard on again: [$ANCHOR]:22 is $got, want timeout"
+kill "$LISTEN_PID" 2>/dev/null || true
+wait "$LISTEN_PID" 2>/dev/null || true
+LISTEN_PID=""
+ok "exit guard: EGRESS_EXIT_GUARD=off drops the chain ([anchor]:22 answers), the next start restores it"
 
 # ── 2. rotate ────────────────────────────────────────────────────────────
 r="$(egress rotate "$PORT")" || fail "rotate"
@@ -369,8 +513,8 @@ table ip6 egsmoke {
 EOF
 in_inet python3 "$TMP/udp.py" "$NEW2" 5
 sleep 0.5
-before="$(fwd_counter before)"
-after="$(fwd_counter after)"
+before="$(counter_of before)"
+after="$(counter_of after)"
 [ -n "$before" ] && [ "$before" -ge 1 ] || fail "unsolicited packets to $NEW2 never reached the forward hook (${before:-?})"
 [ "$after" = 0 ] || fail "the forward guard let ${after:-?} of $before packet(s) to $NEW2 through"
 in_node nft delete table ip6 egsmoke
@@ -444,7 +588,7 @@ done
 n="$(echo "$distinct" | wc -w | tr -d ' ')"
 [ "$n" -ge 2 ] || fail "24 connections used only $n pool address(es)"
 ok "per_connection: 24 connections over $n different pool addresses (proxy entries), never the anchor"
-roundtrip "per_connection (dyn set, numgen pool rule, forward guard)"
+roundtrip "per_connection (dyn set, numgen pool rule, forward and exit guards)"
 
 # ── 9. reset ─────────────────────────────────────────────────────────────
 r="$(egress reset "$PORT" 0)" || fail "reset"

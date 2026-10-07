@@ -210,7 +210,7 @@ test("start() wrote the nftables.service drop-in with the absolute nft path, the
   assert.ok(fs.readFileSync(LOG, "utf-8").includes("systemctl daemon-reload"));
 });
 
-test("start() turned proxy NDP on for the default-route interface and persisted it; the table has the forward guard", async () => {
+test("start() turned proxy NDP on for the default-route interface and persisted it; the table has the forward and exit guards", async () => {
   assert.strictEqual(await started, true);
   const read = (key) => fs.readFileSync(path.join(PROC, key), "utf-8").trim();
   assert.deepStrictEqual(
@@ -219,4 +219,19 @@ test("start() turned proxy NDP on for the default-route interface and persisted 
   );
   assert.strictEqual(fs.readFileSync(SYSCTL_CONF, "utf-8"), eg.sysctlConfText("eth0"));
   assert.ok(fs.readFileSync(LOG, "utf-8").includes("\tchain forward_guard {\n\t\ttype filter hook forward priority filter; policy accept;\n\t\tip6 daddr 2001:db8:1:2::/64 drop\n"));
+  // EGRESS_EXIT_GUARD unset = on; the stub's one global /64 address (no
+  // nodad) is the node's own and keeps inbound access
+  assert.ok(fs.readFileSync(LOG, "utf-8").includes([
+    "\tchain exit_guard {",
+    "\t\ttype filter hook input priority filter - 10; policy accept;",
+    "\t\tiif \"lo\" accept",
+    "\t\tip6 daddr != 2001:db8:1:2::/64 accept",
+    "\t\tip6 daddr 2001:db8:1:2::1 accept",
+    "\t\tct state established,related accept",
+    "\t\ticmpv6 type echo-request drop",
+    "\t\tmeta l4proto ipv6-icmp accept",
+    "\t\tdrop",
+    "\t}",
+    "}",
+  ].join("\n")));
 });
