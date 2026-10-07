@@ -65,6 +65,21 @@ test("GET /health: old fields kept, cfg + address fields added", { timeout: 30_0
       assert.ok(key in json, `pre-existing field ${key} kept`);
     }
     assert.strictEqual(json.service, "proxy-node-agent");
+    // Incident 2026-10-07 — duplicate reaper counters next to duplicateStatePresent.
+    assert.strictEqual(json.duplicatesReaped, 0);
+    assert.strictEqual(json.lastReapAt, null);
+    assert.deepStrictEqual(json.hygiene, {
+      dedupe3proxy: true,
+      cronHygiene: "on",
+      intervalSec: 600,
+      duplicatesReaped: 0,
+      lastReapAt: null,
+      lastDedupeAt: null,
+      lastDedupeOutcome: null,
+      cronLinesRemoved: 0,
+      lastCronAt: null,
+      lastCronOutcome: null,
+    });
     assert.deepStrictEqual(json.cfgs, [
       { startPort: 18100, count: 2, listening: true, pid: null },
       { startPort: 20000, count: 1, listening: false, pid: null },

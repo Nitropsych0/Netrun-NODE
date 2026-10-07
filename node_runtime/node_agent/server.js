@@ -14,6 +14,7 @@ const egress = require("./egress.js");
 const loadSampler = require("./load_sampler.js").createSampler();
 const cfgStatus = require("./cfg_status.js");
 const jobRetention = require("./job_retention.js");
+const hygieneLib = require("./hygiene.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 // Wave FLEET-HEALTH (RES-10) — bind address. The unit template has always set
@@ -1907,30 +1908,40 @@ async function checkDns(timeoutMs = 5000) {
   return result;
 }
 
-function shellSingleQuote(value) {
-  return `'${String(value || "").replace(/'/g, `'\"'\"'`)}'`;
-}
+// Incident 2026-10-07 — leftover generator crontab lines + duplicate 3proxy
+// after a reboot (hygiene.js): the crontab sweep at start and every
+// NODE_AGENT_HYGIENE_INTERVAL_SEC, the duplicate reaper a minute after start
+// and on the same tick, both idle while a /generate holds the lock. The
+// agent's own path (PROXY_ROOT) is the copy kept when a cfg runs twice.
+const hygiene = hygieneLib.createHygiene({
+  preferRoot: PROXY_ROOT,
+  isGenerationBusy: generationBusy,
+});
 
+// Removes THIS batch's generator @reboot line after a /generate. Matched by
+// script name in any directory (hygiene.js, same core as the periodic sweep):
+// the generator writes /root/proxyserver/proxy-startup_<p>.sh (`cd ~`, a
+// symlink to PROXY_ROOT), and the old `grep -Fv <PROXY_ROOT path>` never
+// matched it — every generator line of the node survived (incident
+// 2026-10-07). Like the sweep, a line is only removed while the boot restore
+// units are enabled; the job's result.cronCleanup says why one was kept.
 async function cleanupCronStartup(startupScriptPath) {
   if (!CLEANUP_CRON_AFTER_RUN) {
     return { ok: true, skipped: true };
   }
-  const safePath = shellSingleQuote(startupScriptPath);
-  const script = [
-    "if command -v crontab >/dev/null 2>&1; then",
-    "  tmp=$(mktemp)",
-    "  crontab -l 2>/dev/null | grep -Fv " + safePath + " > \"$tmp\" || true",
-    "  crontab \"$tmp\" 2>/dev/null || true",
-    "  rm -f \"$tmp\"",
-    "fi",
-  ].join("\n");
-
-  const out = await runCommand("bash", ["-lc", script], { timeoutSec: 8 });
+  let out;
+  try {
+    out = await hygiene.removeCronLines(hygieneLib.startupScriptMatcher(startupScriptPath));
+  } catch (error) {
+    return { ok: false, skipped: false, error: `cron_cleanup_failed:${error.message || String(error)}`, stderrTail: "" };
+  }
   return {
     ok: out.ok,
-    skipped: false,
+    skipped: out.skipped,
     error: out.ok ? null : out.error,
-    stderrTail: String(out.stderr || "").slice(-RESPONSE_TAIL_LIMIT),
+    stderrTail: String(out.stderrTail || "").slice(-RESPONSE_TAIL_LIMIT),
+    outcome: out.outcome,
+    removed: out.removed.length,
   };
 }
 
@@ -2227,6 +2238,13 @@ async function classifyGenerationLock(lockPath, ttlMs = STALE_LOCK_MS) {
     fileMtimeMs,
   });
   return { parsed, stale, pidAlive };
+}
+
+// Incident 2026-10-07 — "a /generate holds the generation lock", by the same
+// verdict /health's busy uses; hygiene.js does nothing while it is true.
+async function generationBusy() {
+  const lockState = await classifyGenerationLock(path.join(JOBS_ROOT, LOCK_FILENAME));
+  return Boolean(lockState.parsed) && !lockState.stale;
 }
 
 async function acquireGenerationLock(lockPath, payload) {
@@ -3765,6 +3783,7 @@ async function handleHealth(req, res) {
     duplicateCfg: summary.duplicateCfg,
     duplicateStartPort: summary.duplicateStartPort,
   };
+  const hygieneStatus = hygiene.status();
 
   sendJson(res, 200, {
     success,
@@ -3777,6 +3796,12 @@ async function handleHealth(req, res) {
     busy,
     activeInstances: summary.count,
     duplicateStatePresent: summary.duplicateStatePresent,
+    // Incident 2026-10-07 — additive. duplicatesReaped: duplicate 3proxy
+    // processes terminated since agent start; lastReapAt: the last time one
+    // was (null = never); hygiene: switches + last cron / dedupe outcome.
+    duplicatesReaped: hygieneStatus.duplicatesReaped,
+    lastReapAt: hygieneStatus.lastReapAt,
+    hygiene: hygieneStatus,
     // Wave NODE-GENLOCK-HARDENING — additive 3proxy readiness. Top-level flat
     // field for cheap orchestrator checks; full detail under proxyReadiness.
     proxyReady: proxyReadiness.ready,
@@ -4072,6 +4097,10 @@ if (require.main === module) {
     // table on reboot: re-add them and rebuild the table from egress_state.json,
     // then run the 30 s GC and the per-connection pool refresh.
     egress.start();
+    // Incident 2026-10-07 — drop leftover generator @reboot lines now; reap
+    // duplicate 3proxy a minute after start (the boot restore is done by
+    // then); both again every NODE_AGENT_HYGIENE_INTERVAL_SEC (hygiene.js).
+    hygiene.start();
   });
 }
 
@@ -4125,4 +4154,8 @@ module.exports = {
   scheduleJobPrune,
   JOBS_KEEP,
   REBIND_POLICY,
+  // Incident 2026-10-07 — exported for unit tests.
+  hygiene,
+  generationBusy,
+  cleanupCronStartup,
 };

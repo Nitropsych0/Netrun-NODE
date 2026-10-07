@@ -63,6 +63,9 @@ Wave FLEET-HEALTH additive fields (every older field is unchanged):
 | `ipv6Addresses` | `{ok, expected, present, missing, missingSample, source, checkedAt, ttlSec}` — distinct `-e` addresses of the active cfgs vs those the kernel holds (`/proc/net/if_inet6`, any interface); recomputed at most every `NODE_AGENT_IPV6_COVERAGE_TTL_SEC` (60) |
 | `cfgsError` | why the cfg directory could not be read, else `null` |
 
+`duplicatesReaped`, `lastReapAt` and `hygiene` (duplicate 3proxy reaper + crontab
+hygiene) are described under "Boot duplicates" below.
+
 `proxyReady` / `proxyReadiness` probe each instance on the same first socks port.
 The agent binds `NODE_AGENT_HOST` (default `0.0.0.0`; the unit template has always
 set it, nothing read it, so it used to answer on `[::]` = every customer exit IPv6).
@@ -175,6 +178,102 @@ Job directories: `/opt/netrun/jobs` keeps the newest `NODE_AGENT_JOBS_KEEP` (200
 off) plus the running generation's, any queued/running job updated within 30 min and
 the newest ready job of every start port that still has a cfg (the "reuse a running
 instance" path). Pruned after each generation and a minute after start.
+
+## Boot duplicates: crontab hygiene + 3proxy dedupe (incident 2026-10-07)
+
+**Incident.** Chicago (2 vCPU / 4 GB, ~10 batch cfgs × 1500 dual proxies): after a
+reboot every batch ran twice — once from `netrun-3proxy-restore.service`
+(`/opt/netrun/proxyserver/3proxy/bin/3proxy /opt/netrun/proxyserver/3proxy/3proxy_<sp>.cfg`)
+and once from one of 11 leftover generator crontab lines
+`@reboot bash /root/proxyserver/proxy-startup_<sp>.sh`
+(`/root/proxyserver/3proxy/bin/3proxy /root/proxyserver/3proxy/3proxy_<sp>.cfg`;
+`/root/proxyserver` is a symlink to `/opt/netrun/proxyserver`). 19 3proxy processes,
+MemAvailable 1.5 GB → 0.46 GB, `/health` slower than the Vultr watchdog's 5 s timeout,
+and the watchdog rebooted the node twice — each reboot recreated the duplicates. Two
+daemons on the same ports also split the accepts between them (SO_REUSEPORT).
+
+**Why the lines survived.** The post-`/generate` cleanup
+(`NODE_AGENT_CLEANUP_CRON_AFTER_RUN`) removed `/opt/netrun/proxyserver/proxy-startup_<sp>.sh`
+by exact string, but the generator (`cd ~`) writes `/root/proxyserver/proxy-startup_<sp>.sh`:
+it never matched, so the line of every generation stayed. These scripts also rewrite
+`3proxy_<sp>.cfg` from `ipv6_<sp>.list` / `random_users_<sp>.list` before they start
+3proxy, at every boot, and a `--rotating-interval` line (`*/N * * * *`) re-runs one every
+N minutes. Nothing ever killed a duplicate; `/health` only reported `duplicateStatePresent`.
+
+**What the agent does now** (`node_runtime/node_agent/hygiene.js`):
+
+- **Crontab hygiene** — at agent start and every `NODE_AGENT_HYGIENE_INTERVAL_SEC`: reads
+  `crontab -l`, drops every line that names a generator `proxy-startup_*.sh` in any
+  directory (`@reboot` and rotation lines alike; comments and every other line are kept
+  byte for byte) and writes the crontab back only when something changed. Every removed
+  line is logged. Only while `netrun-3proxy-restore.service` AND
+  `netrun-ipv6-restore.service` are both enabled (`systemctl is-enabled`): without them
+  the `@reboot` line is the only thing that brings a batch (and its IPv6 addresses) back
+  after a reboot, so the lines are kept and one warning is logged
+  (`NODE_AGENT_CRON_HYGIENE=force` removes them anyway). The post-`/generate` cleanup
+  runs the same code, matched by script name (`proxy-startup_<startPort>.sh`, any
+  directory); the job's `result.cronCleanup` now carries `outcome` and `removed`.
+- **3proxy dedupe** — 60 s after agent start (the boot restore has finished by then) and
+  on the same tick: groups the running 3proxy processes (argv[0] is `3proxy`, the
+  argument is an absolute `3proxy_<sp>.cfg`) by the realpath of the cfg, so
+  `/root/proxyserver/...` and `/opt/netrun/proxyserver/...` are one cfg. A cfg with more
+  than one process keeps exactly one — the oldest whose cfg argument is under the agent's
+  `NODE_AGENT_PROXY_ROOT` (`/opt/netrun/proxyserver`, the path the agent and the boot
+  restore use), otherwise the oldest — and the others get SIGTERM, then SIGKILL if still
+  alive 3 s later. Never the last process of a cfg; never a cfg none of whose probe ports
+  listens (its start port and its first socks port — a boot that is still binding is
+  left alone); nothing at all while a `/generate` holds the generation lock (the
+  `/health` `busy` verdict). Right before signalling it re-checks the lock and takes a
+  fresh `ps`: a pid that exited or now runs something else is not touched, and when the
+  process to keep is gone nothing is killed that round.
+
+Steady state: one `crontab -l` and one `ps` per tick; `ss` only when a cfg runs twice.
+The agent restart that deploys this sweeps the crontab at once. Where a reboot still
+finds generator lines (boot units not enabled, or no agent restart yet), cron starts
+them before the agent is up; the reaper then ends the duplicates a minute after start.
+
+| Variable | Default | |
+|---|---|---|
+| `NODE_AGENT_DEDUPE_3PROXY` | on | `0` / `off` / `false` / `no` = never kill a duplicate |
+| `NODE_AGENT_CRON_HYGIENE` | on | `0` / `off` = no sweep at start / on the tick; `force` = sweep even without both boot restore units |
+| `NODE_AGENT_HYGIENE_INTERVAL_SEC` | 600 | period of both (minimum 60) |
+
+`NODE_AGENT_CLEANUP_CRON_AFTER_RUN=0` still turns the post-`/generate` cleanup off.
+
+`/health`, additive, next to `duplicateStatePresent`:
+
+| Field | Meaning |
+|---|---|
+| `duplicatesReaped` | duplicate 3proxy processes terminated since the agent started |
+| `lastReapAt` | when the last one was (`null` = never) |
+| `hygiene` | `{dedupe3proxy, cronHygiene, intervalSec, duplicatesReaped, lastReapAt, lastDedupeAt, lastDedupeOutcome, cronLinesRemoved, lastCronAt, lastCronOutcome}`. `lastDedupeOutcome`: `ok`, `generation_in_progress`, `ps_failed`, `ss_failed`. `lastCronOutcome`: `unchanged`, `removed`, `no_crontab`, `generation_in_progress`, `boot_restore_units_not_enabled`, `crontab_unavailable`, `error`. `null` = not run yet |
+
+Log lines (`journalctl -u netrun-node-agent | grep '\[hygiene\]'`):
+
+```
+[hygiene] dedupe_3proxy=on cron_hygiene=on interval=600s first_dedupe_in=60s
+[hygiene] cron: removed "@reboot /usr/bin/bash /root/proxyserver/proxy-startup_18100.sh"
+[hygiene] cron: removed 11 generator proxy-startup line(s); netrun-3proxy-restore starts the batches at boot
+[hygiene] cron: 11 generator proxy-startup line(s) kept: netrun-3proxy-restore.service / netrun-ipv6-restore.service not both enabled (they are then the only boot path); NODE_AGENT_CRON_HYGIENE=force removes them anyway
+[hygiene] dedupe: /opt/netrun/proxyserver/3proxy/3proxy_18100.cfg (start port 18100) runs 2 times; keeping pid 2202 (/opt/netrun/proxyserver/3proxy/3proxy_18100.cfg, up 40s)
+[hygiene] dedupe: SIGTERM pid 2101 (/root/proxyserver/3proxy/3proxy_18100.cfg, up 50s), duplicate of pid 2202
+[hygiene] dedupe: SIGKILL pid 2101: still alive 3000 ms after SIGTERM
+[hygiene] dedupe: reaped 9 duplicate 3proxy process(es); 9 since agent start
+[hygiene] dedupe: /opt/netrun/proxyserver/3proxy/3proxy_18100.cfg runs 2 times but none of port(s) 18100,18105 listens; left alone
+[hygiene] dedupe: /opt/netrun/proxyserver/3proxy/3proxy_18100.cfg: pid 2202 to keep is gone; left alone this round
+[hygiene] dedupe: ps failed (<stderr>); nothing killed
+[hygiene] dedupe: ss failed (<stderr>); nothing killed
+```
+
+By hand on a node:
+
+```bash
+crontab -l | grep -c 'proxy-startup_'           # 0 once the sweep ran
+ps -eo pid,etimes,args | grep '[b]in/3proxy '   # one line per cfg
+curl -s http://127.0.0.1:8085/health | jq '{duplicateStatePresent, duplicatesReaped, lastReapAt, hygiene}'
+```
+
+Tests: `cd node_runtime/node_agent && node --test hygiene.dedupe.test.js hygiene.cron.test.js server.hygiene.test.js`.
 
 ## Accounting robustness (Wave FLEET-HEALTH)
 

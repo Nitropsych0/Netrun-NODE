@@ -140,7 +140,7 @@ VALUES ((SELECT id FROM skus WHERE code='ipv6_xx'), 'xx-city-01', 100, 100, true
 1. **Vultr-панель → инстанс → Restart Server** (power-cycle через гипервизор; SSH/console-login НЕ нужны)
 2. Подожди ~90 сек
 3. Проверь: `ssh root@<NODE_IP> 'uptime'`
-4. После boot `netrun-3proxy-restore.service` + cron `@reboot proxy-startup` поднимут 3proxy сами
+4. После boot `netrun-3proxy-restore.service` поднимет 3proxy сам. Строки генератора `@reboot … proxy-startup_<p>.sh` агент удаляет из crontab, а лишние копии 3proxy гасит через минуту после старта (инцидент 2026-10-07: каждая партия запускалась дважды — README, «Boot duplicates»)
 
 > ⚠️ **noVNC console «Login incorrect»** — это спецсимволы пароля в noVNC keyboard layout, НЕ проблема ноды. Для recovery console не нужен — только Restart Server. Если нужен console-доступ — поставь root-пароль без спецсимволов.
 
