@@ -256,11 +256,26 @@ RESTART_THRESHOLD=5
 RESTART_COOLDOWN_SEC=600
 REBOOT_THRESHOLD=20
 REBOOT_COOLDOWN_SEC=14400
-PROBE_TIMEOUT=5
+# Incident 2026-10-07: a 1500-proxy generation on a 2 vCPU node slows /health
+# past 5 s; the restart tier then killed the agent mid-generation, the job
+# failed, refill retried it, and so on. 15 s is still far below a dead agent.
+PROBE_TIMEOUT=15
+GENLOCK="/opt/netrun/jobs/.generation.lock"
+GENLOCK_MAX_AGE_SEC=1800
 
 current=$(cat "$STATE_FAIL" 2>/dev/null || echo 0)
 current=${current//[^0-9]/}
 : "${current:=0}"
+
+# A generation in progress is not an outage: do not count (or act on) a slow
+# probe while a fresh generation lock exists. A lock older than
+# GENLOCK_MAX_AGE_SEC is a leftover and does not shield anything.
+if [ -e "$GENLOCK" ]; then
+  lock_age=$(( $(date +%s) - $(stat -c %Y "$GENLOCK" 2>/dev/null || echo 0) ))
+  if [ "$lock_age" -lt "$GENLOCK_MAX_AGE_SEC" ]; then
+    exit 0
+  fi
+fi
 
 if curl --silent --fail --max-time "$PROBE_TIMEOUT" http://127.0.0.1:8085/health >/dev/null 2>&1; then
   if [ "$current" -gt 0 ]; then
