@@ -39,6 +39,15 @@ log "Stopping node-agent and 3proxy processes"
 pkill -f 'node_runtime/node_agent/server\.js' 2>/dev/null || true
 pkill -f '3proxy' 2>/dev/null || true
 
+# Wave IPV6-ROTATION — the agent's egress state (also under a kept legacy
+# root) and its nftables.service boot drop-in; the table goes with the other
+# NETRUN tables below. Addresses it added stay on the NIC until the next
+# reboot, like the anchors.
+log "Removing IPv6 egress rotation state and the nftables.service drop-in"
+rm -f /opt/netrun/proxyserver/egress_state.json /root/proxyserver/egress_state.json
+rm -f /etc/systemd/system/nftables.service.d/netrun-egress.conf
+rmdir /etc/systemd/system/nftables.service.d 2>/dev/null || true
+
 log "Removing /opt/netrun"
 rm -rf /opt/netrun
 
@@ -66,6 +75,7 @@ log "Deleting NETRUN nftables tables"
 if command -v nft >/dev/null 2>&1; then
   nft delete table inet proxy_normalization 2>/dev/null || true
   nft delete table inet proxy_accounting 2>/dev/null || true
+  nft delete table ip6 netrun_egress 2>/dev/null || true
   nft list ruleset > /etc/nftables.conf 2>/dev/null || true
 fi
 

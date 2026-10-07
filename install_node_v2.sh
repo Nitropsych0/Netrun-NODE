@@ -366,6 +366,29 @@ configure_nftables() {
   systemctl restart nftables 2>/dev/null || systemctl start nftables 2>/dev/null || true
 }
 
+# Wave IPV6-ROTATION — `nft list ruleset > /etc/nftables.conf` (here, the
+# generator, deprovision, netrun-harden, netrun-https) also saves the agent's
+# table ip6 netrun_egress, whose rotated / pool addresses are gone after a
+# reboot. This drop-in deletes it right after nftables.service loads the file:
+# proxies leave from their anchors until the agent rebuilds the table from
+# egress_state.json. The agent writes the same file at start (egress.js
+# nftDropinText; egress.test.js keeps the texts equal).
+install_nftables_egress_dropin() {
+  local nft_bin
+  nft_bin="$(command -v nft || echo /usr/sbin/nft)"
+  log "Installing nftables.service drop-in (boot: drop a saved table ip6 netrun_egress)"
+  mkdir -p /etc/systemd/system/nftables.service.d
+  cat > /etc/systemd/system/nftables.service.d/netrun-egress.conf <<EOF
+# NETRUN IPv6 egress rotation (node-agent egress.js; install_node_v2.sh, node_followup_v2.sh).
+# A saved ruleset may hold table ip6 netrun_egress, whose addresses are gone after a
+# reboot: drop it after the boot load. Proxies leave from their anchors until the agent
+# rebuilds the table from egress_state.json.
+[Service]
+ExecStartPost=-${nft_bin} delete table ip6 netrun_egress
+EOF
+  systemctl daemon-reload
+}
+
 write_bootstrap_marker() {
   log "Writing bootstrap marker"
   cat > "$PROXY_ROOT/.netrun_bootstrap.json" <<EOF
@@ -671,6 +694,7 @@ main() {
   install_runtime_files
   configure_sysctl
   configure_nftables
+  install_nftables_egress_dropin
   write_bootstrap_marker
   seed_egress_mode_state
   ensure_legacy_root_proxyserver_symlink

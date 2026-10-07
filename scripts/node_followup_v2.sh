@@ -312,6 +312,22 @@ Unit=netrun-watchdog.service
 WantedBy=timers.target
 EOF
 
+# Wave IPV6-ROTATION — a saved /etc/nftables.conf may hold the agent's table
+# ip6 netrun_egress, whose addresses are gone after a reboot (the watchdog's
+# tier 2 reboots): nftables.service deletes it right after the boot load, so
+# proxies leave from their anchors until the agent rebuilds it. The agent
+# writes the same file at start (egress.js nftDropinText).
+NFT_BIN="$(command -v nft || echo /usr/sbin/nft)"
+mkdir -p /etc/systemd/system/nftables.service.d
+cat > /etc/systemd/system/nftables.service.d/netrun-egress.conf <<EOF
+# NETRUN IPv6 egress rotation (node-agent egress.js; install_node_v2.sh, node_followup_v2.sh).
+# A saved ruleset may hold table ip6 netrun_egress, whose addresses are gone after a
+# reboot: drop it after the boot load. Proxies leave from their anchors until the agent
+# rebuilds the table from egress_state.json.
+[Service]
+ExecStartPost=-${NFT_BIN} delete table ip6 netrun_egress
+EOF
+
 # ── 5) Enable + reset stale failure counter ─────────────────────
 systemctl daemon-reload
 systemctl enable netrun-3proxy-restore.service >/dev/null

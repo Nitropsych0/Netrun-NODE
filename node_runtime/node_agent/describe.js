@@ -11,7 +11,7 @@ const GEO_CACHE_TTL_MS = 60 * 60 * 1000;
 let _geoCache = null;
 let _geoCacheAt = 0;
 
-async function buildDescribe({ healthSnapshot, jobsRoot, proxyRoot } = {}) {
+async function buildDescribe({ healthSnapshot, jobsRoot, proxyRoot, egressRotation = false } = {}) {
   const ipv6 = healthSnapshot?.ipv6 || null;
   const ipv6Egress = healthSnapshot?.ipv6Egress || null;
   const dns = healthSnapshot?.dns || null;
@@ -40,6 +40,9 @@ async function buildDescribe({ healthSnapshot, jobsRoot, proxyRoot } = {}) {
       describe: true,
       accounting: true,
       enroll: true,
+      // Wave IPV6-ROTATION — true once egress.js has its nft NAT table up;
+      // false on a node without nft NAT (POST /egress/* then answers 503).
+      egress_rotation: Boolean(egressRotation),
     },
   };
 }

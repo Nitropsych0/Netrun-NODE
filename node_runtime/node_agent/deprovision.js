@@ -34,6 +34,7 @@
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
+const egress = require("./egress.js");
 
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
@@ -333,6 +334,15 @@ async function deprovisionPorts(rawPorts) {
   const allRequested = [...removeSet];
   if (allRequested.length > 0) {
     result.nft = await nftCleanup(allRequested);
+    // Wave IPV6-ROTATION — a removed port must not keep a rotated egress or a
+    // per-connection mode: the next generate on it is someone else's proxy.
+    // Before the dump below, so the saved ruleset no longer maps it. Never
+    // fails the deprovision (a restart drops ports without a cfg anyway).
+    try {
+      result.egress = await egress.forgetPorts(allRequested);
+    } catch (err) {
+      result.egress = { ok: false, error: String((err && err.message) || err) };
+    }
     await execCapture("bash", ["-c", `nft list ruleset > ${NFTABLES_PERSIST}`], { timeoutMs: 60000 });
   }
   // HTTPS frontend: haproxy still binds the removed HTTP ports until its

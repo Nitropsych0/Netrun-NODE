@@ -10,6 +10,7 @@ const { buildDescribe } = require("./describe.js");
 const accounting = require("./accounting.js");
 const egressMode = require("./egress_mode.js");
 const deprovision = require("./deprovision.js");
+const egress = require("./egress.js");
 const loadSampler = require("./load_sampler.js").createSampler();
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
@@ -3323,6 +3324,7 @@ async function handleDescribe(req, res) {
     healthSnapshot,
     jobsRoot: JOBS_ROOT,
     proxyRoot: PROXY_ROOT,
+    egressRotation: egress.isAvailable(),
   });
   sendJson(res, 200, payload);
 }
@@ -3520,6 +3522,13 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Wave IPV6-ROTATION — per-port egress IPv6 (rotate / per-connection /
+  // reset) through an nftables SNAT table; 3proxy and its cfgs are never
+  // touched (egress.js). Any other /egress path falls through to the 404.
+  if (pathname === "/egress" || pathname.startsWith("/egress/")) {
+    if (await egress.handleHttp(req, res, url, { sendJson, parseJsonBody, ensureAuthorized })) return;
+  }
+
   sendJson(res, 404, { success: false, status: "failed", error: "not_found" });
 });
 
@@ -3541,6 +3550,10 @@ if (require.main === module) {
       .catch((err) =>
         console.error(`[node-agent] reapplyPergbBlocks on boot failed: ${(err && err.message) || err}`)
       );
+    // Wave IPV6-ROTATION — the kernel forgets the added addresses and the NAT
+    // table on reboot: re-add them and rebuild the table from egress_state.json,
+    // then run the 30 s GC and the per-connection pool refresh.
+    egress.start();
   });
 }
 
@@ -3574,4 +3587,7 @@ module.exports = {
   // Wave NODE-GENLOCK-HARDENING — pure 3proxy readiness verdict for /health,
   // exported for unit tests.
   computeProxyReadiness,
+  // Wave IPV6-ROTATION — the HTTP server itself (it only listens when run as
+  // the entrypoint), so tests can drive the /egress routes end to end.
+  server,
 };

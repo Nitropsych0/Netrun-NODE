@@ -67,7 +67,8 @@ Returns a single JSON snapshot the orchestrator consumes via `POST /v1/nodes/enr
 - `geo_code` (ISO 3166-1 alpha-2, cached 1h via ipapi.co)
 - `ipv6`, `ipv6_egress` (same shape as `/health`)
 - `api_key_required`, `jobs_root`, `proxy_root`
-- `supports.{describe,enroll,accounting}`
+- `supports.{describe,enroll,accounting,egress_rotation}` (`egress_rotation` is true once the
+  egress module below has its nft NAT table up)
 
 Open access (mirrors `/health`); set `NODE_AGENT_API_KEY` only if you want auth on the write endpoints.
 
@@ -139,6 +140,143 @@ Smoke validates `/describe` advertises accounting, plus the negative
 paths (400 missing ports / 404 unknown port / 200 partial empty map).
 Happy-path with a real reserved port is exercised end-to-end by the
 orchestrator integration tests.
+
+## IPv6 egress rotation (Wave IPV6-ROTATION)
+
+Changes the IPv6 address a proxy's **new** connections leave from, per port, without
+touching 3proxy or its cfgs (`node_runtime/node_agent/egress.js`). One 3proxy process
+serves a whole batch of customers and every cfg change restarts it, so instead each
+port keeps binding to the `-e` address of its `socks` line (the **anchor**; the paired
+HTTP port shares it) and an nftables SNAT rewrites the source:
+
+```text
+table ip6 netrun_egress {
+  set dyn_anchors   { type ipv6_addr; }                  # ports in per_connection mode
+  map static_egress { type ipv6_addr : ipv6_addr; }      # anchor -> current address
+  chain dyn  { snat to numgen random mod K map { 0 : <pool0>, ... } }
+  chain post { type nat hook postrouting priority srcnat; policy accept;
+               ip6 saddr @dyn_anchors goto dyn
+               snat to ip6 saddr map @static_egress }
+}
+```
+
+Only the first packet of a connection is NATed (conntrack carries the rest), so open
+sessions keep their address and other ports are never affected; pay-per-GB metering
+is keyed by the client-facing port and does not change. Every nft change is one
+`nft -f` transaction (an element delta; a full `add table` + `delete table` +
+definition rebuild if the kernel no longer matches), so the table is never half
+applied. A new address is the node's /64 + 64 random bits, added with
+`ip -6 -force -batch` (`address add <a> dev <if> nodad`) **before** nft maps to it.
+The agent creates the (empty) table when it starts; with nothing rotated it changes
+no packet.
+
+All endpoints honour `X-API-KEY`; at most 1000 ports per call; a port is the SOCKS port.
+
+```bash
+# new random address for new connections (mode becomes static; the old one drains)
+curl -X POST http://127.0.0.1:8085/egress/rotate -d '{"ports":[32001,32002],"drain_sec":600}'
+# a random pool address for every new connection / back to the anchor
+curl -X POST http://127.0.0.1:8085/egress/mode -d '{"ports":[32001],"mode":"per_connection"}'
+curl -X POST http://127.0.0.1:8085/egress/mode -d '{"ports":[32001],"mode":"static"}'
+# forget the port entirely (egress = anchor)
+curl -X POST http://127.0.0.1:8085/egress/reset -d '{"ports":[32001]}'
+# what the node holds (no ports = every port with state)
+curl "http://127.0.0.1:8085/egress?ports=32001,32002"
+```
+
+Mutations answer 200 `{ok, items:[{port, ok, anchor, mode, old_ipv6, new_ipv6, error}]}`:
+`mode` is `static` / `per_connection` / `null` after the call, `new_ipv6` is the egress
+of new connections (`null` = the anchor, `"pool"` = per connection), `old_ipv6` the same
+before the call, `error` one of `port_not_found`, `anchor_not_found`,
+`address_add_failed`, `address_budget_exceeded` (the node is at
+`EGRESS_MAX_EXTRA_ADDRS`, see below), `nft_failed` (a failed port keeps its previous
+state; `ok` is true only if every item is). `reset` is idempotent: a port without state
+(or without a cfg) answers ok. `GET /egress` answers
+`{items:[{port, anchor, current, mode}], pool:{size, refreshed_at, idle_since}, draining, prefix, iface}`
+(`idle_since`: when the last `per_connection` port left the pool, else `null`).
+400 `bad_request` on a malformed body or more than 1000 ports; 503
+`egress_unavailable` (with `detail`) when the module is not up (no nft / no NAT, no
+default IPv6 route, a bad `NODE_EGRESS_PREFIX`) or the state file cannot be written.
+`/deprovision` also drops the egress state of the ports it removes.
+
+Environment (agent unit drop-in):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EGRESS_DRAIN_SEC` | 600 | how long a retired address stays on the NIC (default for `drain_sec`; always used for pool members) |
+| `EGRESS_POOL_SIZE` | 1024 | node-wide per-connection pool, created when the first port enters `per_connection` |
+| `EGRESS_POOL_REFRESH_SEC` | 600 | pool refresh period; also how long a pool nobody uses is kept idle before it drains |
+| `EGRESS_POOL_REFRESH_FRACTION` | 0.25 | share of the pool (oldest first) replaced on each refresh |
+| `EGRESS_MAX_EXTRA_ADDRS` | 40000 | most current + pool + draining addresses the node holds (anchors not counted) |
+| `NODE_EGRESS_PREFIX` | — | the /64 for new addresses (e.g. `2001:db8:1:2::/64`); default: the /64 of the first global address on the default-route IPv6 interface |
+| `EGRESS_NFT_DROPIN` | `/etc/systemd/system/nftables.service.d/netrun-egress.conf` | the boot drop-in below; `off` = do not write it |
+
+Address count: every extra address is one more /128 (and MLD group) on a NIC that
+already carries up to ~18k anchors, so it is bounded whatever callers do:
+- **one draining address per port**: rotating a port again (timer, rotation link, bot)
+  ends the drain of its previous-but-one address at once, so a port holds at most its
+  anchor, its current address and one draining address (sessions older than the
+  previous rotation of that port are cut);
+- **the pool is reused**: when the last `per_connection` port leaves, the pool is kept
+  idle for `EGRESS_POOL_REFRESH_SEC` (no refresh meanwhile) and only then drains, so
+  switching modes back and forth reuses one pool instead of adding `EGRESS_POOL_SIZE`
+  each time;
+- **`EGRESS_MAX_EXTRA_ADDRS`**: a call that would go over it first ends the drains due
+  soonest (the GC deletes them); ports that still do not fit fail with
+  `address_budget_exceeded` (a pool gets what fits, at least one address, or the
+  `per_connection` items fail the same way).
+
+Addresses and reboots: the state lives in `$PROXY_ROOT/egress_state.json` (atomic
+tmp+fsync+rename, written before a call answers). Retired addresses drain and a 30 s
+GC deletes them with the prefix length they actually carry (`/128`, or `/64` after the
+boot restore); an anchor, a current or a pool address is never deleted. The same tick
+checks that the table still exists (`nft list chain ip6 netrun_egress post`, only while
+something is mapped) and rebuilds it from the state after an `nft flush ruleset` or a
+`systemctl restart nftables`. The kernel forgets the added addresses and the table on
+reboot, and `netrun-ipv6-restore` only knows the cfgs' `-e` anchors: the **agent**
+re-adds the current and pool addresses of its state in one `ip -batch` and rebuilds the
+table when it starts, dropping ports whose cfg block or anchor is gone (an address that
+cannot be re-added is forgotten: that port leaves from its anchor until it is rotated
+again). Draining addresses are not re-added (no session survives a reboot; after a plain
+agent restart they are still on the NIC and the GC deletes them).
+
+Boot: the generator, `/deprovision`, `netrun-harden`, `netrun-https` and the install
+scripts save the whole ruleset (`nft list ruleset > /etc/nftables.conf`), this table
+included. So that a reboot never maps ports to addresses that are not back yet, a
+drop-in on `nftables.service` deletes the table right after the boot load:
+
+```ini
+# /etc/systemd/system/nftables.service.d/netrun-egress.conf
+[Service]
+ExecStartPost=-/usr/sbin/nft delete table ip6 netrun_egress
+```
+
+Rotated ports then leave from their anchors until the agent's start-up rebuild (a few
+seconds). `install_node_v2.sh` and `node_followup_v2.sh` install it, and the agent
+writes it at start when it is missing or different (then a best-effort
+`systemctl daemon-reload`), so a code deploy covers existing nodes.
+
+Rollback to an agent without rotation (it never touches the table or the addresses):
+
+```bash
+nft delete table ip6 netrun_egress          # every port leaves from its anchor again
+rm -f /opt/netrun/proxyserver/egress_state.json
+nft list ruleset > /etc/nftables.conf       # the saved copy goes too
+# the drop-in may stay (a missing table is ignored); the added /128s go at the next reboot
+```
+
+`scripts/clean_node.sh` also deletes the table, `egress_state.json` and the drop-in.
+
+Limits: every address stays inside the node's one /64 (anti-fraud systems that score a
+whole /64 still see one network), and with dual-stack (`-64`) proxies IPv4-only sites
+still see the node's single IPv4. Each rotated port holds two addresses on the NIC
+(anchor + current) plus at most one draining. Before offering short timers at scale,
+watch `ipv6=` and `load=` in `/var/log/netrun-trend.log` on a full staging node.
+
+```bash
+sudo bash scripts/smoke_egress_rotation.sh   # throw-away Linux box only: netns, real nft;
+                                             # also proves the saved ruleset loads back at boot
+```
 
 ## Smoke Generate
 
