@@ -84,12 +84,19 @@ reset
 ok "start: systemd-run --scope --unit netrun-3proxy-<sp> KillMode=process TasksMax=infinity --collect; setsid only if no 3proxy appeared; exit 3 when none did"
 
 # ── 4. legacy third-party DNS fixed forward at the (re)start ──────
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 reset
 printf 'daemon\nnserver 1.0.0.19\nnserver 2a0d:2a00:1::\n  maxconn 200\nflush\nsocks -6 -a -p18100 -i45.32.10.20 -e2001:db8::1\n' > "$CFG"
+touch -t 202001020304 "$CFG"; chmod 600 "$CFG"
+m_before="$(mtime "$CFG")"
 [ "$(run "$CFG")" = 0 ] || fail "spawn with legacy dns"
 printf 'daemon\nnserver 127.0.0.1\nnserver ::1\n  maxconn 200\nflush\nsocks -6 -a -p18100 -i45.32.10.20 -e2001:db8::1\n' > "$TMP/want"
 cmp -s "$TMP/want" "$CFG" || { cat "$CFG"; fail "legacy nserver not rewritten"; }
 grep -q '^dns-fixed start_port=18100' "$TMP/out" || fail "dns fix not reported"
+[ "$(mtime "$CFG")" = "$m_before" ] || fail "the DNS fix changed the cfg mtime ($m_before -> $(mtime "$CFG")): supervisor/firewall would see a new batch"
+[ "$(mode "$CFG")" = 600 ] || fail "the DNS fix changed the cfg mode: $(mode "$CFG")"
+chmod 644 "$CFG"
 reset
 printf 'daemon\nnserver 8.8.8.8\nflush\nsocks -6 -a -p18100 -i1.2.3.4 -e2001:db8::1\n' > "$CFG"
 cp "$CFG" "$TMP/orig"
@@ -102,7 +109,7 @@ grep -qx 'nserver 8.8.8.8' "$CFG" || fail "NETRUN_SPAWN_FIX_DNS=0 rewrote"
 reset; cp "$CFG" "$TMP/orig"; echo "1 $CFGDIR/bin/3proxy $CFG" > "$PS"
 run "$CFG" >/dev/null
 cmp -s "$TMP/orig" "$CFG" || fail "a running batch's cfg was touched"
-ok "legacy geo-seed nserver -> 127.0.0.1/::1 right before a start (only with unbound up; NETRUN_SPAWN_FIX_DNS=0 off; never for a running batch)"
+ok "legacy geo-seed nserver -> 127.0.0.1/::1 right before a start (mtime + mode kept; only with unbound up; NETRUN_SPAWN_FIX_DNS=0 off; never for a running batch)"
 
 # ── 5. restore_3proxy.sh: one snapshot, helper per non-listening cfg ──
 reset

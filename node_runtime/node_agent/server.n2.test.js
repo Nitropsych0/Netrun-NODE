@@ -29,6 +29,8 @@ process.env.NODE_AGENT_CLEANUP_CRON_AFTER_RUN = "0";
 process.env.NODE_AGENT_JOBS_KEEP = "0";
 process.env.NODE_AGENT_IPV6_EGRESS_URL = "https://127.0.0.1:9/";
 process.env.NODE_AGENT_FIREWALL_STATE_FILE = path.join(TMP, "desired.json");
+// Hermetic on a Linux host too: the real ip_local_port_range must not refuse the ghost push.
+process.env.NODE_AGENT_FIREWALL_EPHEMERAL_GUARD = "0";
 process.env.NETRUN_3PROXY_SPAWN = "off";
 process.env.PATH = `${BIN}:${process.env.PATH}`;
 fs.writeFileSync(path.join(BIN, "ss"), "#!/bin/sh\necho 'LISTEN 0 13 45.32.10.20:18100 0.0.0.0:*'\necho 'LISTEN 0 13 45.32.10.20:40000 0.0.0.0:*'\n", { mode: 0o755 });
@@ -114,6 +116,12 @@ test("GET /health: additive supervisor / firewall / static cfg checks / nodeTuni
   assert.deepStrictEqual(json.cfgsEgressFamily, { expectedFlag: "-6", mismatched: 1, items: [{ startPort: 40000, flags: ["-64"] }] });
   assert.ok("ipLocalPortRange" in json.nodeTuning && "ephemeralOverlapsProxyPorts" in json.nodeTuning && "pipeUserPagesSoft" in json.nodeTuning);
   assert.strictEqual(json.nodeTuning.proxyListenFloor, 8100);
+  // Audit follow-ups — additive.
+  assert.strictEqual(json.egressMode, "ipv6_only");
+  assert.strictEqual(json.ipv4ExitSharedWithNode, false, "the FP-01 guarantee holds only without IPv4 egress");
+  assert.strictEqual(json.firewall.accountToggles, 0);
+  assert.strictEqual(json.firewall.ephemeralGuard, false, "off in this test (env)");
+  for (const key of ["orphanAnchorsDeprecated", "preferredNodad", "preferredNonNodad", "respawnHistory"]) assert.ok(key in json.supervisor, key);
 });
 
 test("POST /firewall/desired: 400 on a bad body, 200 applied (ghost 40000 blocked), GET shows the persisted state", { timeout: 30_000 }, async () => {

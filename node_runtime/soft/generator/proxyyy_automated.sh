@@ -43,13 +43,13 @@ function usage() { echo "Usage: $0 [-s | --subnet <16|32|48|64|80|96|112> proxy 
                           [--allowed-hosts <string> allowed hosts or IPs (3proxy format), for example \"google.com,*.google.com,*.gstatic.com\"
                                 if at least one host is allowed, the rest are banned by default]
                           [--denied-hosts <string> banned hosts or IP addresses in quotes (3proxy format)]
-                          [--dns-servers <ip1,ip2> explicit upstream DNS resolvers override (default: the node's unbound, 127.0.0.1 / ::1)]
                           [--maxconn <number> 3proxy maxconn for this instance; the listen backlog is maxconn/16+1
                                 (default \$NETRUN_3PROXY_MAXCONN, else /etc/netrun/netrun.env, else 512)]
                           [--ipv6-policy <strict_dual_stack|ipv6_required|ipv6_only> egress family policy (default strict_dual_stack)]
-                          [--dns-country, --network-profile, --tcp-timestamps-mode, --self-check-samples <value>,
+                          [--dns-country, --dns-servers, --network-profile, --tcp-timestamps-mode, --self-check-samples <value>,
                            --skip-self-check: accepted and IGNORED (audit CLN-03/CLN-04: the TCP stack is set only by
-                           install_node_v2.sh / deploy/node/99-zz-netrun-tcp.conf, DNS is the local unbound, and the
+                           install_node_v2.sh / deploy/node/99-zz-netrun-tcp.conf, DNS is always the node's local unbound
+                           — the spawn helper rewrites any other nserver at the batch's first start — and the
                            post-start self-check never ran under the agent)]
                           [--port-ipv6-map-file <string> path to CSV file with port-to-IPv6 mapping
                                 (default \`~/proxyserver/port_ipv6_map_<start_port>.csv\`)]
@@ -83,7 +83,6 @@ script_log_file="/var/tmp/ipv6-proxy-server-logs.log"
 backconnect_ipv4=""
 mode_flag="-64"  # Universal mode by default
 ip_preference_mode="compat_ipv6_first"
-dns_servers_override=""
 ipv6_policy="strict_dual_stack"
 # Speed audit — 3proxy 0.9.3 has NO listen-backlog option: every service calls
 # listen(sock, (maxconn >> 4) + 1) (mainfunc 0xc408-0xc421 in the bundled
@@ -124,12 +123,13 @@ while true; do
     -d | --disable-inet6-ifaces-check ) inet6_network_interfaces_configuration_check=false; shift ;;
     --allowed-hosts ) allowed_hosts="$2"; shift 2 ;;
     --denied-hosts ) denied_hosts="$2"; shift 2 ;;
-    --dns-servers ) dns_servers_override="$2"; shift 2 ;;
     --ipv6-policy ) ipv6_policy="$2"; shift 2 ;;
     --maxconn ) proxy_maxconn="$2"; shift 2 ;;
     # Audit CLN-03 — accepted and ignored for one release (the agent and older
     # orchestrators still pass some of them): they changed nothing on the wire.
-    --dns-country | --network-profile | --tcp-timestamps-mode | --self-check-samples ) shift 2 ;;
+    # --dns-servers too: its nserver lines never survived the batch's first
+    # start (the spawn helper points every cfg at the local unbound).
+    --dns-country | --dns-servers | --network-profile | --tcp-timestamps-mode | --self-check-samples ) shift 2 ;;
     --skip-self-check ) shift ;;
     --port-ipv6-map-file ) port_ipv6_map_file="$2"; shift 2 ;;
     --bootstrap-only ) bootstrap_only=true; shift ;;
@@ -166,10 +166,6 @@ function log_err_print_usage_and_exit() {
 
 function is_valid_ip() {
   if [[ "$1" =~ ^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ ]]; then return 0; else return 1; fi;
-}
-
-function looks_like_ipv6() {
-  if [[ "$1" == *:* ]]; then return 0; else return 1; fi;
 }
 
 function is_auth_used() {
@@ -420,32 +416,17 @@ function install_package() {
 }
 
 function configure_dns_servers() {
-  # --- Manual override (accepts IPv4 OR IPv6 for each of the two slots) ---
-  if [ -n "$dns_servers_override" ]; then
-    IFS=',' read -r dns_override_1 dns_override_2 _ <<< "$dns_servers_override"
-    dns_override_1=$(echo "$dns_override_1" | tr -d '[:space:]')
-    dns_override_2=$(echo "$dns_override_2" | tr -d '[:space:]')
-    if { is_valid_ip "$dns_override_1" || looks_like_ipv6 "$dns_override_1"; } \
-       && { is_valid_ip "$dns_override_2" || looks_like_ipv6 "$dns_override_2"; }; then
-      dns_nserver_lines="  nserver ${dns_override_1}"$'\n'"  nserver ${dns_override_2}"
-      dns_selected_servers_csv="${dns_override_1},${dns_override_2}"
-      dns_selection_strategy="manual_override"
-      echo "   DNS selected (manual_override): ${dns_selected_servers_csv}"
-      return
-    else
-      log_err_print_usage_and_exit "Error: '--dns-servers' must contain two valid IPv4 or IPv6 resolvers as 'ip1,ip2'";
-    fi;
-  fi;
-
-  # --- Default: local recursive resolver (unbound on 127.0.0.1) ---
-  # The bundled 3proxy 0.9.3 HONOURS the cfg `nserver` (h_nserver sets
-  # resolvfunc = myresolver -> udpresolve), and every node runs a local unbound
-  # (install_node_v2 -> configure_unbound). Pointing nserver at it keeps customer
-  # lookups on the node — no Cloudflare / third-party resolver sees them. The
-  # recursion leaves from the node's PRIMARY address (proxy anchors are
-  # deprecated, never picked as a source), so a DNS-leak test shows the node,
-  # not the proxy's exit IP: same network/ASN, not the same address.
-  # Override with --dns-servers if needed.
+  # Local recursive resolver (unbound on 127.0.0.1 / ::1), always. The bundled
+  # 3proxy 0.9.3 HONOURS the cfg `nserver` (h_nserver sets resolvfunc =
+  # myresolver -> udpresolve), and every node runs a local unbound
+  # (install_node_v2 -> configure_unbound). Pointing nserver at it keeps
+  # customer lookups on the node — no Cloudflare / third-party resolver sees
+  # them. For a -6 batch (ipv6_only egress) the recursion leaves from the
+  # node's PRIMARY IPv6 (proxy anchors are deprecated, never picked as a
+  # source), so a DNS-leak test shows the node, not the proxy's exit IP: same
+  # network/ASN, not the same address. Not so for IPv4 in dualstack (-64):
+  # IPv4 destinations and unbound's IPv4 recursion share the node's one IPv4
+  # (audit FP-02). --dns-servers is accepted and ignored (audit follow-up).
   dns_nserver_lines="  nserver 127.0.0.1"$'\n'"  nserver ::1"
   dns_selected_servers_csv="127.0.0.1,::1"
   dns_selection_strategy="local_unbound"
@@ -717,8 +698,11 @@ function create_startup_script() {
   local main_listen_ip="$backconnect_ipv4"
   if [ "$proxies_type" = "http" ]; then main_listen_ip="$http_listen_ip"; fi
   # Audit FP-01 — anchors are added deprecated (see the ip -batch below).
-  local anchor_lft=" preferred_lft 0"
-  if [ "$(netrun_setting NETRUN_ANCHOR_DEPRECATE 1)" = 0 ]; then anchor_lft=""; fi
+  # Off like everywhere else (agent settingOn, netrun-ipv6-restore): 0 / off /
+  # false / no, any case.
+  local anchor_lft=" preferred_lft 0" anchor_dep
+  anchor_dep="$(netrun_setting NETRUN_ANCHOR_DEPRECATE 1 | tr '[:upper:]' '[:lower:]')"
+  case "$anchor_dep" in 0|off|false|no) anchor_lft="" ;; esac
 
   # Wave CAPACITY-18K — the batch header no longer carries
   # `nscache 65536` / `nscache6 65536`. In the bundled 3proxy 0.9.3 they make

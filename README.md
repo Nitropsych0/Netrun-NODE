@@ -98,7 +98,10 @@ directory, or a listening first socks port: exit 0, nothing started), takes a pe
 -p TasksMax=infinity --collect` (setsid only when no 3proxy appeared) — restarting the
 restore unit, the agent or the https-sync oneshot never takes a batch down any more.
 Right before a start it rewrites legacy third-party `nserver` lines (the 2026-05 geo
-seed) to `127.0.0.1` / `::1` while unbound is active (`NETRUN_SPAWN_FIX_DNS=0`: off).
+seed) to `127.0.0.1` / `::1` while unbound is active (`NETRUN_SPAWN_FIX_DNS=0`: off),
+keeping the cfg's mode, owner and mtime (the supervisor and the firewall read the mtime:
+the rewrite is not a new batch). The generator's `--dns-servers` is accepted and ignored
+(its `nserver` lines never survived that first start).
 `scripts/test_3proxy_spawn.sh`.
 
 ### Supervisor (RES-11)
@@ -115,14 +118,28 @@ Every `NODE_AGENT_SUPERVISOR_INTERVAL_SEC` (60; first run after
   holds the generation lock (checked per tick and again right before the spawn) or the
   boot restore unit is running; at most `NODE_AGENT_SUPERVISOR_MAX_RESPAWNS_PER_HOUR`
   (5) per cfg, then the cfg is `failed` (logged once, `/health supervisor.failedCfgs`)
-  until it listens again or its file changes. The duplicate reaper and the supervisor
+  until it listens again or its file changes; the hourly history and the failed marks
+  survive an agent restart (same status file) — an OOM / watchdog restart does not hand a
+  crash-looping batch 5 fresh respawns. "Seen serving" belongs to the batch, not the start
+  port: `/generate` (under its lock, after kill-on-rebind) and a whole-batch `/deprovision`
+  forget the start port, so a regeneration there that fails leaves an `unsupervised`
+  leftover instead of a respawned batch nobody recorded; rewrites that keep the batch
+  (`/deprovision` rewrite, `/egress_mode`, the DNS fix) keep its supervision. An
+  http-only cfg is probed on its own listen address (`-i127.0.0.1` behind the HTTPS
+  front), never on haproxy's `<public-ip>:<port>`. The duplicate reaper and the supervisor
   share one process lock (`process_lock.js`) and never fight: the supervisor starts only
   a cfg that runs zero times, the reaper acts only on a cfg that runs twice and never
   kills its last copy; `/deprovision` and `/egress_mode` kill+respawn under the same lock;
 - re-adds anchors (cfg `-e` addresses) missing from `/proc/net/if_inet6` whose /64 the node
   still has, in ONE `ip -6 -force -batch` (`/128 nodad preferred_lft 0`), at most
   `NODE_AGENT_ANCHOR_READD_BATCH` (2000) per tick — an add holds RTNL for O(addresses on the NIC), ~30 ms at 16k (`NETRUN_ANCHOR_READD=0`: off);
-- deprecates anchors (below), `NODE_AGENT_ANCHOR_DEPRECATE_BATCH` (2000) per tick.
+- deprecates anchors (below), `NODE_AGENT_ANCHOR_DEPRECATE_BATCH` (2000) per tick —
+  every preferred global `nodad` address on the egress interface, not only the active
+  cfgs' (a deprovisioned / regenerated batch's anchors stay on the NIC until a reboot, a
+  `*.cfg.disabled`'s, an old restore's /64s: one of them added after the primary wins the
+  kernel's source tie-break). `/health supervisor`: `preferredNodad` (should reach 0),
+  `preferredNonNodad` (the primary: normally 1), `orphanAnchorsDeprecated`,
+  `respawnHistory`, `failedCfgs[].atMs|mtimeMs`.
 
 `NODE_AGENT_SUPERVISOR=0` turns it off. `netrun-ipv6-restore.sh` now exits 1 (loudly)
 when it finds no IPv6 interface instead of exiting 0.
@@ -141,9 +158,15 @@ owned by systemd-networkd / the RA (rewritten on every RA refresh or `netplan ap
 and does not cover on-link /64 destinations; `unbound outgoing-interface` + an agent
 `localAddress` cover two programs only and break when the SLAAC address changes. Only
 `nodad` anchors are ever deprecated (the host's own address never carries nodad).
-`NETRUN_ANCHOR_DEPRECATE=0` (environment or `/etc/netrun/netrun.env`) turns it off;
-undo on a node: the same `ip address change` with `preferred_lft forever`.
+`NETRUN_ANCHOR_DEPRECATE=0` / `off` / `false` / `no`, any case (environment or
+`/etc/netrun/netrun.env`; the agent, the generator and the boot restore read it the same
+way) turns it off; undo on a node: the same `ip address change` with `preferred_lft forever`.
 Check: `ip -6 route get 2001:500:2f::f` shows the primary as `src`.
+**IPv6 only.** In egress mode `dualstack` (`-64`) a proxy's IPv4 destinations leave from
+the node's single IPv4 — the address unbound's IPv4 recursion and the agent use too, so a
+DNS-leak test through such a proxy shows resolver IPv4 == exit IPv4. `/health` reports
+`egressMode` and `ipv4ExitSharedWithNode`; the fix is audit FP-02 (a dedicated egress
+IPv4 or fail-closed `-6`).
 
 ### Uniform TCP signature (FP-01)
 
@@ -155,7 +178,10 @@ after `99-sysctl.conf` (= `/etc/sysctl.conf`), where the old generator wrote
 generator's TCP profile (`apply_network_profile_sysctl`, written to `/etc/sysctl.conf`),
 its edge "normalization" (ttl/hoplimit set, ct invalid drop, fragment drops) and every
 `tcp option maxseg size set` rule (nft can only LOWER an MSS; 1460 was a no-op, the legacy
-1340 read as OpenVPN). Existing nodes: `apply_capacity_tuning.sh --only fingerprint`.
+1340 read as OpenVPN). Existing nodes: `apply_capacity_tuning.sh --only fingerprint` —
+it deletes those rules and keeps the (now empty) `inet proxy_normalization` table and its
+chains: the pre-N2 generator refuses every `--runtime-only` generation without the table,
+so a rollback to it must find it (restoring `/etc/nftables.conf` alone reloads nothing).
 
 ### Desired-state firewall for stale listeners (RES-13, node part)
 
@@ -175,7 +201,32 @@ exist: 409 unless `force`. The accepted push is persisted
 re-asserts the pushed ghosts and `pergbBlocked` and removes stale drops on live ports,
 but never declares new ghosts. `GET /firewall/desired` shows the state.
 `NODE_AGENT_FIREWALL_DESIRED=0`: off. Response `report`: `{ghosts, pergbBlocked, added,
-removed, skippedInFlight}` (`{count, sample}` each), `listenersInWindows`, `freshExempt`.
+removed, skippedInFlight}` (`{count, sample}` each), `listenersInWindows`, `freshExempt`,
+`togglesKept`, `ipLocalPortRange`.
+
+- **The latest per-port intent wins.** `POST /accounts/{port}/disable|enable` records the
+  toggle (`{blocked, atMs}` for the port and its http pair) in memory and in
+  `NODE_AGENT_FIREWALL_TOGGLES_FILE` (`/var/lib/netrun/desired.toggles.json`) before the
+  200 (same response as before). Every plan lays the toggles over the desired state: a
+  disabled port stays blocked, an enabled one is live and never blocked — the 15-min and
+  the boot re-apply of an older push never re-block a customer who topped up or free a
+  depleted account, and `pergb_blocked.list` is never pruned / refilled against a toggle.
+  A push drops the toggles older than its snapshot (`computedAt`, else its arrival, − 5 min)
+  and keeps the newer ones over its payload; a generation lift drops its batch's toggles.
+  The accounting call runs outside the apply chain (a slow push never delays the disable
+  ack); a toggle landing while a plan applies is re-checked before `nft -f` and inside the
+  list update. `/health firewall.accountToggles`.
+- **Lift after a failed sweep.** When `/generate`'s kill-on-rebind sweep did not finish
+  (its `ss -p` failed or it threw), one cheap `ss -Hltn` per range finds the batch ports an
+  old occupant still serves (address-aware like the generator's pre-check: haproxy's
+  `<public-ip>:<http-port>` frontend is not an occupant); their drops, list entries and
+  toggles stay. If that snapshot fails too, everything is lifted as before.
+- **Ephemeral-range guard** (`NODE_AGENT_FIREWALL_EPHEMERAL_GUARD`, default on): the drop
+  rule also drops the SYN-ACKs of upstream connections whose ephemeral port is blocked (the
+  2026-10-07 5–7 % incident). A push that would add blocks inside
+  `net.ipv4.ip_local_port_range` → 409 `ephemeral_overlap` (`ipLocalPortRange`,
+  `overlappingAdds`) unless `force`; a re-apply only warns (`ephemeralOverlap` in its report).
+  Fix the node with `apply_capacity_tuning.sh --only sysctl` (1024–8000).
 
 ### 3proxy accept backlog, splice pipes, HTTPS reloads (speed)
 
@@ -189,9 +240,19 @@ removed, skippedInFlight}` (`{count, sample}` each), `listenersInWindows`, `fres
   per connection): past the soft limit new pipes get 8 KiB instead of 64 KiB. Sized by RAM
   (largest power of two ≤ MemTotal/32 pages, 16384..262144; 2c/4GB → 65536 = full pipes for
   ~2048 relays, 256 MiB worst case). Existing nodes: `apply_capacity_tuning.sh --only pipes`.
-- `netrun-https sync` reloads haproxy only when the frontends or the base config changed
-  (it reloaded every 5 min, each reload leaving a draining worker for up to the 1 h tunnel
-  timeout); its unit gets `KillMode=process` (`netrun-https units`).
+- `netrun-https sync` reloads haproxy only when needed (it reloaded every 5 min, each
+  reload leaving a draining worker for up to the 1 h tunnel timeout): the frontends or the
+  base config changed, haproxy is stopped, or the files differ from the last reload that
+  haproxy verifiably loaded — `/run/netrun/haproxy-applied.sha` (haproxy.cfg + certificate
+  + frontends), written only once haproxy listens on every frontend's first bind port
+  (`NETRUN_HTTPS_RELOAD_VERIFY`, default 1; up to `NETRUN_HTTPS_VERIFY_WAIT_SEC`, 10). A
+  failed, killed or unverified reload is therefore retried on the next 5-min tick (the
+  sync exits 1 meanwhile); a missing stamp (deploy, reboot) costs one reload;
+  `NETRUN_HTTPS_RELOAD_MAX_AGE_H` (6; 0 = never) reloads anyway after that long. A new
+  frontend set is checked with `haproxy -c` BEFORE it replaces `/etc/haproxy/netrun.d`
+  (a rejected set never goes live). sync / renew / setup share one `flock`
+  (`/run/netrun/https-sync.lock`). Its unit gets `KillMode=process` (`netrun-https units`;
+  `apply_capacity_tuning.sh --only units` refreshes the `/usr/local/sbin` copy).
 - Batch IPv6 generation: one `od` + one `awk` per batch (was ~17 subshells and one
   `ip -6 addr` dump of every NIC address per address).
 
@@ -205,7 +266,7 @@ bash scripts/apply_capacity_tuning.sh --apply --only units,fingerprint,pipes,ipv
 Tests: `bash scripts/test_3proxy_spawn.sh`, `bash scripts/test_generator_flags.sh`,
 `bash scripts/test_apply_capacity_tuning.sh`, `bash scripts/test_capacity_18k_node.sh`,
 `cd node_runtime/node_agent && node --test` (`supervisor`, `firewall`, `proxy_spawn`,
-`cfg_checks`, `server.n2`).
+`cfg_checks`, `server.n2`, `server.lift_exclude`).
 
 ## Self-describe (for orchestrator enroll)
 

@@ -20,6 +20,8 @@ process.env.NODE_AGENT_JOBS_ROOT = path.join(ROOT, "jobs");
 process.env.NODE_AGENT_DISABLE_GRACE_MS = "0";
 process.env.NODE_AGENT_CLEANUP_CRON_AFTER_RUN = "0";
 process.env.NODE_AGENT_JOBS_KEEP = "0";
+// The account toggles are recorded next to the desired-state file (firewall.js).
+process.env.NODE_AGENT_FIREWALL_STATE_FILE = path.join(ROOT, "desired.json");
 // No 3proxy runs here: a stub pgrep that never matches (exit 1 = no process).
 const BIN = path.join(ROOT, "bin");
 fs.mkdirSync(BIN, { recursive: true });
@@ -207,6 +209,12 @@ test("POST /accounts/{port}/disable: failed block -> 500 disable_failed (port st
     acct._setNftExec(fakeNft({ delCode: 1 }).exec);
     const en = await post(port, "/accounts/41001/enable");
     assert.notStrictEqual(en.status, 500, JSON.stringify(en.json));
+
+    // Both toggles are recorded for the desired-state firewall (a re-apply of
+    // an older push must never undo them).
+    const toggles = JSON.parse(fs.readFileSync(path.join(ROOT, "desired.toggles.json"), "utf-8")).toggles;
+    assert.strictEqual(toggles["41000"].blocked, true);
+    assert.strictEqual(toggles["41001"].blocked, false);
   } finally {
     await new Promise((r) => srv.server.close(r));
   }

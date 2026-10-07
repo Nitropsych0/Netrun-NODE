@@ -61,12 +61,19 @@ function ipv6ToHex(text) {
 // default, IPv4), for /health's static checks: third-party DNS left over from
 // the 2026-05 geo seed, and a batch that can leave over IPv4 while the node is
 // in ipv6_only egress mode (the dual-stack self-check never ran).
+//
+// probeAddr: the listen address (-i) of the probe line. An http-only cfg on a
+// node with the HTTPS front binds 127.0.0.1:<port> while haproxy holds
+// <public-ip>:<port>: a bare port probe would read haproxy's frontend as the
+// batch listening (cfgListening below matches the address for such a cfg).
 function parseCfgSummary(text) {
   const socksPorts = [];
   const httpPorts = [];
   const egress = new Set();
   const nservers = [];
   const modeFlags = new Set();
+  let socksAddr;
+  let httpAddr;
   for (const raw of String(text || "").split(/\r?\n/)) {
     const line = raw.trim();
     const ns = /^nserver\s+(\S+)/.exec(line);
@@ -78,15 +85,23 @@ function parseCfgSummary(text) {
     const isHttp = /^proxy\s/.test(line);
     if (!isSocks && !isHttp) continue;
     const pm = /(?:^|\s)-p(\d+)(?:\s|$)/.exec(line);
-    if (pm) (isSocks ? socksPorts : httpPorts).push(Number(pm[1]));
+    if (pm) {
+      (isSocks ? socksPorts : httpPorts).push(Number(pm[1]));
+      const im = /(?:^|\s)-i(\S+)/.exec(line);
+      if (isSocks && socksAddr === undefined) socksAddr = im ? im[1] : null;
+      if (isHttp && httpAddr === undefined) httpAddr = im ? im[1] : null;
+    }
     const em = /(?:^|\s)-e(\S+)/.exec(line);
     if (em && em[1].includes(":")) egress.add(em[1]);
     const fm = /(?:^|\s)(-64|-46|-6|-4)(?=\s|$)/.exec(line);
     modeFlags.add(fm ? fm[1] : "none");
   }
   const primary = socksPorts.length ? socksPorts : httpPorts;
+  const probeAddr = socksPorts.length ? socksAddr : httpAddr;
   return {
     probePort: primary.length ? primary[0] : null,
+    probeAddr: probeAddr || null,
+    httpOnly: socksPorts.length === 0 && httpPorts.length > 0,
     count: primary.length,
     socksPorts,
     httpPorts,
@@ -94,6 +109,43 @@ function parseCfgSummary(text) {
     nservers,
     modeFlags: [...modeFlags].sort(),
   };
+}
+
+// "[2001:db8::1]" / "127.0.0.1%lo" / "::FFFF:1.2.3.4" -> the bare lowercase address.
+function normalizeListenAddr(addr) {
+  return String(addr || "").trim().replace(/^\[/, "").replace(/\]$/, "").replace(/%.*$/, "").toLowerCase();
+}
+
+const WILDCARD_ADDRS = new Set(["", "*", "0.0.0.0", "::"]);
+
+function listenKey(addr, port) {
+  return `${normalizeListenAddr(addr)}:${port}`;
+}
+
+// `ss -ltn` text -> Set of "<addr>:<port>" of the listeners (local column).
+function parseListenKeys(text) {
+  const out = new Set();
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const fields = raw.trim().split(/\s+/);
+    if (fields.length < 2) continue;
+    const local = fields.length >= 4 ? fields[3] : fields[fields.length - 1];
+    const m = /^(.*):(\d+)$/.exec(String(local || ""));
+    if (!m) continue;
+    const port = Number(m[2]);
+    if (Number.isInteger(port) && port > 0 && port <= 65535) out.add(listenKey(m[1], port));
+  }
+  return out;
+}
+
+// Is the cfg's probe listener up? An http-only cfg bound to a specific
+// address is matched on address:port (keys), so haproxy's frontend on the
+// same port number never counts; every other cfg on the port (ports).
+function cfgListening(c, ports, keys = null) {
+  const probe = Number.isInteger(c && c.probePort) && c.probePort > 0 ? c.probePort : c && c.startPort;
+  if (keys && c && c.httpOnly && c.probeAddr && !WILDCARD_ADDRS.has(normalizeListenAddr(c.probeAddr))) {
+    return keys.has(listenKey(c.probeAddr, probe));
+  }
+  return Boolean(ports && ports.has(probe));
 }
 
 // A resolver that is not the node's own unbound (127.0.0.0/8, ::1, localhost;
@@ -176,7 +228,9 @@ function computeAddressCoverage(expectedAddrs, presentHex, { sample = 10 } = {})
 // instances = collectRunningInstances().instances, listeningPorts = Set|array.
 // When the port probe failed (portsOk false) `listening` and `cfgsDown` are
 // null (unknown), never "down".
-function computeCfgStatus({ cfgs, instances, listeningPorts, portsOk = true, maxItems = 500 } = {}) {
+// listeningKeys (Set of "<addr>:<port>", optional): address-aware probe for
+// http-only cfgs (cfgListening).
+function computeCfgStatus({ cfgs, instances, listeningPorts, listeningKeys = null, portsOk = true, maxItems = 500 } = {}) {
   const portSet =
     listeningPorts instanceof Set
       ? listeningPorts
@@ -196,8 +250,7 @@ function computeCfgStatus({ cfgs, instances, listeningPorts, portsOk = true, max
     const startPort = Number(c && c.startPort);
     if (!Number.isInteger(startPort) || startPort <= 0) continue;
     const pids = (pidsByStart.get(startPort) || []).sort((a, b) => a - b);
-    const probe = Number.isInteger(c.probePort) && c.probePort > 0 ? c.probePort : startPort;
-    const listening = portsOk ? portSet.has(probe) : null;
+    const listening = portsOk ? cfgListening({ ...c, startPort }, portSet, listeningKeys) : null;
     if (listening === false) down += 1;
     if (pids.length === 0) withoutProcess.push({ startPort, cfgPath: c.cfgPath || null });
     items.push({
@@ -218,9 +271,11 @@ function computeCfgStatus({ cfgs, instances, listeningPorts, portsOk = true, max
 }
 
 // Active cfg files (3proxy_<start>.cfg; *.cfg.disabled are off on purpose),
-// parsed once per (mtime, size).
+// parsed once per (mtime, size, inode). The inode is part of the key: the
+// spawn helper's DNS fix-forward rewrites a cfg (tmp + mv: a new inode) and
+// keeps its mtime, and the rewrite may keep the size too.
 function createCfgInventory({ cfgDir, fs: fsImpl = fsp } = {}) {
-  const cache = new Map(); // name -> { mtimeMs, size, summary }
+  const cache = new Map(); // name -> { mtimeMs, size, ino, summary }
   async function read() {
     let names;
     try {
@@ -246,20 +301,22 @@ function createCfgInventory({ cfgDir, fs: fsImpl = fsp } = {}) {
       }
       live.add(name);
       let hit = cache.get(name);
-      if (!hit || hit.mtimeMs !== st.mtimeMs || hit.size !== st.size) {
+      if (!hit || hit.mtimeMs !== st.mtimeMs || hit.size !== st.size || hit.ino !== st.ino) {
         let text = "";
         try {
           text = await fsImpl.readFile(cfgPath, "utf-8");
         } catch {
           continue;
         }
-        hit = { mtimeMs: st.mtimeMs, size: st.size, summary: parseCfgSummary(text) };
+        hit = { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, summary: parseCfgSummary(text) };
         cache.set(name, hit);
       }
       cfgs.push({
         startPort: Number(m[1]),
         cfgPath,
         probePort: hit.summary.probePort,
+        probeAddr: hit.summary.probeAddr,
+        httpOnly: hit.summary.httpOnly,
         count: hit.summary.count,
         egress: hit.summary.egress,
         nservers: hit.summary.nservers,
@@ -331,6 +388,10 @@ function createCoverageProbe({
 module.exports = {
   ipv6ToHex,
   parseCfgSummary,
+  normalizeListenAddr,
+  listenKey,
+  parseListenKeys,
+  cfgListening,
   isLocalResolver,
   staticCfgChecks,
   parseIfInet6,

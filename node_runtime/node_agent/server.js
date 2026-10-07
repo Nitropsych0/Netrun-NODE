@@ -799,6 +799,57 @@ function generationBatchPorts(params) {
   return out;
 }
 
+// Audit RES-13 follow-up — the batch ports an OLD occupant still listens on,
+// from `ss -Hltn` text (no -p) over the batch's socks range and its http
+// mirror. Address-aware like the generator's port pre-check
+// (select_listen_conflicts): a socks-range listener on any address is an
+// occupant; in the http mirror a loopback / wildcard listener is (3proxy's
+// http behind haproxy), a specific public address is only when the node has
+// no HTTPS front (with one, <public-ip>:<http-port> is haproxy's frontend,
+// which the generator does not count either). An occupied port takes its
+// pair along (socks p <-> http p - 10000), as the pay-per-GB blocks do.
+function selectOccupiedBatchPorts(ssText, params, { httpsFront = false } = {}) {
+  const batch = new Set(generationBatchPorts(params));
+  const sp = toPositiveInt(params && params.startPort, 0);
+  const n = toPositiveInt(params && params.proxyCount, 0);
+  const inSocks = (p) => p >= sp && p < sp + n;
+  const out = new Set();
+  for (const raw of String(ssText || "").split(/\r?\n/)) {
+    const fields = raw.trim().split(/\s+/);
+    if (fields.length < 4 || fields[0] !== "LISTEN") continue;
+    const local = fields[3];
+    const m = /^(.*):(\d+)$/.exec(local);
+    if (!m) continue;
+    const port = Number(m[2]);
+    if (!batch.has(port)) continue;
+    const addr = m[1].replace(/^\[/, "").replace(/\]$/, "").replace(/%.*$/, "");
+    const loopbackOrWild = addr === "*" || addr === "0.0.0.0" || addr === "::" || addr === "::1" || /^127\./.test(addr) || /^::ffff:127\./.test(addr);
+    if (!inSocks(port) && httpsFront && !loopbackOrWild) continue; // haproxy's frontend
+    for (const q of [port, inSocks(port) ? port - 10000 : port + 10000]) if (batch.has(q)) out.add(q);
+  }
+  return out;
+}
+
+// One cheap snapshot per range (no -p: that walks every 3proxy's fds).
+// -> { ok, ports: Set }.
+async function occupiedBatchPorts(params) {
+  const sp = toPositiveInt(params && params.startPort, 0);
+  const n = toPositiveInt(params && params.proxyCount, 0);
+  if (!sp || !n) return { ok: true, ports: new Set() };
+  const ranges = [[sp, sp + n - 1]];
+  if (String((params && params.proxiesType) || "") === "dual" && sp + n - 1 - 10000 >= 1) {
+    ranges.push([Math.max(1, sp - 10000), sp + n - 1 - 10000]);
+  }
+  let text = "";
+  for (const [lo, hi] of ranges) {
+    const r = await runCommand("ss", ["-Hltn", `sport >= :${lo} and sport <= :${hi}`], { timeoutSec: 8 });
+    if (!r.ok) return { ok: false, ports: new Set() };
+    text += `${String(r.stdout || "")}\n`;
+  }
+  const httpsFront = fs.existsSync(String(process.env.NETRUN_HAPROXY_FRONTEND_DIR || "/etc/haproxy/netrun.d"));
+  return { ok: true, ports: selectOccupiedBatchPorts(text, params, { httpsFront }) };
+}
+
 function buildCfgPathForStartPort(startPort) {
   return path.join(PROXY_CFG_ROOT, `3proxy_${startPort}.cfg`);
 }
@@ -1561,12 +1612,14 @@ async function listListeningExactPorts(ports) {
   const list = [...new Set((ports || []).map((p) => toPositiveInt(p, 0)).filter((p) => p > 0 && p <= 65535))];
   if (list.length <= LISTEN_PROBE_CHUNK) return listListeningTcpPorts(list.length > 0 ? { ports: list } : undefined);
   const out = new Set();
+  const keys = new Set();
   for (let i = 0; i < list.length; i += LISTEN_PROBE_CHUNK) {
     const part = await listListeningTcpPorts({ ports: list.slice(i, i + LISTEN_PROBE_CHUNK) });
-    if (!part.ok) return { ok: false, error: part.error, ports: out };
+    if (!part.ok) return { ok: false, error: part.error, ports: out, keys };
     for (const p of part.ports) out.add(p);
+    for (const k of part.keys || []) keys.add(k);
   }
-  return { ok: true, error: null, ports: out };
+  return { ok: true, error: null, ports: out, keys };
 }
 
 async function listListeningTcpPorts(range) {
@@ -1589,7 +1642,7 @@ async function listListeningTcpPorts(range) {
   }
   const ss = await runCommand("ss", _ssArgs, { timeoutSec: 8 });
   if (!ss.ok) {
-    return { ok: false, error: ss.error || "ss_failed", ports: out };
+    return { ok: false, error: ss.error || "ss_failed", ports: out, keys: new Set() };
   }
 
   const lines = String(ss.stdout || "").split(/\r?\n/);
@@ -1609,7 +1662,9 @@ async function listListeningTcpPorts(range) {
       out.add(port);
     }
   }
-  return { ok: true, error: null, ports: out };
+  // Audit RES-11 follow-up — "<addr>:<port>" too (an http-only cfg behind the
+  // HTTPS front is up only on its own 127.0.0.1:<port>, not haproxy's).
+  return { ok: true, error: null, ports: out, keys: cfgStatus.parseListenKeys(ss.stdout) };
 }
 
 function sleep(ms) {
@@ -2938,8 +2993,9 @@ async function handleGenerate(req, res) {
   // first (it re-checks the lock under the same process lock, so none starts
   // after this point): the process snapshot below sees everything.
   await withProcessLock(async () => {});
+  let rebindResult = null;
   try {
-    const rebindResult = await killOverlappingListeners({
+    rebindResult = await killOverlappingListeners({
       newStart: params.startPort,
       newCount: params.proxyCount,
       reclaimStartPorts: reclaimParse.ports,
@@ -2977,20 +3033,40 @@ async function handleGenerate(req, res) {
     }
   } catch (rebindError) {
     // Never block a generation on the safety sweep.
+    rebindResult = null;
     console.warn("[kill-on-rebind] sweep error; proceeding with generation", {
       jobId,
       start_port: params.startPort,
       error: rebindError && rebindError.message ? rebindError.message : String(rebindError),
     });
   }
+  // Audit RES-11 follow-up — the supervisor forgets that these start ports
+  // served: whatever this run leaves at them is a NEW batch (a failed
+  // attempt's leftover is `unsupervised`, never respawned; a good one listens
+  // and is seen again on the next tick).
+  try {
+    supervisor.forget([params.startPort, ...((rebindResult && rebindResult.cleanedStartPorts) || [])]);
+  } catch (forgetError) {
+    console.warn("[supervisor] forget before generation failed", forgetError && forgetError.message ? forgetError.message : String(forgetError));
+  }
   // Audit RES-13 — the ports of the batch about to be generated are never left
   // firewalled: an old occupant's ghost / pay-per-GB block or an earlier failed
   // attempt's block would fail this run's validation (incident 2026-10-07).
-  // Nothing of the old occupant listens any more (kill-on-rebind ran above;
-  // strict mode returned ports_in_use instead).
+  // After a finished sweep nothing of the old occupant listens any more
+  // (strict mode returned ports_in_use instead). When the sweep did not finish
+  // (its `ss -p` failed or it threw), one cheap address-aware snapshot finds
+  // the ports an old occupant still serves: their blocks (a depleted pay-per-GB
+  // account's) stay; the generator refuses those ports itself. If that
+  // snapshot fails too, everything is lifted as before.
   try {
-    const lift = await firewall.liftPorts(generationBatchPorts(params), `generation ${jobId}`);
+    let exclude = null;
+    if (!(rebindResult && rebindResult.ok)) {
+      const occupied = await occupiedBatchPorts(params);
+      if (occupied.ok && occupied.ports.size > 0) exclude = occupied.ports;
+    }
+    const lift = await firewall.liftPorts(generationBatchPorts(params), `generation ${jobId}`, { exclude });
     if (lift && lift.lifted) console.log("[firewall] generation job_id=%s lifted %s block(s)", jobId, lift.lifted);
+    if (lift && lift.kept) console.warn("[firewall] generation job_id=%s kept %s block(s) on ports that still listen", jobId, lift.kept);
   } catch (liftError) {
     console.warn("[firewall] lift before generation failed; proceeding", liftError && liftError.message ? liftError.message : String(liftError));
   }
@@ -3887,6 +3963,7 @@ async function handleHealth(req, res) {
     cfgs: inventory.cfgs,
     instances,
     listeningPorts: listenState.ports,
+    listeningKeys: listenState.keys || null,
     portsOk: listenState.ok && inventory.ok,
   });
   const success = Boolean(instancesState.ok);
@@ -3970,6 +4047,12 @@ async function handleHealth(req, res) {
     cfgsLegacyDns: cfgChecks.cfgsLegacyDns,
     cfgsEgressFamily: cfgChecks.cfgsEgressFamily,
     nodeTuning: nodeTuningStatus(),
+    // Audit FP-01 scope — additive. The deprecated-anchor guarantee (the
+    // node's own traffic never leaves from a customer's exit IP) is IPv6-only:
+    // in dualstack egress (-64) IPv4 destinations leave from the node's one
+    // IPv4, the address unbound and the agent use too (FP-02).
+    egressMode: egressModeNow,
+    ipv4ExitSharedWithNode: egressModeNow === "dualstack" ? true : egressModeNow === "ipv6_only" ? false : null,
   });
 }
 
@@ -4090,9 +4173,12 @@ const server = http.createServer(async (req, res) => {
     const port = Number(accountsActionMatch[1]);
     const action = accountsActionMatch[2];
     try {
-      const result = action === "disable"
-        ? await accounting.disablePort(port)
-        : await accounting.enablePort(port);
+      // Audit RES-13 follow-up — through the desired-state firewall, which
+      // records the toggle first: a later re-apply of an older push (every
+      // 15 min, and at agent start) must never undo it. Same response.
+      const result = await firewall.recordAccountToggle(port, action === "disable", () =>
+        action === "disable" ? accounting.disablePort(port) : accounting.enablePort(port)
+      );
       return sendJson(res, 200, { success: true, port, ...result });
     } catch (err) {
       if (err && err.code === "PORT_NOT_FOUND") {
@@ -4185,6 +4271,16 @@ const server = http.createServer(async (req, res) => {
     }
     try {
       const result = await deprovision.deprovisionPorts(ports);
+      // Audit RES-11 follow-up — a dropped batch's start port is free for a
+      // new batch: it no longer counts as "seen serving".
+      const dropped = (result.cfgs || []).filter((c) => c && c.ok && c.mode === "drop").map((c) => c.startPort);
+      if (dropped.length) {
+        try {
+          supervisor.forget(dropped);
+        } catch (_error) {
+          // status only
+        }
+      }
       return sendJson(res, 200, { success: result.ok, ...result });
     } catch (err) {
       return sendJson(res, 500, {
@@ -4332,6 +4428,7 @@ module.exports = {
   supervisor,
   firewall,
   generationBatchPorts,
+  selectOccupiedBatchPorts,
   evaluateProductProfileContract,
   buildProfileDiagnostics,
   nodeTuningStatus,

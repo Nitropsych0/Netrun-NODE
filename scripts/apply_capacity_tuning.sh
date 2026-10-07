@@ -8,7 +8,8 @@
 #   - never changes a listener, a port, a cfg file or a sold proxy;
 #   - never touches nft map/set rules, counters, or tables other than the
 #     legacy per-port rules of inet proxy_accounting and (fingerprint step)
-#     the inert inet proxy_normalization table.
+#     the inert rules of inet proxy_normalization (the table and its chains
+#     stay, empty).
 #
 #   bash apply_capacity_tuning.sh                     # = --dry-run: print the plan, change nothing
 #   bash apply_capacity_tuning.sh --apply             # do it
@@ -72,9 +73,12 @@
 #                sysctl -p (new sockets only). And the inert/legacy rules of nft
 #                table inet proxy_normalization (MSS `maxseg size set` 1460 — or
 #                1340, which reads as OpenVPN — ttl/hoplimit set, ct invalid drop,
-#                fragment drops) are deleted in one nft -f; the empty table goes
-#                too once the deployed generator no longer checks for it. Refused
-#                while a generation holds the genlock (ruleset persist).
+#                fragment drops) are deleted in one nft -f. The table and its
+#                (now empty, policy accept) chains are KEPT: the pre-N2 generator
+#                refuses every --runtime-only generation without the table
+#                (check_bootstrap_ready), so a rollback to it must find it — and
+#                restoring /etc/nftables.conf alone does not reload anything.
+#                Refused while a generation holds the genlock (ruleset persist).
 #   pipes        OPT-IN (speed audit). fs.pipe-user-pages-soft sized by RAM (the
 #                largest power of two <= MemTotal/32 in pages, 16384..262144;
 #                2c/4GB -> 65536 = full 64 KiB splice pipes for ~2048 relayed
@@ -142,7 +146,6 @@ HTTPS_SYNC_DROPIN="$SYSTEMD_DIR/netrun-https-sync.service.d/10-killmode.conf"
 HTTPS_SBIN="$ROOT/usr/local/sbin/netrun-https"
 TCP_FILE="$ROOT/etc/sysctl.d/99-zz-netrun-tcp.conf"
 SYSCTL_CONF="$ROOT/etc/sysctl.conf"
-GENERATOR="$ROOT/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh"
 PROC_PIPE_SOFT="$ROOT/proc/sys/fs/pipe-user-pages-soft"
 TCP_KEYS="net.ipv4.ip_default_ttl net.ipv4.tcp_timestamps net.ipv4.tcp_sack net.ipv4.tcp_window_scaling net.ipv4.tcp_ecn net.ipv4.tcp_rmem net.ipv4.route.min_adv_mss net.ipv4.tcp_mtu_probing"
 
@@ -715,7 +718,7 @@ normalization_rules() {
 }
 
 step_fingerprint() {
-  local src="$REPO/deploy/node/99-zz-netrun-tcp.conf" need=() key ek legacy="" rules="" n_rules=0 drop_table=0
+  local src="$REPO/deploy/node/99-zz-netrun-tcp.conf" need=() key ek legacy="" rules="" n_rules=0
   if [ ! -f "$src" ]; then
     refused fingerprint "repo file $src not found (deploy the code first)"
     return 0
@@ -732,7 +735,7 @@ step_fingerprint() {
     rules="$(normalization_rules)"
     n_rules="$(printf '%s' "$rules" | grep -c .)"
     [ "$n_rules" -eq 0 ] || need+=("nft-normalization-rules:$n_rules")
-    if [ -f "$GENERATOR" ] && ! grep -q 'proxy_normalization' "$GENERATOR"; then drop_table=1; need+=("nft-normalization-table"); fi
+    # The empty table stays (rollback compatibility with pre-N2 generators).
   fi
   if [ "${#need[@]}" -eq 0 ]; then
     step_status fingerprint ok "pinned TCP signature in place ($TCP_FILE), no legacy keys in /etc/sysctl.conf, no normalization rules"
@@ -743,7 +746,7 @@ step_fingerprint() {
     [ -z "$rules" ] || nft list table inet proxy_normalization 2>/dev/null | grep -E 'maxseg|ttl|hoplimit|ct state|frag' | head -n 8 | sed 's/^/[capacity-tuning]     /'
     return 0
   fi
-  if [ "$n_rules" -gt 0 ] || [ "$drop_table" = 1 ]; then
+  if [ "$n_rules" -gt 0 ]; then
     if [ -e "$GENLOCK" ] && [ "$IGNORE_GENLOCK" != 1 ]; then
       refused fingerprint "a generation holds $GENLOCK — rerun when it is done (the ruleset is persisted)"
       return 0
@@ -759,11 +762,8 @@ step_fingerprint() {
     done
   fi
   sysctl -p "$TCP_FILE" >/dev/null 2>&1 || { failed fingerprint "sysctl -p $TCP_FILE failed (files written)"; return 0; }
-  if [ "$n_rules" -gt 0 ] || [ "$drop_table" = 1 ]; then
-    {
-      printf '%s\n' "$rules" | awk 'NF == 2 { print "delete rule inet proxy_normalization " $1 " handle " $2 }'
-      [ "$drop_table" = 1 ] && echo "delete table inet proxy_normalization"
-    } > "$TMPD/norm_batch"
+  if [ "$n_rules" -gt 0 ]; then
+    printf '%s\n' "$rules" | awk 'NF == 2 { print "delete rule inet proxy_normalization " $1 " handle " $2 }' > "$TMPD/norm_batch"
     if ! nft -f "$TMPD/norm_batch" 2>"$TMPD/norm_err"; then
       failed fingerprint "nft -f rejected (sysctl part applied): $(head -c 300 "$TMPD/norm_err" | tr '\n' ' ')"
       return 0

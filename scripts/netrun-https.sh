@@ -17,7 +17,8 @@
 #
 #   netrun-https setup   # once: haproxy + lego, certificate, timers, then sync
 #   netrun-https sync    # idempotent: move HTTP listeners, (re)write frontends;
-#                        # haproxy is reloaded ONLY when its config changed
+#                        # haproxy is reloaded ONLY when what it loaded differs
+#                        # from the files (see "reload stamp" below)
 #   netrun-https renew   # timer: renew the certificate when due, reload haproxy
 #   netrun-https status  # short report
 #   netrun-https accounting  # only (re)write the two per-port counter map rules
@@ -26,6 +27,24 @@
 # Settings (environment, else ${NETRUN_ENV_FILE:-/etc/netrun/netrun.env}):
 #   NETRUN_ACCOUNTING_MATCH_IPV4=1  meter only client legs: the map rules also
 #     match `ip daddr|saddr <public IPv4>` (default 0 = port-only, as before).
+#   NETRUN_HTTPS_RELOAD_VERIFY (1)  after a reload, wait up to
+#     NETRUN_HTTPS_VERIFY_WAIT_SEC (10) for haproxy to listen on every
+#     frontend's first bind port before the reload counts as applied; 0 = trust
+#     the reload's exit code.
+#   NETRUN_HTTPS_RELOAD_MAX_AGE_H (6)  reload anyway when the last applied
+#     reload is older than this (a safety net; 0 = never).
+#
+# Reload stamp (audit follow-up): the frontend set is validated with
+# `haproxy -c` BEFORE it replaces /etc/haproxy/netrun.d (a set haproxy rejects
+# never becomes the live one), and a reload counts only once haproxy really
+# listens on the frontends; then a hash of haproxy.cfg + the certificate + the
+# frontend files goes to /run/netrun/haproxy-applied.sha. Every sync reloads
+# when the files differ from that stamp, so a failed / killed / unverified
+# reload is retried on the next 5-min tick (it used to be lost for good: the
+# files were in place, the diff said "unchanged"). A missing stamp (first sync
+# after a deploy or a reboot) costs one reload. sync / renew / setup run under
+# one flock (/run/netrun/https-sync.lock): the generator, the timer and
+# /deprovision call it concurrently.
 set -euo pipefail
 
 PROXY_DIR="${NETRUN_PROXY_DIR:-/opt/netrun/proxyserver/3proxy}"
@@ -41,6 +60,8 @@ FRONTEND_DIR=/etc/haproxy/netrun.d
 LEGO_VERSION="${LEGO_VERSION:-v5.5.2}"
 SELF=/usr/local/sbin/netrun-https
 SYSTEMD_DIR="${NETRUN_SYSTEMD_DIR:-/etc/systemd/system}"
+APPLIED_STAMP="${NETRUN_HTTPS_APPLIED_STAMP:-/run/netrun/haproxy-applied.sha}"
+SYNC_LOCK="${NETRUN_HTTPS_SYNC_LOCK:-/run/netrun/https-sync.lock}"
 
 log() { printf '[netrun-https] %s\n' "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
@@ -52,6 +73,14 @@ netrun_setting() {
     v="$(awk -v k="$key" '{ sub(/^[ \t]+/, "") } index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { gsub(/^["\047 \t]+|["\047 \t\r]+$/, "", v); print v }' "$f")"
   fi
   printf '%s' "${v:-$def}"
+}
+
+# 0 (true) when KEY is switched off: 0 / off / false / no, any case.
+setting_off() {
+  case "$(netrun_setting "$1" "${2:-1}" | tr '[:upper:]' '[:lower:]')" in
+    0|off|false|no) return 0 ;;
+  esac
+  return 1
 }
 
 public_ipv4() {
@@ -97,6 +126,10 @@ restart_cfg() {
     sleep 2
     survivors="$(pids_for_cfg "$cfg")"
     [ -z "$survivors" ] || kill -9 $survivors 2>/dev/null || true
+    # Gone before haproxy takes the public ports (a SIGKILLed 3proxy can
+    # linger an instant; its listener would make haproxy's bind fail).
+    local i=0
+    while [ -n "$(pids_for_cfg "$cfg")" ] && [ "$i" -lt 10 ]; do sleep 0.5; i=$((i + 1)); done
   fi
   # Audit RES-11 — the respawn goes through the spawn helper: its own systemd
   # scope, so this oneshot (the 5-min sync timer) can never take the batch down
@@ -205,6 +238,13 @@ EOF
     return 0
   fi
   FRONTENDS_CHANGED=1
+  # Validate the NEW set before it replaces the live one: a set haproxy
+  # rejects never lands in $FRONTEND_DIR (the running haproxy, the next sync
+  # and the next boot keep the last good set; this run fails loudly).
+  if ! haproxy_check "$tmpdir"; then
+    rm -rf "$tmpdir"
+    die "haproxy rejects the new frontend set — $FRONTEND_DIR left as it was"
+  fi
   # Replace the set atomically enough: new/changed files in, stale ones out.
   rm -f "$FRONTEND_DIR"/*.cfg
   cp "$tmpdir"/*.cfg "$FRONTEND_DIR"/ 2>/dev/null || true
@@ -222,13 +262,105 @@ frontend_sets_equal() {
   return 0
 }
 
+# `haproxy -c` of the base config + a frontend directory.
+haproxy_check() {
+  haproxy -c -q -f "$HAPROXY_CFG" -f "$1"
+}
+
 reload_haproxy() {
-  haproxy -c -q -f "$HAPROXY_CFG" -f "$FRONTEND_DIR" || die "haproxy config check failed"
+  haproxy_check "$FRONTEND_DIR" || die "haproxy config check failed"
   if systemctl is-active --quiet haproxy; then
     systemctl reload haproxy
   else
     systemctl enable --now haproxy >/dev/null
   fi
+}
+
+# ── reload stamp: what haproxy really loaded ──────────────────────
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
+}
+
+# sha256 over haproxy.cfg, the certificate and the sorted frontend files
+# (names + contents): the files a reload makes haproxy load.
+haproxy_config_hash() {
+  local f
+  {
+    for f in "$HAPROXY_CFG" "$PEM"; do
+      printf '== %s\n' "$f"
+      cat "$f" 2>/dev/null || true
+    done
+    for f in $( (cd "$FRONTEND_DIR" 2>/dev/null && ls -1 -- *.cfg 2>/dev/null) | sort); do
+      printf '== %s\n' "$f"
+      cat "$FRONTEND_DIR/$f"
+    done
+  } | sha256_stream
+}
+
+stamp_read() { cat "$APPLIED_STAMP" 2>/dev/null || true; }
+
+stamp_write() {
+  mkdir -p "$(dirname "$APPLIED_STAMP")" 2>/dev/null || true
+  printf '%s\n' "$1" > "$APPLIED_STAMP.tmp" && mv -f "$APPLIED_STAMP.tmp" "$APPLIED_STAMP"
+}
+
+# 0 when the stamp exists and is older than NETRUN_HTTPS_RELOAD_MAX_AGE_H.
+stamp_expired() {
+  local h
+  h="$(netrun_setting NETRUN_HTTPS_RELOAD_MAX_AGE_H 6)"
+  case "$h" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$h" -gt 0 ] && [ -f "$APPLIED_STAMP" ] || return 1
+  [ -n "$(find "$APPLIED_STAMP" -mmin +$((h * 60)) 2>/dev/null)" ]
+}
+
+# The first port of each frontend file's first bind line, one per line.
+frontend_first_ports() {
+  local f
+  for f in "$FRONTEND_DIR"/*.cfg; do
+    [ -e "$f" ] || continue
+    awk '$1 == "bind" { n = split($2, a, ":"); split(a[n], r, "-"); print r[1]; exit }' "$f"
+  done
+}
+
+# Of the ports given, those with no listener on IP:port — ONE `ss -Hltn`
+# (no -p: that would walk every 3proxy's fds). Exit 2 when ss fails.
+frontend_ports_missing() {
+  local ip="$1" filter="" p have
+  shift
+  [ "$#" -gt 0 ] || return 0
+  for p in "$@"; do filter="${filter:+$filter or }sport = :$p"; done
+  have="$(ss -Hltn "$filter" 2>/dev/null)" || return 2
+  have="$(printf '%s\n' "$have" | awk '{ print $4 }')"
+  for p in "$@"; do
+    printf '%s\n' "$have" | grep -qxF "$ip:$p" || echo "$p"
+  done
+}
+
+# After a reload: haproxy listens on every frontend's first bind port (it
+# gets NETRUN_HTTPS_VERIFY_WAIT_SEC to bind them). `systemctl reload` only
+# signals the master, and a new worker that cannot bind leaves the old one
+# serving the old set — this is what says the new set is live.
+verify_frontends_listening() {
+  local ip="$1" ports missing="" waited=0 limit
+  setting_off NETRUN_HTTPS_RELOAD_VERIFY 1 && return 0
+  ports="$(frontend_first_ports)"
+  [ -n "$ports" ] || return 0
+  limit="$(netrun_setting NETRUN_HTTPS_VERIFY_WAIT_SEC 10)"
+  case "$limit" in ''|*[!0-9]*) limit=10 ;; esac
+  while :; do
+    # shellcheck disable=SC2086
+    if missing="$(frontend_ports_missing "$ip" $ports)"; then
+      [ -n "$missing" ] || return 0
+    else
+      missing="(ss failed)"
+    fi
+    [ "$waited" -lt "$limit" ] || break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  log "WARNING: after the reload haproxy does not listen on $ip port(s) $(printf '%s' "$missing" | tr '\n' ' ')— not marked applied; the next sync retries"
+  return 1
 }
 
 # ── traffic accounting ────────────────────────────────────────────
@@ -318,16 +450,29 @@ cmd_sync() {
   done
   FRONTENDS_CHANGED=1
   write_frontends "$ip"
-  # Audit RES-11 — reload ONLY on a change (it used to reload every 5 min:
+  # Audit RES-11 — reload ONLY when needed (it used to reload every 5 min:
   # each reload re-binds every frontend on a 2-vCPU box and leaves the old
-  # worker draining for up to the 1 h tunnel timeout). A stopped haproxy is
-  # started whatever the diff says.
-  if [ "$FRONTENDS_CHANGED" = 1 ] || [ "$base_changed" = 1 ] || [ "$changed" = 1 ]; then
-    reload_haproxy
-    log "synced: haproxy reloaded (frontends_changed=$FRONTENDS_CHANGED base_changed=$base_changed moved=${#moved[@]})"
-  elif ! systemctl is-active --quiet haproxy; then
-    reload_haproxy
-    log "synced: haproxy was not running — started"
+  # worker draining for up to the 1 h tunnel timeout): a change, a stopped
+  # haproxy, or files haproxy has not (verifiably) loaded yet — the stamp.
+  local want stamp reason=""
+  want="$(haproxy_config_hash)"
+  stamp="$(stamp_read)"
+  if [ "$FRONTENDS_CHANGED" = 1 ]; then reason="frontends changed"
+  elif [ "$base_changed" = 1 ]; then reason="base config written"
+  elif [ "$changed" = 1 ]; then reason="listeners moved"
+  elif ! systemctl is-active --quiet haproxy; then reason="haproxy was not running"
+  elif [ -z "$stamp" ]; then reason="no reload stamp yet"
+  elif [ "$stamp" != "$want" ]; then reason="files not applied by the last reload"
+  elif stamp_expired; then reason="last applied reload older than $(netrun_setting NETRUN_HTTPS_RELOAD_MAX_AGE_H 6) h"
+  fi
+  [ -n "$reason" ] || return 0
+  reload_haproxy
+  if verify_frontends_listening "$ip"; then
+    stamp_write "$want"
+    log "synced: haproxy reloaded ($reason; moved=${#moved[@]})"
+  else
+    log "synced: haproxy reloaded ($reason) but NOT verified"
+    return 1
   fi
 }
 
@@ -338,8 +483,21 @@ cmd_renew() {
   after="$(sha256sum "$PEM" | cut -d' ' -f1)"
   if [ "$before" != "$after" ] && systemctl is-active --quiet haproxy; then
     systemctl reload haproxy
+    # The stamp covers the certificate: an unverified reload here is retried
+    # by the next sync.
+    if verify_frontends_listening "$(public_ipv4)"; then stamp_write "$(haproxy_config_hash)"; fi
     log "certificate renewed, haproxy reloaded"
   fi
+}
+
+# sync / renew / setup one at a time (generator, timer, /deprovision).
+with_sync_lock() {
+  if command -v flock >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$SYNC_LOCK")" 2>/dev/null || true
+    exec 9>"$SYNC_LOCK"
+    flock -w "${NETRUN_HTTPS_LOCK_WAIT_SEC:-300}" 9 || die "another netrun-https run still holds $SYNC_LOCK"
+  fi
+  "$@"
 }
 
 install_lego() {
@@ -439,7 +597,8 @@ cmd_setup() {
   write_base_config
   # Certificate first: the sync timer fires as soon as it is enabled.
   issue_or_renew
-  cmd_sync
+  # An unverified first reload must not keep the timers (the retry) away.
+  cmd_sync || log "WARNING: first sync not verified — the sync timer retries"
   install_units
   log "HTTPS ready on $(public_ipv4): same ports as HTTP"
 }
@@ -456,9 +615,9 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  setup) cmd_setup ;;
-  sync) cmd_sync ;;
-  renew) cmd_renew ;;
+  setup) with_sync_lock cmd_setup ;;
+  sync) with_sync_lock cmd_sync ;;
+  renew) with_sync_lock cmd_renew ;;
   status) cmd_status ;;
   accounting) fix_accounting ;;
   units) cmd_units ;;

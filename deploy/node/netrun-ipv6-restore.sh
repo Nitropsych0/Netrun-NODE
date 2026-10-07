@@ -40,7 +40,7 @@ if [ -z "$DEPRECATE" ] && [ -r "$ENV_FILE" ]; then
   DEPRECATE="$(awk -F= '{ sub(/^[ \t]+/, "", $1) } $1 == "NETRUN_ANCHOR_DEPRECATE" { v = $2 } END { gsub(/["\047 \t\r]/, "", v); print v }' "$ENV_FILE")"
 fi
 LFT=""
-case "${DEPRECATE:-1}" in 0|off|false|no) ;; *) LFT=" preferred_lft 0" ;; esac
+case "$(printf '%s' "${DEPRECATE:-1}" | tr '[:upper:]' '[:lower:]')" in 0|off|false|no) ;; *) LFT=" preferred_lft 0" ;; esac
 
 batch="$(mktemp 2>/dev/null)" || exit 1
 trap 'rm -f "$batch"' EXIT

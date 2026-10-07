@@ -2,8 +2,9 @@
 # Audit CLN-03 / CLN-04 / speed — generator tests (no root, no network): the
 # real code is pulled out of node_runtime/soft/generator/proxyyy_automated.sh
 # and run with controlled globals and stubbed commands.
-#   1. legacy flags (--dns-country, --network-profile, --tcp-timestamps-mode,
-#      --self-check-samples, --skip-self-check) are accepted and IGNORED;
+#   1. legacy flags (--dns-country, --dns-servers, --network-profile,
+#      --tcp-timestamps-mode, --self-check-samples, --skip-self-check) are
+#      accepted and IGNORED (DNS stays the local unbound);
 #   2. maxconn: 512 by default (listen backlog 33), NETRUN_3PROXY_MAXCONN
 #      (env, else /etc/netrun/netrun.env) and --maxconn override it;
 #   3. the generator never writes sysctl, never builds 3proxy, never touches
@@ -12,7 +13,8 @@
 #      same address layout for /64, /56 and /48, existing addresses skipped,
 #      and ONE `ip -6 addr` snapshot per batch (was one per address);
 #   5. the start-up script spawns through the spawn helper, refuses a missing
-#      address list, and NETRUN_ANCHOR_DEPRECATE=0 drops preferred_lft 0.
+#      address list, and NETRUN_ANCHOR_DEPRECATE=0 / off / OFF (env or
+#      netrun.env) drops preferred_lft 0.
 #   bash scripts/test_generator_flags.sh
 set -uo pipefail
 
@@ -65,7 +67,7 @@ parse() { # args... -> prints "var=value" lines of interest
     ip() { :; }
     set -- "$@"
     . "$TMP/parse.sh"
-    for v in start_port proxy_count proxies_type ipv6_policy use_random_auth proxy_maxconn dns_servers_override \
+    for v in start_port proxy_count proxies_type ipv6_policy use_random_auth proxy_maxconn \
              network_profile tcp_timestamps_mode dns_country run_self_check self_check_samples; do
       printf '%s=%s\n' "$v" "${!v-<unset>}"
     done
@@ -75,7 +77,7 @@ parse() { # args... -> prints "var=value" lines of interest
 # ── 1. legacy flags accepted and ignored ──────────────────────────
 out="$(NETRUN_ENV_FILE="$TMP/none.env" parse --start-port 18100 --proxy-count 5 --proxies-type dual --random \
   --ipv6-policy ipv6_only --network-profile high_compatibility --dns-country US --tcp-timestamps-mode off \
-  --self-check-samples 3 --skip-self-check true --port-ipv6-map-file /tmp/m.csv)"
+  --dns-servers 9.9.9.9,149.112.112.112 --self-check-samples 3 --skip-self-check true --port-ipv6-map-file /tmp/m.csv)"
 echo "$out" | grep -qx 'start_port=18100' || fail "start_port not parsed: $out"
 echo "$out" | grep -qx 'proxy_count=5' || fail "proxy_count after legacy flags: $out"
 echo "$out" | grep -qx 'proxies_type=dual' || fail "proxies_type: $out"
@@ -97,9 +99,26 @@ echo "$out" | grep -qx 'start_port=18100' || fail "bogus legacy value rejected: 
   network_profile=bogus; tcp_timestamps_mode=nope; dns_country=XYZ1; self_check_samples=abc
   check_startup_parameters >/dev/null 2>&1 && echo ACCEPT
 ) | grep -qx ACCEPT || fail "check_startup_parameters still validates legacy labels"
+# --dns-servers: the cfg's resolvers stay the local unbound (the spawn helper
+# would rewrite anything else at the first start anyway).
+eval "$(extract configure_dns_servers)"
+out="$(
+  usage() { echo "USAGE"; exit 4; }
+  ip() { :; }
+  set -- --start-port 18100 --dns-servers 9.9.9.9,149.112.112.112 --proxy-count 2
+  NETRUN_ENV_FILE="$TMP/none.env"
+  . "$TMP/parse.sh"
+  configure_dns_servers >/dev/null
+  printf 'proxy_count=%s\nstrategy=%s\nservers=%s\nlines=%s\n' "$proxy_count" "$dns_selection_strategy" "$dns_selected_servers_csv" "$(printf '%s' "$dns_nserver_lines" | tr '\n' '|')"
+)"
+echo "$out" | grep -qx 'proxy_count=2' || fail "--dns-servers swallowed the next flag: $out"
+echo "$out" | grep -qx 'strategy=local_unbound' || fail "--dns-servers still overrides: $out"
+echo "$out" | grep -qx 'servers=127.0.0.1,::1' || fail "dns servers: $out"
+echo "$out" | grep -qx 'lines=  nserver 127.0.0.1|  nserver ::1' || fail "nserver lines: $out"
+! grep -q 'manual_override' "$GEN" || fail "the --dns-servers manual_override branch is still there"
 grep -q -- '--skip-self-check' "$GEN" || fail "the agent's scriptSupportsFlag probe needs the --skip-self-check text"
 grep -q -- '--runtime-only' "$GEN" || fail "--runtime-only text gone"
-ok "legacy --dns-country/--network-profile/--tcp-timestamps-mode/--self-check-samples/--skip-self-check accepted and ignored"
+ok "legacy --dns-country/--dns-servers/--network-profile/--tcp-timestamps-mode/--self-check-samples/--skip-self-check accepted and ignored"
 
 # ── 2. maxconn default 512, setting + flag override ───────────────
 out="$(NETRUN_ENV_FILE="$TMP/none.env" parse --start-port 18100)"
@@ -168,7 +187,7 @@ ok "IPv6 generation: one od + one awk per batch, unique, /64 /56 /48 layout, NIC
 
 # ── 5. start-up script: spawn helper, missing list, deprecate switch ──
 for f in netrun_setting http_listen_ip_for_node create_startup_script; do eval "$(extract "$f")"; done
-mk_script() { # deprecate(1|0)
+mk_script() { # label deprecate-env-value [netrun.env file]
   (
     set +u
     H="$TMP/h$1"; mkdir -p "$H/proxyserver/3proxy/bin"
@@ -185,10 +204,10 @@ mk_script() { # deprecate(1|0)
     random_users_list_file="$H/proxyserver/random_users_18100.list"
     startup_script_path="$H/proxyserver/proxy-startup_18100.sh"
     printf '2001:db8:0:1::a\n' > "$random_ipv6_list_file"; printf 'u1:p1\n' > "$random_users_list_file"
-    NETRUN_ENV_FILE="$TMP/none.env" NETRUN_ANCHOR_DEPRECATE="$1" create_startup_script
+    NETRUN_ENV_FILE="${3:-$TMP/none.env}" NETRUN_ANCHOR_DEPRECATE="$2" create_startup_script
   )
 }
-mk_script 1 || fail "create_startup_script"
+mk_script 1 1 || fail "create_startup_script"
 S="$TMP/h1/proxyserver/proxy-startup_18100.sh"
 mkdir -p "$TMP/stub"
 printf '#!/bin/sh\nfor a; do [ -f "$a" ] && cp "$a" "%s/batch"; done\nexit 0\n' "$TMP" > "$TMP/stub/ip"
@@ -204,9 +223,21 @@ rm -f "$TMP/h1/proxyserver/ipv6_18100.list" "$TMP/helper_calls"
 PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$S" >/dev/null 2>&1 && fail "start-up script ran without its address list"
 [ ! -f "$TMP/helper_calls" ] || fail "spawned a batch with no address list"
 ! grep -q 'rnd_subnet_ip' "$S" || fail "start-up script still mints random addresses"
-mk_script 0 || fail "create_startup_script (deprecate off)"
+mk_script 0 0 || fail "create_startup_script (deprecate off)"
 PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$TMP/h0/proxyserver/proxy-startup_18100.sh" >/dev/null 2>&1
 grep -qx 'address add 2001:db8:0:1::a/128 dev eth9 nodad' "$TMP/batch" || fail "NETRUN_ANCHOR_DEPRECATE=0: $(cat "$TMP/batch")"
-ok "start-up script: spawn helper with the cfg, refuses a missing address list, NETRUN_ANCHOR_DEPRECATE=0 adds preferred anchors"
+# The same switch values the agent and the boot restore accept: off / OFF in netrun.env, False in the env.
+for v in off OFF; do
+  printf 'NETRUN_ANCHOR_DEPRECATE=%s\n' "$v" > "$TMP/dep-$v.env"
+  mk_script "env$v" "" "$TMP/dep-$v.env" || fail "create_startup_script (netrun.env $v)"
+  rm -f "$TMP/batch"
+  PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$TMP/henv$v/proxyserver/proxy-startup_18100.sh" >/dev/null 2>&1
+  grep -qx 'address add 2001:db8:0:1::a/128 dev eth9 nodad' "$TMP/batch" || fail "NETRUN_ANCHOR_DEPRECATE=$v in netrun.env: $(cat "$TMP/batch" 2>/dev/null)"
+done
+mk_script false False || fail "create_startup_script (False)"
+rm -f "$TMP/batch"
+PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$TMP/hfalse/proxyserver/proxy-startup_18100.sh" >/dev/null 2>&1
+grep -qx 'address add 2001:db8:0:1::a/128 dev eth9 nodad' "$TMP/batch" || fail "NETRUN_ANCHOR_DEPRECATE=False: $(cat "$TMP/batch" 2>/dev/null)"
+ok "start-up script: spawn helper with the cfg, refuses a missing address list, NETRUN_ANCHOR_DEPRECATE=0/off/OFF/False adds preferred anchors"
 
 echo "test_generator_flags.sh — all $PASS checks passed"

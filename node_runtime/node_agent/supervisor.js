@@ -28,6 +28,16 @@
 //   It never fights the duplicate reaper (hygiene.js): it starts a cfg only
 //   when it runs ZERO times, the reaper acts only on cfgs that run twice and
 //   never kills the last copy; both take the same process lock.
+//   "Seen serving" belongs to the batch, not to the start port: /generate
+//   (under its lock, right after kill-on-rebind) and a whole-batch
+//   /deprovision call forget(startPorts), so a regeneration at a port that
+//   served before which then fails leaves an `unsupervised` leftover, never a
+//   respawned batch whose credentials the orchestrator never recorded. Rewrites
+//   that keep the batch (/deprovision rewrite, /egress_mode, the spawn helper's
+//   DNS fix) keep its supervision. The respawn history (the hourly cap) and the
+//   failed marks survive an agent restart in the status file too.
+//   An http-only cfg is probed on its own listen address: on a node with the
+//   HTTPS front haproxy holds <public-ip>:<port> of the same port number.
 //
 //   re-adds missing anchors — the cfgs' -e addresses absent from
 //   /proc/net/if_inet6 whose /64 the node still has — in ONE
@@ -43,6 +53,15 @@
 //   the agent's egress / DNS checks — leaves from the node's primary IPv6, not
 //   from a customer's exit address; 3proxy binds -e<anchor> explicitly and is
 //   unaffected. NETRUN_ANCHOR_DEPRECATE=0: off (new anchors preferred again).
+//   Not only the active cfgs' anchors: EVERY global nodad address on the
+//   egress interface that is still preferred (a deprovisioned / regenerated
+//   batch's anchors stay on the NIC until a reboot, a *.cfg.disabled's, an old
+//   boot restore's /64s) — one such address added after the primary wins the
+//   kernel's source tie-break. nodad marks anchors: the SLAAC / netplan
+//   primary never carries it. /health supervisor.preferredNodad (should reach
+//   0) and preferredNonNodad (the primary: normally 1) show the result.
+//   IPv6 only: in dualstack egress (-64) IPv4 destinations leave from the
+//   node's single IPv4, which unbound and the agent share (audit FP-02).
 //
 // Status: GET /health `supervisor`, and NODE_AGENT_SUPERVISOR_STATUS_FILE
 // (/run/netrun/supervisor.json). NODE_AGENT_SUPERVISOR=0 turns it all off.
@@ -166,6 +185,12 @@ function presentPrefixes(rows, iface) {
 // yet deprecated, and flagged nodad — every anchor is added nodad (generator,
 // boot restore, this module), the host's own SLAAC / netplan address never
 // is: even a cfg that named the primary address could not deprecate it.
+//
+// With the egress interface known, every other global nodad address on it
+// that is preferred (not deprecated, not tentative) is deprecated too
+// (orphans: anchors no active cfg lists any more). preferredNodad /
+// preferredNonNodad count the interface's preferred global addresses with /
+// without nodad (null without an interface).
 function planAnchors(cfgs, rows, { iface = null } = {}) {
   const expected = new Map(); // hex -> text
   for (const c of Array.isArray(cfgs) ? cfgs : []) {
@@ -187,7 +212,25 @@ function planAnchors(cfgs, rows, { iface = null } = {}) {
       pendingDeprecate.push({ addr: hexToIpv6(hex), plen: r.plen, ifname: r.ifname });
     }
   }
-  return { expected: expected.size, missing, pendingDeprecate };
+  let orphans = 0;
+  let preferredNodad = null;
+  let preferredNonNodad = null;
+  if (iface) {
+    preferredNodad = 0;
+    preferredNonNodad = 0;
+    for (const [hex, r] of rows) {
+      if (r.ifname !== iface || r.scope !== 0 || (r.flags & (IFA_F_DEPRECATED | IFA_F_TENTATIVE))) continue;
+      if (!(r.flags & IFA_F_NODAD)) {
+        preferredNonNodad += 1;
+        continue;
+      }
+      preferredNodad += 1;
+      if (expected.has(hex)) continue; // in the list above already
+      pendingDeprecate.push({ addr: hexToIpv6(hex), plen: r.plen, ifname: r.ifname, orphan: true });
+      orphans += 1;
+    }
+  }
+  return { expected: expected.size, missing, pendingDeprecate, orphans, preferredNodad, preferredNonNodad };
 }
 
 function readdBatchText(addrs, iface, { deprecate = true } = {}) {
@@ -203,7 +246,7 @@ function deprecateBatchText(items) {
 // failed: Map, seen: Set }. Returns { respawn: [cfg], pending: [sp],
 // settling: [sp], unsupervised: [sp], failedNew: [{startPort, respawns}],
 // recovered: [sp] } and updates state. bootMs: when the host booted.
-function planRespawns(cfgs, { runningKeys, listening, keyOf, nowMs, settleMs, maxPerHour, state, bootMs = 0 }) {
+function planRespawns(cfgs, { runningKeys, listening, listeningKeys = null, keyOf, nowMs, settleMs, maxPerHour, state, bootMs = 0 }) {
   const respawn = [];
   const pending = [];
   const settling = [];
@@ -215,9 +258,8 @@ function planRespawns(cfgs, { runningKeys, listening, keyOf, nowMs, settleMs, ma
   for (const c of Array.isArray(cfgs) ? cfgs : []) {
     const sp = c.startPort;
     live.add(sp);
-    const probe = Number.isInteger(c.probePort) && c.probePort > 0 ? c.probePort : sp;
     const running = runningKeys.has(keyOf(c));
-    const up = listening.has(probe);
+    const up = cfgStatus.cfgListening(c, listening, listeningKeys);
     if (up) state.seen.add(sp);
     if (running || up) {
       state.downSince.delete(sp);
@@ -298,11 +340,37 @@ function createSupervisor({
   const state = { downSince: new Map(), history: new Map(), failed: new Map(), seen: new Set() };
   let unsupervised = [];
   let bootMs = null;
-  // The batches seen serving since boot survive an agent restart: the status
-  // file lives on /run (tmpfs), so a reboot starts from an empty set.
+  // forget(): start port -> the forget epoch; a tick whose snapshot predates
+  // the forget must not mark the port seen again from it.
+  const forgotten = new Map();
+  let forgetEpoch = 0;
+  // The batches seen serving since boot, the respawn history of the last hour
+  // and the failed marks survive an agent restart (a watchdog restart, an OOM
+  // kill, a deploy): the status file lives on /run (tmpfs), so a reboot starts
+  // from nothing. Missing fields (an older agent's file) restore nothing.
   try {
     const prev = JSON.parse(fs.readFileSync(statusFile, "utf-8"));
+    const nowMs = now();
     for (const sp of (prev && prev.seenServing) || []) if (Number.isInteger(sp)) state.seen.add(sp);
+    const hist = prev && prev.respawnHistory && typeof prev.respawnHistory === "object" ? prev.respawnHistory : {};
+    for (const [k, arr] of Object.entries(hist)) {
+      const sp = Number(k);
+      if (!Number.isInteger(sp) || sp <= 0 || !Array.isArray(arr)) continue;
+      const recent = arr.map(Number).filter((t) => Number.isFinite(t) && nowMs - t >= 0 && nowMs - t < HOUR_MS);
+      if (recent.length) state.history.set(sp, recent);
+    }
+    for (const f of (prev && Array.isArray(prev.failedCfgs) && prev.failedCfgs) || []) {
+      const sp = Number(f && f.startPort);
+      const mtimeMs = Number(f && f.mtimeMs);
+      if (!Number.isInteger(sp) || sp <= 0 || f.mtimeMs === undefined || f.mtimeMs === null || !Number.isFinite(mtimeMs)) continue;
+      const atMs = Number(f.atMs);
+      state.failed.set(sp, {
+        at: Number.isFinite(atMs) ? atMs : nowMs,
+        reason: String(f.reason || "rate_limited"),
+        respawns: Number.isInteger(f.respawns) ? f.respawns : 0,
+        mtimeMs,
+      });
+    }
   } catch {
     // first start since boot
   }
@@ -319,6 +387,9 @@ function createSupervisor({
     anchorsDeprecated: 0,
     anchorsPendingDeprecate: null,
     anchorsExpected: null,
+    orphanAnchorsDeprecated: 0,
+    preferredNodad: null,
+    preferredNonNodad: null,
     iface: null,
   };
   let inFlight = null;
@@ -372,13 +443,15 @@ function createSupervisor({
   async function listListening(ports) {
     const list = [...new Set(ports)].filter((p) => Number.isInteger(p) && p > 0);
     const out = new Set();
+    const keys = new Set();
     for (let i = 0; i < list.length; i += LISTEN_PROBE_CHUNK) {
       const filter = list.slice(i, i + LISTEN_PROBE_CHUNK).map((p) => `sport = :${p}`).join(" or ");
       const res = await run("ss", ["-ltnH", filter], { timeoutMs: 8000 });
       if (res.code !== 0) return { ok: false, error: String(res.stderr || "").trim().slice(0, 200) || `exit ${res.code}` };
       for (const p of hygieneLib.parseListeningPorts(res.stdout)) out.add(p);
+      for (const k of cfgStatus.parseListenKeys(res.stdout)) keys.add(k);
     }
-    return { ok: true, ports: out };
+    return { ok: true, ports: out, keys };
   }
 
   async function egressIface() {
@@ -411,6 +484,7 @@ function createSupervisor({
   }
 
   async function respawnPhase(cfgs) {
+    const epoch = forgetEpoch;
     const procs = await listProcesses();
     if (!procs.ok) {
       log.error(`[supervisor] ps failed (${procs.error}); no respawn this tick`);
@@ -428,6 +502,7 @@ function createSupervisor({
     const plan = planRespawns(cfgs, {
       runningKeys: procs.keys,
       listening: listening.ports,
+      listeningKeys: listening.keys,
       keyOf: (c) => keys.get(c.startPort),
       nowMs: now(),
       settleMs: settings.settleSec * 1000,
@@ -435,6 +510,17 @@ function createSupervisor({
       state,
       bootMs,
     });
+    // A start port forgotten while this tick read ps / ss: its snapshot may
+    // still show the old batch serving — that must not count for the new one.
+    for (const [sp, e] of [...forgotten]) {
+      if (e > epoch) {
+        state.seen.delete(sp);
+        state.downSince.delete(sp);
+        plan.respawn = plan.respawn.filter((c) => c.startPort !== sp);
+      } else {
+        forgotten.delete(sp);
+      }
+    }
     if (plan.unsupervised.join(",") !== unsupervised.join(",") && plan.unsupervised.length) {
       log.warn(
         `[supervisor] batch(es) ${plan.unsupervised.join(",")}: not running and never served since boot ` +
@@ -483,6 +569,9 @@ function createSupervisor({
         outcome = "generation_in_progress";
         break;
       }
+      // The respawn counts toward the hourly cap even if the agent dies in the
+      // rest of this tick (the anchor ip -batch can take minutes).
+      if (done === "respawned") await writeStatus();
     }
     return outcome;
   }
@@ -501,6 +590,8 @@ function createSupervisor({
     const plan = planAnchors(cfgs, rows, { iface });
     stats.anchorsExpected = plan.expected;
     stats.addressesMissing = plan.missing.length;
+    stats.preferredNonNodad = plan.preferredNonNodad;
+    stats.preferredNodad = plan.preferredNodad;
     let outcome = "ok";
     if (settings.readdAnchors && plan.missing.length > 0) {
       if (!iface) {
@@ -522,10 +613,15 @@ function createSupervisor({
       stats.anchorsPendingDeprecate = plan.pendingDeprecate.length - take.length;
       if (take.length > 0) {
         const res = await ipBatch(deprecateBatchText(take), "deprecate");
+        const orphans = take.filter((t) => t.orphan).length;
         stats.anchorsDeprecated += take.length;
+        stats.orphanAnchorsDeprecated += orphans;
+        if (res.code === 0 && stats.preferredNodad !== null) {
+          stats.preferredNodad = Math.max(0, stats.preferredNodad - take.filter((t) => t.ifname === iface).length);
+        }
         log.log(
-          `[supervisor] deprecated ${take.length} anchor(s) (preferred_lft 0: never the node's own source address); ` +
-            `${stats.anchorsPendingDeprecate} to go; ip -batch exit ${res.code}`
+          `[supervisor] deprecated ${take.length} anchor(s)${orphans ? ` (${orphans} listed by no active cfg)` : ""} ` +
+            `(preferred_lft 0: never the node's own source address); ${stats.anchorsPendingDeprecate} to go; ip -batch exit ${res.code}`
         );
       }
     } else {
@@ -534,20 +630,48 @@ function createSupervisor({
     return outcome;
   }
 
-  async function writeStatus() {
-    const body = `${JSON.stringify({ ...status(), writtenAt: iso() }, null, 2)}\n`;
-    try {
-      if (writeFile) {
-        await writeFile(statusFile, body);
-        return;
+  // One write at a time (the tick, a respawn and forget() all write it);
+  // each takes its snapshot when it starts.
+  let statusTail = Promise.resolve();
+  function writeStatus() {
+    const run = statusTail.then(async () => {
+      const body = `${JSON.stringify({ ...status(), writtenAt: iso() }, null, 2)}\n`;
+      try {
+        if (writeFile) {
+          await writeFile(statusFile, body);
+          return;
+        }
+        await fsp.mkdir(path.dirname(statusFile), { recursive: true });
+        const tmp = `${statusFile}.tmp`;
+        await fsp.writeFile(tmp, body);
+        await fsp.rename(tmp, statusFile);
+      } catch (err) {
+        log.warn(`[supervisor] cannot write ${statusFile}: ${(err && err.message) || err}`);
       }
-      await fsp.mkdir(path.dirname(statusFile), { recursive: true });
-      const tmp = `${statusFile}.tmp`;
-      await fsp.writeFile(tmp, body);
-      await fsp.rename(tmp, statusFile);
-    } catch (err) {
-      log.warn(`[supervisor] cannot write ${statusFile}: ${(err && err.message) || err}`);
+    });
+    statusTail = run.catch(() => {});
+    return run;
+  }
+
+  // /generate (under the generation lock, after kill-on-rebind) and a
+  // whole-batch /deprovision: these start ports no longer belong to the batch
+  // that served there. Whatever is written at them next is a new batch — seen
+  // once it listens; a failed attempt's leftover stays `unsupervised`.
+  function forget(startPorts) {
+    let n = 0;
+    for (const raw of startPorts || []) {
+      const sp = Number(raw);
+      if (!Number.isInteger(sp) || sp <= 0) continue;
+      forgetEpoch += 1;
+      forgotten.set(sp, forgetEpoch);
+      state.seen.delete(sp);
+      state.downSince.delete(sp);
+      state.history.delete(sp);
+      state.failed.delete(sp);
+      n += 1;
     }
+    if (n > 0) writeStatus();
+    return n;
   }
 
   function tick() {
@@ -626,12 +750,24 @@ function createSupervisor({
       unsupervised: [...unsupervised],
       seenServing: [...state.seen].sort((a, b) => a - b),
       failedCfgs: [...state.failed.entries()]
-        .map(([sp, f]) => ({ startPort: sp, at: iso(f.at), reason: f.reason, respawns: f.respawns }))
+        .map(([sp, f]) => ({ startPort: sp, at: iso(f.at), reason: f.reason, respawns: f.respawns, atMs: f.at, mtimeMs: f.mtimeMs }))
         .sort((a, b) => a.startPort - b.startPort),
+      respawnHistory: respawnHistory(),
     };
   }
 
-  return { start, stop, tick, status, settings: () => ({ ...settings }) };
+  // { "<startPort>": [ms, ...] } of the last hour (the hourly cap's memory).
+  function respawnHistory() {
+    const nowMs = now();
+    const out = {};
+    for (const [sp, arr] of [...state.history.entries()].sort((a, b) => a[0] - b[0])) {
+      const recent = (arr || []).filter((t) => nowMs - t < HOUR_MS);
+      if (recent.length) out[String(sp)] = recent;
+    }
+    return out;
+  }
+
+  return { start, stop, tick, status, forget, settings: () => ({ ...settings }) };
 }
 
 module.exports = {

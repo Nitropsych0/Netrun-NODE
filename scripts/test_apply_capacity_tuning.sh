@@ -468,7 +468,8 @@ before="$(snapshot "$R")"
 rc="$(NORM_DIR="$ND" run_tool "$R" --only fingerprint)"
 [ "$rc" = 0 ] && [ "$before" = "$(snapshot "$R")" ] || { cat "$TMP/out"; fail "fingerprint dry-run changed files"; }
 grep -q '1340 = reads as OpenVPN' "$TMP/out" || { cat "$TMP/out"; fail "audit: 1340 clamp not flagged"; }
-grep -qE 'fingerprint +would-apply .*tcp-signature-file sysctl.conf:net.ipv4.tcp_timestamps net.ipv4.tcp_rmem nft-normalization-rules:3 nft-normalization-table' "$TMP/out" || { cat "$TMP/out"; fail "fingerprint plan"; }
+grep -qE 'fingerprint +would-apply .*tcp-signature-file sysctl.conf:net.ipv4.tcp_timestamps net.ipv4.tcp_rmem nft-normalization-rules:3;' "$TMP/out" || { cat "$TMP/out"; fail "fingerprint plan"; }
+! grep -q 'nft-normalization-table' "$TMP/out" || { cat "$TMP/out"; fail "the plan still drops the normalization table"; }
 : > "$R/opt/netrun/jobs/.generation.lock"
 rc="$(NORM_DIR="$ND" run_tool "$R" --apply --only fingerprint)"
 [ "$rc" = 2 ] && grep -qE 'fingerprint +REFUSED .*generation' "$TMP/out" || { cat "$TMP/out"; fail "fingerprint must refuse under the genlock"; }
@@ -480,10 +481,13 @@ cmp -s "$REPO_ROOT/deploy/node/99-zz-netrun-tcp.conf" "$R/etc/sysctl.d/99-zz-net
 grep -qx 'net.ipv4.icmp_echo_ignore_all = 1' "$R/etc/sysctl.conf" && grep -qx 'vm.swappiness = 10' "$R/etc/sysctl.conf" || fail "unrelated sysctl.conf lines removed"
 ls "$R/etc/" | grep -q '^sysctl.conf.bak-fingerprint-' || fail "no sysctl.conf backup"
 grep -qx "sysctl -p $R/etc/sysctl.d/99-zz-netrun-tcp.conf" "$CALLS" || fail "pins not applied at runtime"
-printf 'delete rule inet proxy_normalization output handle 4\ndelete rule inet proxy_normalization output handle 5\ndelete rule inet proxy_normalization postrouting handle 7\ndelete table inet proxy_normalization\n' > "$TMP/want_norm"
+# The empty table (and its chains) stays even though the deployed generator
+# no longer mentions it: a rollback to a pre-N2 generator needs it.
+printf 'delete rule inet proxy_normalization output handle 4\ndelete rule inet proxy_normalization output handle 5\ndelete rule inet proxy_normalization postrouting handle 7\n' > "$TMP/want_norm"
 cmp -s "$TMP/want_norm" "$TMP/nft_batch.applied" || { cat "$TMP/nft_batch.applied"; fail "normalization batch"; }
 grep -q 'ruleset after cleanup' "$R/etc/nftables.conf" || fail "ruleset not persisted"
 ! grep -qi '3proxy' "$CALLS" || fail "fingerprint touched 3proxy"
+! grep -qE 'delete (table|chain)' "$TMP/nft_batch.applied" || fail "table/chain deleted (rollback to a pre-N2 generator would refuse every generation)"
 # An OLD generator (still checks for the table): rules go, the table stays.
 echo 'nft list table inet proxy_normalization' > "$R/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh"
 rm -f "$TMP/nft_batch.applied"
@@ -491,7 +495,7 @@ rc="$(NORM_DIR="$ND" run_tool "$R" --apply --only fingerprint)"
 [ "$rc" = 0 ] && ! grep -q 'delete table' "$TMP/nft_batch.applied" || { cat "$TMP/out"; fail "table deleted although the generator still needs it"; }
 rc="$(run_tool "$R" --apply --only fingerprint)"
 [ "$rc" = 0 ] && grep -qE '\] fingerprint +ok ' "$TMP/out" || { cat "$TMP/out"; fail "fingerprint rerun not ok"; }
-ok "fingerprint: 99-zz TCP pins + runtime, pinned keys out of /etc/sysctl.conf (backup; others kept), MSS 1340/ct/hoplimit rules + table removed in one nft -f; genlock refuses"
+ok "fingerprint: 99-zz TCP pins + runtime, pinned keys out of /etc/sysctl.conf (backup; others kept), MSS 1340/ct/hoplimit rules removed in one nft -f, the empty table kept (rollback); genlock refuses"
 
 # ── 18. pipes (opt-in): RAM-sized fs.pipe-user-pages-soft, only raised ─
 R="$(new_root pipes)"

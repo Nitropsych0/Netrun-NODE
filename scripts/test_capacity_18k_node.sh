@@ -81,6 +81,7 @@ for f in http_port_ranges localize_http_listeners write_frontends frontend_sets_
   [ -n "$body" ] || fail "netrun-https: $f not found"
   eval "$body"
 done
+haproxy_check() { return 0; }   # no haproxy here (section 5 tests the check itself)
 PROXY_DIR="$TMP/3proxy"; FRONTEND_DIR="$TMP/netrun.d"; mkdir -p "$PROXY_DIR"
 {
   echo "daemon"
@@ -134,41 +135,95 @@ grep -qx 'address add 2001:db8::1/128 dev enp1s0 nodad' "$TMP/ip_batch" || { cat
 printf 'NETRUN_ANCHOR_DEPRECATE=off\n' > "$TMP/netrun.env"
 PATH="$TMP/stub:$PATH" NETRUN_PROXY_ROOT="$PR" NETRUN_IPV6_IFACE=enp1s0 NETRUN_ENV_FILE="$TMP/netrun.env" bash "$RESTORE" || fail "restore: netrun.env"
 grep -qx 'address add 2001:db8::1/128 dev enp1s0 nodad' "$TMP/ip_batch" || { cat "$TMP/ip_batch"; fail "restore: NETRUN_ANCHOR_DEPRECATE=off from netrun.env"; }
+PATH="$TMP/stub:$PATH" NETRUN_PROXY_ROOT="$PR" NETRUN_IPV6_IFACE=enp1s0 NETRUN_ANCHOR_DEPRECATE=OFF bash "$RESTORE" || fail "restore: OFF"
+grep -qx 'address add 2001:db8::1/128 dev enp1s0 nodad' "$TMP/ip_batch" || { cat "$TMP/ip_batch"; fail "restore: NETRUN_ANCHOR_DEPRECATE=OFF (any case, as the agent)"; }
 # No interface: a loud failure (exit 1), not a silent exit 0.
 printf '#!/bin/sh\nexit 0\n' > "$TMP/stub/ip"
 if PATH="$TMP/stub:$PATH" NETRUN_PROXY_ROOT="$PR" NETRUN_IPV6_IFACE="" bash "$RESTORE" 2>"$TMP/restore_err"; then fail "restore: no interface must exit non-zero"; fi
 grep -q 'ERROR: no IPv6 default route' "$TMP/restore_err" || fail "restore: no-interface message"
 ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -force -batch with nodad, loud failure without an interface"
 
-# ── 5. netrun-https sync: haproxy reloaded ONLY when its config changed ──
+# ── 5. netrun-https sync: reload only when haproxy has not loaded the files ──
+# (a change, a stopped haproxy, or no verified reload of exactly these files:
+# the stamp), the new frontend set validated BEFORE it goes live, a failed /
+# unverified reload retried on the next sync, and never otherwise.
 (
-  for f in http_port_ranges localize_http_listeners write_frontends frontend_sets_equal cmd_sync; do
+  for f in netrun_setting setting_off http_port_ranges localize_http_listeners write_frontends frontend_sets_equal \
+           sha256_stream haproxy_config_hash stamp_read stamp_write stamp_expired frontend_first_ports \
+           frontend_ports_missing verify_frontends_listening cmd_sync; do
     pat="/^$f() {/,/^}/p"   # (bash 3.2 brace-expands the pattern inline)
     eval "$(sed -n "$pat" "$HTTPS")"
+    type "$f" >/dev/null 2>&1 || { echo "netrun-https: $f not found"; exit 1; }
   done
   RELOADS="$TMP/reloads"; : > "$RELOADS"
-  log() { :; }; die() { echo "DIE $*"; exit 3; }
+  export NETRUN_ENV_FILE="$TMP/no-netrun.env"
+  log() { :; }; die() { echo "DIE $*" >> "$RELOADS"; exit 3; }
   public_ipv4() { echo 45.32.10.20; }
   fix_accounting() { :; }
+  sleep() { :; }
   restart_cfg() { echo "restart $1" >> "$RELOADS"; }
-  reload_haproxy() { echo reload >> "$RELOADS"; }
+  # reload: logged; RELOAD_FAIL=1 -> the script dies there (set -e in the real run).
+  reload_haproxy() { echo reload >> "$RELOADS"; [ "${RELOAD_FAIL:-0}" = 0 ] || exit 5; }
+  # haproxy -c of a candidate set: CHECK_FAIL=1 rejects it.
+  haproxy_check() { [ "${CHECK_FAIL:-0}" = 0 ]; }
   systemctl() { [ "$1 $2" = "is-active --quiet" ] && [ "${HAPROXY_UP:-1}" = 1 ]; }
+  # ss -Hltn '<filter>': haproxy listens on every asked port unless HAPROXY_LISTENS=0.
+  ss() { [ "${HAPROXY_LISTENS:-1}" = 1 ] || return 0; for p in $(printf '%s\n' "$2" | grep -oE ':[0-9]+' | tr -d :); do echo "LISTEN 0 4096 45.32.10.20:$p 0.0.0.0:*"; done; }
   PROXY_DIR="$TMP/sync/3proxy"; FRONTEND_DIR="$TMP/sync/netrun.d"; mkdir -p "$PROXY_DIR"
   PEM="$TMP/sync/node.pem"; echo pem > "$PEM"; HAPROXY_CFG="$TMP/sync/haproxy.cfg"; echo '# Managed by netrun-https' > "$HAPROXY_CFG"
-  printf 'socks -6 -a -p18100 -i45.32.10.20 -e2001:db8::1\nproxy -6 -n -a -p8100 -i127.0.0.1 -e2001:db8::1\n' > "$PROXY_DIR/3proxy_18100.cfg"
-  cmd_sync; [ "$(grep -c reload "$RELOADS")" = 1 ] || { cat "$RELOADS"; echo "first sync must reload"; exit 1; }
-  cmd_sync; cmd_sync; [ "$(grep -c reload "$RELOADS")" = 1 ] || { cat "$RELOADS"; echo "unchanged syncs reloaded haproxy"; exit 1; }
-  printf 'socks -6 -a -p18200 -i45.32.10.20 -e2001:db8::2\nproxy -6 -n -a -p8200 -i127.0.0.1 -e2001:db8::2\n' > "$PROXY_DIR/3proxy_18200.cfg"
-  cmd_sync; [ "$(grep -c reload "$RELOADS")" = 2 ] || { echo "a new batch did not reload"; exit 1; }
-  rm -f "$PROXY_DIR/3proxy_18200.cfg"
-  cmd_sync; [ "$(grep -c reload "$RELOADS")" = 3 ] || { echo "a removed batch did not reload"; exit 1; }
+  APPLIED_STAMP="$TMP/sync/run/haproxy-applied.sha"
+  batch() { printf 'socks -6 -a -p%s -i45.32.10.20 -e2001:db8::1\nproxy -6 -n -a -p%s -i127.0.0.1 -e2001:db8::1\n' "$1" "$(($1 - 10000))" > "$PROXY_DIR/3proxy_$1.cfg"; }
+  reloads() { grep -c '^reload$' "$RELOADS"; }
+  want() { [ "$(reloads)" = "$1" ] || { cat "$RELOADS"; echo "expected $1 reload(s) — $2"; exit 1; }; }
+  batch 18100
+  ( cmd_sync ); want 1 "first sync must reload"
+  [ "$(cat "$APPLIED_STAMP")" = "$(haproxy_config_hash)" ] || { echo "stamp not written after a verified reload"; exit 1; }
+  ( cmd_sync ); ( cmd_sync ); want 1 "unchanged syncs with a valid stamp reloaded haproxy"
+  batch 18200; ( cmd_sync ); want 2 "a new batch did not reload"
+  rm -f "$PROXY_DIR/3proxy_18200.cfg"; ( cmd_sync ); want 3 "a removed batch did not reload"
   [ ! -e "$FRONTEND_DIR/3proxy_18200.cfg" ] || { echo "stale frontend kept"; exit 1; }
-  HAPROXY_UP=0 cmd_sync; [ "$(grep -c reload "$RELOADS")" = 4 ] || { echo "a stopped haproxy was not started"; exit 1; }
+  ( HAPROXY_UP=0 cmd_sync ); want 4 "a stopped haproxy was not started"
+  # (a) the reload fails once: the files are in place, the next sync retries, later ones do not.
+  batch 18300
+  if ( RELOAD_FAIL=1 cmd_sync ); then echo "a failed reload must fail the sync"; exit 1; fi
+  want 5 "failed reload attempt"
+  [ -e "$FRONTEND_DIR/3proxy_18300.cfg" ] || { echo "validated set not installed"; exit 1; }
+  ( cmd_sync ); want 6 "a failed reload was not retried"
+  ( cmd_sync ); want 6 "retried twice"
+  # (b) the reload "succeeds" but haproxy does not listen on the new frontend: not stamped, retried.
+  batch 18400
+  if ( HAPROXY_LISTENS=0 cmd_sync ); then echo "an unverified reload must fail the sync"; exit 1; fi
+  want 7 "unverified reload attempt"
+  ( HAPROXY_LISTENS=0 cmd_sync ) || true; want 8 "an unverified reload was not retried"
+  ( cmd_sync ); want 9 "verified retry"
+  ( cmd_sync ); want 9 "verified once, then quiet"
+  ( HAPROXY_LISTENS=0 NETRUN_HTTPS_RELOAD_VERIFY=0 cmd_sync ); want 9 "verify off: nothing to do anyway"
+  # (c) haproxy rejects the new set: the live directory is left untouched, nothing reloaded.
+  batch 18500
+  before="$(ls "$FRONTEND_DIR" | tr '\n' ' ')"
+  if ( CHECK_FAIL=1 cmd_sync ); then echo "a rejected set must fail the sync"; exit 1; fi
+  [ "$(ls "$FRONTEND_DIR" | tr '\n' ' ')" = "$before" ] || { echo "a rejected set reached the live dir"; exit 1; }
+  grep -q 'DIE haproxy rejects the new frontend set' "$RELOADS" || { echo "no die on a rejected set"; exit 1; }
+  want 9 "reloaded a rejected set"
+  ( cmd_sync ); want 10 "the fixed set was not installed + reloaded"
+  [ -e "$FRONTEND_DIR/3proxy_18500.cfg" ] || { echo "fixed set not installed"; exit 1; }
+  # (d) the max-age safety net (6 h by default; 0 = off); a missing stamp (reboot) = one reload.
+  touch -t 202001010000 "$APPLIED_STAMP"
+  ( NETRUN_HTTPS_RELOAD_MAX_AGE_H=0 cmd_sync ); want 10 "max age 0 must never reload"
+  ( cmd_sync ); want 11 "an expired stamp did not reload"
+  ( cmd_sync ); want 11 "a fresh stamp reloaded"
+  rm -f "$APPLIED_STAMP"; ( cmd_sync ); want 12 "no stamp (reboot) must reload once"
+  ( cmd_sync ); want 12 "after the stamp is back: quiet"
+  # frontend_first_ports / frontend_ports_missing
+  [ "$(frontend_first_ports | sort -n | tr '\n' ' ')" = "8100 8300 8400 8500 " ] || { frontend_first_ports; echo "first ports"; exit 1; }
+  [ -z "$(frontend_ports_missing 45.32.10.20 8100 8300)" ] || { echo "listening ports reported missing"; exit 1; }
+  [ "$(HAPROXY_LISTENS=0 frontend_ports_missing 45.32.10.20 8100 8300 | tr '\n' ' ')" = "8100 8300 " ] || { echo "missing ports not reported"; exit 1; }
   exit 0
-) || fail "netrun-https: reload-on-change"
+) || fail "netrun-https: reload-on-change + reload stamp"
+grep -q 'with_sync_lock cmd_sync' "$HTTPS" || fail "netrun-https: sync not serialized with flock"
 grep -q '^KillMode=process$' "$HTTPS" || fail "netrun-https: sync unit without KillMode=process"
 grep -q 'bash "$SPAWN_HELPER" "$cfg"' "$HTTPS" || fail "netrun-https: restart_cfg not via the spawn helper"
 grep -q 'bash "$SPAWN_HELPER" "$cfg"' "$ROOT_DIR/scripts/netrun-harden.sh" || fail "netrun-harden: restart_cfg not via the spawn helper"
-ok "netrun-https sync: haproxy reloaded only on a frontend/base change (or when stopped); KillMode=process; restarts via the spawn helper"
+ok "netrun-https sync: reload only on a change / stopped haproxy / unapplied stamp; new set validated before it goes live; failed + unverified reloads retried; flock; KillMode=process; restarts via the spawn helper"
 
 echo "test_capacity_18k_node.sh — all $PASS checks passed"

@@ -402,10 +402,15 @@ EOF
 # and ASN as the proxies) instead of leaking to Cloudflare/Google. The bundled
 # 3proxy 0.9.3 HONOURS the cfg `nserver` directive (h_nserver sets resolvfunc =
 # myresolver): every batch cfg says `nserver 127.0.0.1` / `nserver ::1`, i.e.
-# this unbound; resolv.conf is for the node's own tools. The recursion leaves
-# from the node's PRIMARY address, not a proxy's exit address: proxy anchors
-# are added deprecated (preferred_lft 0, audit FP-01), so the kernel never
-# picks one as a source.
+# this unbound; resolv.conf is for the node's own tools. Over IPv6 the
+# recursion leaves from the node's PRIMARY address, not a proxy's exit
+# address: proxy anchors are added deprecated (preferred_lft 0, audit FP-01),
+# so the kernel never picks one as a source. That guarantee is IPv6-only: in
+# egress_mode dualstack (-64) a proxy's IPv4 destinations leave from the
+# node's single IPv4 — the same address unbound's IPv4 recursion and the agent
+# use (resolver IPv4 == proxy IPv4 exit; /health ipv4ExitSharedWithNode). The
+# fix for that is audit FP-02 (a dedicated egress IPv4, or fail-closed -6);
+# an unbound outgoing-interface changes nothing on a one-IPv4 node.
 configure_unbound() {
   log "Installing local recursive resolver (unbound)"
   DEBIAN_FRONTEND=noninteractive apt-get install -y unbound >/dev/null 2>&1 \
@@ -450,7 +455,7 @@ nameserver 1.1.1.1
 options edns0 trust-ad timeout:2 attempts:1
 EOF
   chattr +i "$RESOLV_CONF" 2>/dev/null || true
-  log "unbound active; resolv.conf -> 127.0.0.1 (recursion egress = node's primary IP)"
+  log "unbound active; resolv.conf -> 127.0.0.1 (recursion egress = primary IPv6 (anchors deprecated) / the node's IPv4)"
 }
 
 configure_nftables() {

@@ -32,7 +32,10 @@
 #     (127.0.0.1 / ::1) — the 2026-05 geo-seed resolvers — gets exactly
 #     `nserver 127.0.0.1` + `nserver ::1` right before 3proxy reads it, and only
 #     while unbound is active. No batch is ever restarted for it: the fix lands
-#     at the batch's next (re)start.
+#     at the batch's next (re)start. The rewrite keeps the cfg's mode, owner and
+#     MTIME: it is not a new batch — the agent's supervisor (respawn only a cfg
+#     older than the boot or seen serving) and firewall (cfgs written after a
+#     cutoff are "fresh", never ghosts) both read the mtime.
 #
 # stdout: one line "<outcome> start_port=<sp> ...", outcome one of
 #   spawned | already-running | already-listening | refused | failed
@@ -105,6 +108,13 @@ port_listening() { # PORT -> 0 listening, 1 not, 2 unknown (ss failed)
 
 unbound_active() { systemctl is-active --quiet unbound 2>/dev/null; }
 
+# SRC DST: DST gets SRC's mode, owner and mtime (GNU first, BSD stat fallback).
+copy_file_attrs() {
+  chmod --reference="$1" "$2" 2>/dev/null || chmod "$(stat -f %Lp "$1" 2>/dev/null)" "$2" 2>/dev/null || true
+  chown --reference="$1" "$2" 2>/dev/null || true
+  touch -r "$1" "$2"
+}
+
 # Legacy geo-seed resolvers -> the node's unbound (see the header).
 fix_legacy_dns() {
   [ "${NETRUN_SPAWN_FIX_DNS:-1}" = 1 ] || return 0
@@ -124,7 +134,8 @@ fix_legacy_dns() {
       if (!done) { match($0, /^[ \t]*/); ind = substr($0, 1, RLENGTH); print ind "nserver 127.0.0.1"; print ind "nserver ::1"; done = 1 }
       next
     }
-    { print }' "$cfg" > "$tmp" && mv -f "$tmp" "$cfg" || { rm -f "$tmp"; say "kept start_port=$sp legacy nserver lines (rewrite failed)"; return 0; }
+    { print }' "$cfg" > "$tmp" && copy_file_attrs "$cfg" "$tmp" && mv -f "$tmp" "$cfg" \
+    || { rm -f "$tmp"; say "kept start_port=$sp legacy nserver lines (rewrite failed)"; return 0; }
   say "dns-fixed start_port=$sp legacy third-party nserver lines -> 127.0.0.1 / ::1 (local unbound)"
 }
 

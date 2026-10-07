@@ -89,8 +89,11 @@ test("planFirewall reapply: re-asserts the pushed ghosts + pergb, never declares
 });
 
 // A fake node: `ss -Hltn`, `nft list set` and `nft -f` answered from state.
+// host.gate: a promise `nft -f` waits for (a toggle can land meanwhile);
+// host.ephemeral: ip_local_port_range as [lo, hi] (null = unknown);
+// host.nowMs: the clock (null = Date.now()).
 function fakeFirewall(name, { env = {}, lock = null, cfgs = [] } = {}) {
-  const host = { listening: new Set(), blocked: new Set(), batches: [], list: new Set(), lock, nftFail: false, infra: 0 };
+  const host = { listening: new Set(), blocked: new Set(), batches: [], list: new Set(), lock, nftFail: false, infra: 0, gate: null, ephemeral: null, nowMs: null };
   const run = async (cmd, args) => {
     if (cmd === "ss") return { code: 0, stdout: [...host.listening].map((p) => `LISTEN 0 13 1.2.3.4:${p} 0.0.0.0:*`).join("\n"), stderr: "" };
     if (cmd === "nft" && args[0] === "list") {
@@ -98,6 +101,7 @@ function fakeFirewall(name, { env = {}, lock = null, cfgs = [] } = {}) {
     }
     if (cmd === "nft" && args[0] === "-f") {
       const text = fs.readFileSync(args[1], "utf-8");
+      if (host.gate) await host.gate;
       host.batches.push(text);
       if (host.nftFail) return { code: 1, stdout: "", stderr: "Error: Could not process rule" };
       for (const line of text.trim().split("\n")) {
@@ -122,9 +126,29 @@ function fakeFirewall(name, { env = {}, lock = null, cfgs = [] } = {}) {
     protectedPorts: [8085, 22],
     log: quietLog,
     tmpDir: TMP,
+    now: () => (host.nowMs === null ? Date.now() : host.nowMs),
+    readEphemeralRange: () => host.ephemeral,
   });
-  return { host, firewall, stateFile };
+  return { host, firewall, stateFile, run };
 }
+
+// What POST /accounts/{port}/disable|enable does to nft + pergb_blocked.list
+// (accounting.js _enforceBlock: the port and its http pair).
+function accountingToggle(host, port, blocked) {
+  return async () => {
+    for (const p of fw.withHttpMirror([port])) {
+      if (blocked) {
+        host.blocked.add(p);
+        host.list.add(p);
+      } else {
+        host.blocked.delete(p);
+        host.list.delete(p);
+      }
+    }
+    return { action: blocked ? "blocked_nft_only" : "unblocked_nft_only", port };
+  };
+}
+const sortedOf = (set) => [...set].sort((a, b) => a - b);
 
 test("push: applies ghosts + pergb, removes stale drops, persists the desired state, syncs the blocked list", async () => {
   const { host, firewall, stateFile } = fakeFirewall("push");
@@ -235,4 +259,174 @@ test("nft failure: 500 nft_failed, nothing persisted; NODE_AGENT_FIREWALL_DESIRE
   assert.strictEqual((await off.firewall.push({ livePorts: [1], window: [1, 2] })).status, 404);
   assert.deepStrictEqual(await off.firewall.liftPorts([1]), { skipped: true });
   assert.deepStrictEqual(await off.firewall.reapply(), { skipped: true, reason: "disabled" });
+});
+
+test("account toggles after the push survive the periodic AND the boot re-apply (latest per-port intent wins)", async () => {
+  const { host, firewall, stateFile } = fakeFirewall("toggles");
+  host.listening = new Set([40000, 40001, 30000, 30001]);
+  let out = await firewall.push({ livePorts: [40000, 40001, 30000, 30001], pergbBlocked: [40001], window: [40000, 65535] });
+  assert.strictEqual(out.status, 200, JSON.stringify(out.body));
+  assert.deepStrictEqual(sortedOf(host.blocked), [30001, 40001]);
+  assert.deepStrictEqual(sortedOf(host.list), [30001, 40001]);
+  // The customer of 40001 tops up; the account of 40000 runs out of quota.
+  let r = await firewall.recordAccountToggle(40001, false, accountingToggle(host, 40001, false));
+  assert.strictEqual(r.action, "unblocked_nft_only", "the accounting result is passed through");
+  await firewall.recordAccountToggle(40000, true, accountingToggle(host, 40000, true));
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000]);
+  await firewall.reapply("periodic");
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000], "periodic re-apply: the paying customer stays open, the depleted one blocked");
+  assert.deepStrictEqual(sortedOf(host.list), [30000, 40000], "the list is neither pruned nor refilled against the toggles");
+  assert.strictEqual(firewall.status().accountToggles, 2);
+  // Agent restart + reboot: an OLD ruleset snapshot (before the toggles) comes
+  // back and reapplyPergbBlocks re-adds the list; then the boot re-apply of a
+  // NEW agent process (toggles read from the file).
+  host.blocked = new Set([30001, 40001, ...host.list]);
+  const again = fw.createFirewall({
+    env: { NODE_AGENT_FIREWALL_STATE_FILE: stateFile },
+    run: async (cmd, args) => fakeRun(host, cmd, args),
+    readCfgs: async () => ({ ok: true, cfgs: [] }),
+    updateBlockedList: async (fn) => fn(host.list),
+    log: quietLog,
+    tmpDir: TMP,
+    readEphemeralRange: () => null,
+  });
+  assert.strictEqual(again.status().accountToggles, 2, "toggles restored from desired.toggles.json");
+  r = await again.reapply("boot");
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000], "boot re-apply: stale drops of the enabled port removed, the disable kept");
+  assert.deepStrictEqual(sortedOf(host.list), [30000, 40000]);
+  const file = JSON.parse(fs.readFileSync(fw.defaultTogglesFile(stateFile), "utf-8"));
+  assert.deepStrictEqual(Object.keys(file.toggles), ["40000", "40001"]);
+  assert.strictEqual(file.toggles["40000"].blocked, true);
+});
+
+// The fake `run` of fakeFirewall for a second firewall on the same host.
+function fakeRun(host, cmd, args) {
+  if (cmd === "nft" && args[0] === "list") {
+    return { code: 0, stdout: `table inet proxy_accounting {\n\tset pergb_blocked {\n${host.blocked.size ? `\t\telements = { ${[...host.blocked].join(", ")} }\n` : ""}\t}\n}\n`, stderr: "" };
+  }
+  if (cmd === "nft" && args[0] === "-f") {
+    for (const line of fs.readFileSync(args[1], "utf-8").trim().split("\n")) {
+      for (const p of (line.match(/\{([^}]*)\}/)[1].match(/\d+/g) || []).map(Number)) {
+        if (line.startsWith("add")) host.blocked.add(p);
+        else host.blocked.delete(p);
+      }
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  }
+  return { code: 1, stdout: "", stderr: "unexpected" };
+}
+
+test("push: a toggle newer than the payload's snapshot (computedAt) is kept; an older one is dropped", async () => {
+  const { host, firewall, stateFile } = fakeFirewall("toggle-push");
+  const T = Date.parse("2026-10-07T12:00:00Z");
+  host.nowMs = T;
+  host.listening = new Set([40000, 30000]);
+  await firewall.recordAccountToggle(40000, true, accountingToggle(host, 40000, true));
+  // The orchestrator read its DB 10 min BEFORE the disable: the payload does not know it yet.
+  host.nowMs = T + 60_000;
+  let out = await firewall.push({ livePorts: [40000, 30000], pergbBlocked: [], window: [40000, 65535], computedAt: new Date(T - 600_000).toISOString() });
+  assert.strictEqual(out.status, 200, JSON.stringify(out.body));
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000], "the disable is not undone by an older snapshot");
+  assert.deepStrictEqual(sortedOf(host.list), [30000, 40000]);
+  assert.strictEqual(out.body.report.togglesKept, 2, "40000 + its http pair");
+  assert.strictEqual(firewall.status().accountToggles, 1, "still newer than the snapshot: kept");
+  // A snapshot taken well after the disable is authoritative: it says active.
+  host.nowMs = T + 20 * 60_000;
+  out = await firewall.push({ livePorts: [40000, 30000], pergbBlocked: [], window: [40000, 65535], computedAt: new Date(T + 15 * 60_000).toISOString() });
+  assert.strictEqual(out.status, 200);
+  assert.deepStrictEqual(sortedOf(host.blocked), [], "the snapshot (newer than the toggle) wins");
+  assert.strictEqual(firewall.status().accountToggles, 0, "older toggles dropped once the push is in");
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(fw.defaultTogglesFile(stateFile), "utf-8")).toggles, {});
+  // dryRun / refused pushes never drop toggles.
+  await firewall.recordAccountToggle(40000, true, accountingToggle(host, 40000, true));
+  host.nowMs = T + 60 * 60_000;
+  out = await firewall.push({ livePorts: [40000, 30000], pergbBlocked: [], window: [40000, 65535], dryRun: true });
+  assert.strictEqual(firewall.status().accountToggles, 1);
+});
+
+test("a toggle that lands while a re-apply is applying is not undone by it (nft -f and the list update re-check)", async () => {
+  const { host, firewall } = fakeFirewall("toggle-race");
+  host.listening = new Set([40000, 30000, 40005, 30005]);
+  await firewall.push({ livePorts: [40000, 30000, 40005, 30005], pergbBlocked: [], window: [40000, 65535] });
+  host.blocked = new Set([40005]); // a stale drop the re-apply removes
+  let release;
+  host.gate = new Promise((r) => { release = r; });
+  const pending = firewall.reapply("periodic");
+  await new Promise((r) => setTimeout(r, 20)); // the re-apply now waits in nft -f
+  await firewall.recordAccountToggle(40000, true, accountingToggle(host, 40000, true));
+  release();
+  host.gate = null;
+  const r = await pending;
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000], "stale 40005 removed, the fresh disable kept");
+  assert.deepStrictEqual(sortedOf(host.list), [30000, 40000], "the re-apply's list update did not prune the fresh disable");
+  // The next re-apply keeps it too.
+  await firewall.reapply("periodic");
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000]);
+});
+
+test("liftPorts: exclude keeps the drop and the list entry of a port that still listens; lifted ports lose their toggles", async () => {
+  const { host, firewall } = fakeFirewall("lift-exclude");
+  host.listening = new Set([40000, 40001, 30000, 30001]);
+  await firewall.push({ livePorts: [40000, 40001, 30000, 30001], pergbBlocked: [40000, 40001], window: [40000, 65535] });
+  await firewall.recordAccountToggle(40001, true, accountingToggle(host, 40001, true));
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 30001, 40000, 40001]);
+  const lift = await firewall.liftPorts([40000, 40001, 30000, 30001], "generation test", { exclude: new Set([40000, 30000]) });
+  assert.strictEqual(lift.lifted, 2);
+  assert.strictEqual(lift.kept, 2);
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000], "the old occupant's blocks stay");
+  assert.deepStrictEqual(sortedOf(host.list), [30000, 40000]);
+  assert.strictEqual(firewall.status().accountToggles, 0, "the lifted batch's toggle is gone (a new batch takes the ports)");
+  await firewall.reapply("periodic");
+  assert.deepStrictEqual(sortedOf(host.blocked), [30000, 40000]);
+});
+
+test("ephemeral guard: a push adding blocks inside ip_local_port_range is refused (409) unless force; re-apply only reports", async () => {
+  const { host, firewall, stateFile } = fakeFirewall("ephemeral");
+  host.listening = new Set([18100, 40000]);
+  host.ephemeral = [10000, 65000]; // an untuned node
+  let out = await firewall.push({ livePorts: [18100], window: [18100, 65535] });
+  assert.strictEqual(out.status, 409);
+  assert.strictEqual(out.body.error, "ephemeral_overlap");
+  assert.strictEqual(out.body.ipLocalPortRange, "10000 65000");
+  assert.deepStrictEqual(out.body.overlappingAdds.sample, [40000]);
+  assert.strictEqual(host.blocked.size, 0);
+  assert.ok(!fs.existsSync(stateFile));
+  out = await firewall.push({ livePorts: [18100], window: [18100, 65535], force: true });
+  assert.strictEqual(out.status, 200);
+  assert.deepStrictEqual(sortedOf(host.blocked), [40000]);
+  const r = await firewall.reapply("periodic");
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(r.ephemeralOverlap, { ipLocalPortRange: "10000 65000", blockedInRange: { count: 1, sample: [40000] } });
+  // Tuned node (1024-8000): nothing in range, no refusal.
+  const tuned = fakeFirewall("ephemeral-tuned");
+  tuned.host.listening = new Set([18100, 40000]);
+  tuned.host.ephemeral = [1024, 8000];
+  out = await tuned.firewall.push({ livePorts: [18100], window: [18100, 65535] });
+  assert.strictEqual(out.status, 200);
+  assert.strictEqual(out.body.report.ipLocalPortRange, "1024 8000");
+  assert.deepStrictEqual(sortedOf(tuned.host.blocked), [40000]);
+  // Guard off.
+  const off = fakeFirewall("ephemeral-off", { env: { NODE_AGENT_FIREWALL_EPHEMERAL_GUARD: "0" } });
+  off.host.listening = new Set([18100, 40000]);
+  off.host.ephemeral = [10000, 65000];
+  out = await off.firewall.push({ livePorts: [18100], window: [18100, 65535] });
+  assert.strictEqual(out.status, 200);
+  assert.strictEqual(fw.parseEphemeralRange("1024\t8000\n").join(","), "1024,8000");
+  assert.strictEqual(fw.parseEphemeralRange("junk"), null);
+});
+
+test("recordAccountToggle: disabled firewall or a bad port just runs the accounting call; a failing call keeps the intent", async () => {
+  const off = fakeFirewall("toggle-off", { env: { NODE_AGENT_FIREWALL_DESIRED: "0" } });
+  assert.deepStrictEqual(await off.firewall.recordAccountToggle(40000, true, async () => ({ action: "x" })), { action: "x" });
+  assert.strictEqual(off.firewall.status().accountToggles, 0);
+  assert.ok(!fs.existsSync(fw.defaultTogglesFile(off.stateFile)));
+  const { host, firewall, stateFile } = fakeFirewall("toggle-fail");
+  await assert.rejects(firewall.recordAccountToggle(40000, true, async () => {
+    host.list.add(40000); // accounting persists the list even when nft failed, then throws
+    throw new Error("nft_block_failed");
+  }), /nft_block_failed/);
+  assert.strictEqual(firewall.status().accountToggles, 1, "the disable intent stands (the orchestrator retries it)");
+  assert.strictEqual(JSON.parse(fs.readFileSync(fw.defaultTogglesFile(stateFile), "utf-8")).toggles["40000"].blocked, true);
 });

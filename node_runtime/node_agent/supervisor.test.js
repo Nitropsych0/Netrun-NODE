@@ -113,7 +113,7 @@ test("planAnchors: re-add only addresses of a /64 the node has; deprecate only n
 });
 
 // A fake node: cfg dir on disk, ps / ss / systemctl / ip answered from state.
-function fakeNode(name, { cfgs = {}, env = {} } = {}) {
+function fakeNode(name, { cfgs = {}, env = {}, nowMs = 10_000_000, bootTimeMs = () => Date.now() } = {}) {
   const dir = path.join(TMP, name, "3proxy");
   fs.mkdirSync(dir, { recursive: true });
   for (const [file, text] of Object.entries(cfgs)) {
@@ -129,11 +129,15 @@ function fakeNode(name, { cfgs = {}, env = {} } = {}) {
     batches: [],
     busy: false,
     spawned: [],
-    nowMs: 10_000_000,
+    nowMs,
+    onPs: null,
   };
   const run = async (cmd, args) => {
     host.calls.push(`${cmd} ${args.join(" ")}`);
-    if (cmd === "ps") return { code: 0, stdout: host.procs.join("\n"), stderr: "" };
+    if (cmd === "ps") {
+      if (host.onPs) host.onPs();
+      return { code: 0, stdout: host.procs.join("\n"), stderr: "" };
+    }
     if (cmd === "ss") {
       const ports = [...String(args[1]).matchAll(/:(\d+)/g)].map((m) => Number(m[1]));
       return { code: 0, stdout: ports.filter((p) => host.listening.has(p)).map((p) => `LISTEN 0 13 1.2.3.4:${p} 0.0.0.0:*`).join("\n"), stderr: "" };
@@ -162,7 +166,7 @@ function fakeNode(name, { cfgs = {}, env = {} } = {}) {
     processLock: withProcessLock,
     now: () => host.nowMs,
     log: quietLog,
-    bootTimeMs: () => Date.now(), // every fixture cfg (mtime 1970) predates the boot
+    bootTimeMs, // default: every fixture cfg (mtime 1970) predates the boot
   });
   return { dir, host, supervisor, statusPath };
 }
@@ -346,4 +350,182 @@ test("the batches seen serving survive an agent restart (status file on /run); a
   await second.tick();
   await second.tick();
   assert.deepStrictEqual(spawned, [path.join(first.dir, "3proxy_18100.cfg")]);
+});
+
+test("forget: a start port regenerated after serving is a NEW batch — a failed attempt's leftover stays unsupervised, also after an agent restart", async () => {
+  const boot = Date.now() - 3600_000;
+  const { dir, host, supervisor, statusPath } = fakeNode("forget", {
+    cfgs: { "3proxy_18100.cfg": CFG(18100, "2001:db8:0:1::a") },
+    bootTimeMs: () => boot,
+  });
+  host.listening = new Set([18100]);
+  await supervisor.tick();
+  assert.deepStrictEqual(supervisor.status().seenServing, [18100]);
+  // /generate at 18100: kill-on-rebind removed the old batch, forget() under
+  // the lock, the new attempt wrote its cfg and failed before 3proxy came up.
+  assert.strictEqual(supervisor.forget([18100, "x", -1]), 1);
+  fs.writeFileSync(path.join(dir, "3proxy_18100.cfg"), CFG(18100, "2001:db8:0:1::f")); // written after the boot
+  host.listening = new Set();
+  host.procs = [];
+  host.nowMs = Date.now() + 10 * 60_000; // past the settle window
+  for (let i = 0; i < 3; i += 1) {
+    await supervisor.tick();
+    host.nowMs += 60_000;
+  }
+  assert.deepStrictEqual(host.spawned, [], "never respawned");
+  assert.deepStrictEqual(supervisor.status().unsupervised, [18100]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(statusPath, "utf-8")).seenServing, []);
+  // Agent restart: the status file does not bring the old "seen" back.
+  const inventory = cfgStatus.createCfgInventory({ cfgDir: dir });
+  const spawned = [];
+  const second = sup.createSupervisor({
+    env: { NODE_AGENT_SUPERVISOR_STATUS_FILE: statusPath, NETRUN_ENV_FILE: path.join(TMP, "none.env"), NETRUN_ANCHOR_DEPRECATE: "0", NETRUN_ANCHOR_READD: "0" },
+    readCfgs: () => inventory.read(),
+    spawnCfg: async (p) => { spawned.push(p); return { ok: true, outcome: "spawned", pid: 1, via: "helper" }; },
+    run: async (cmd) => (cmd === "systemctl" ? { code: 0, stdout: "active\n" } : { code: 0, stdout: "" }),
+    readFile: async () => "",
+    now: () => host.nowMs,
+    log: quietLog,
+    bootTimeMs: () => boot,
+  });
+  await second.tick();
+  await second.tick();
+  assert.deepStrictEqual(spawned, []);
+  assert.deepStrictEqual(second.status().unsupervised, [18100]);
+});
+
+test("without forget a rewrite of a served batch (deprovision rewrite / egress_mode) keeps it supervised", async () => {
+  const boot = Date.now() - 3600_000;
+  const { dir, host, supervisor } = fakeNode("rewrite-kept", {
+    cfgs: { "3proxy_18100.cfg": CFG(18100, "2001:db8:0:1::a") },
+    bootTimeMs: () => boot,
+  });
+  host.listening = new Set([18100]);
+  await supervisor.tick();
+  fs.writeFileSync(path.join(dir, "3proxy_18100.cfg"), CFG(18100, "2001:db8:0:1::a")); // rewritten after the boot
+  host.listening = new Set();
+  host.procs = [];
+  host.nowMs = Date.now() + 10 * 60_000;
+  await supervisor.tick();
+  assert.deepStrictEqual(supervisor.status().pendingDown, [18100]);
+  host.nowMs += 60_000;
+  await supervisor.tick();
+  assert.deepStrictEqual(host.spawned, [path.join(dir, "3proxy_18100.cfg")]);
+});
+
+test("forget during a tick: the tick's older ps / ss snapshot does not mark the port seen again", async () => {
+  const { host, supervisor } = fakeNode("forget-race", { cfgs: { "3proxy_18100.cfg": CFG(18100, "2001:db8:0:1::a") } });
+  host.listening = new Set([18100]);
+  let once = true;
+  host.onPs = () => {
+    if (once) {
+      once = false;
+      supervisor.forget([18100]); // /generate takes the lock while this tick reads ps / ss
+    }
+  };
+  await supervisor.tick();
+  assert.deepStrictEqual(supervisor.status().seenServing, [], "not re-added from the stale snapshot");
+  host.nowMs += 60_000;
+  await supervisor.tick(); // a later tick sees the (new) batch listening
+  assert.deepStrictEqual(supervisor.status().seenServing, [18100]);
+});
+
+test("the hourly respawn cap and the failed mark survive an agent restart; a changed cfg is tried again once the hour is over", async () => {
+  const name = "cap-restart";
+  const env = { NODE_AGENT_SUPERVISOR_MAX_RESPAWNS_PER_HOUR: "2", NETRUN_ANCHOR_DEPRECATE: "0", NETRUN_ANCHOR_READD: "0" };
+  const first = fakeNode(name, { cfgs: { "3proxy_18100.cfg": CFG(18100, "2001:db8:0:1::a") }, env });
+  for (let i = 0; i < 6; i += 1) {
+    first.host.procs = []; // a crash loop
+    await first.supervisor.tick();
+    first.host.nowMs += 60_000;
+  }
+  assert.strictEqual(first.host.spawned.length, 2);
+  const file = JSON.parse(fs.readFileSync(first.statusPath, "utf-8"));
+  assert.deepStrictEqual(file.failedCfgs.map((f) => [f.startPort, f.reason, f.mtimeMs]), [[18100, "rate_limited", 0]]);
+  assert.strictEqual(file.respawnHistory["18100"].length, 2);
+  // OOM / watchdog restart of the agent: a NEW supervisor on the same /run file.
+  const second = fakeNode(name, { cfgs: { "3proxy_18100.cfg": CFG(18100, "2001:db8:0:1::a") }, env, nowMs: first.host.nowMs });
+  assert.deepStrictEqual(second.supervisor.status().failedCfgs.map((f) => f.startPort), [18100], "failed mark restored");
+  assert.strictEqual(second.supervisor.status().respawnHistory["18100"].length, 2, "history restored");
+  await second.supervisor.tick();
+  second.host.nowMs += 60_000;
+  await second.supervisor.tick();
+  assert.deepStrictEqual(second.host.spawned, [], "no fresh 5/h after a restart");
+  // The cfg changes; the cap still counts the last hour, then it is tried again.
+  fs.utimesSync(path.join(second.dir, "3proxy_18100.cfg"), new Date(1000), new Date(1000));
+  second.host.nowMs += 3600_000;
+  await second.supervisor.tick();
+  second.host.nowMs += 60_000;
+  await second.supervisor.tick();
+  assert.strictEqual(second.host.spawned.length, 1, "respawned after the change, outside the hour");
+  // A status file of the previous agent version (no history / mtimes) restores nothing.
+  const oldDir = path.join(TMP, "cap-old");
+  fs.mkdirSync(oldDir, { recursive: true });
+  fs.writeFileSync(path.join(oldDir, "s.json"), JSON.stringify({ seenServing: [1], failedCfgs: [{ startPort: 1, at: "x", reason: "rate_limited", respawns: 5 }] }));
+  const old = sup.createSupervisor({ env: { NODE_AGENT_SUPERVISOR_STATUS_FILE: path.join(oldDir, "s.json") }, readCfgs: async () => ({ ok: true, cfgs: [] }), spawnCfg: async () => ({}), log: quietLog });
+  assert.deepStrictEqual(old.status().failedCfgs, []);
+  assert.deepStrictEqual(old.status().respawnHistory, {});
+});
+
+test("http-only cfg behind the HTTPS front: haproxy's frontend on the same port is not the batch — a dead batch is respawned", async () => {
+  const { dir, host, supervisor } = fakeNode("http-only", {
+    cfgs: { "3proxy_8100.cfg": "daemon\nflush\nproxy -6 -n -a -p8100 -i127.0.0.1 -e2001:db8:0:1::a\nproxy -6 -n -a -p8101 -i127.0.0.1 -e2001:db8:0:1::b\n" },
+    env: { NETRUN_ANCHOR_DEPRECATE: "0", NETRUN_ANCHOR_READD: "0" },
+  });
+  host.listening = new Set([8100]); // the fake ss answers 1.2.3.4:8100 — haproxy's public frontend
+  await supervisor.tick();
+  assert.deepStrictEqual(supervisor.status().pendingDown, [8100], "not 'up' on haproxy's listener");
+  host.nowMs += 60_000;
+  await supervisor.tick();
+  assert.deepStrictEqual(host.spawned, [path.join(dir, "3proxy_8100.cfg")]);
+  // planRespawns with the 3proxy listener present on 127.0.0.1: up.
+  const state = { downSince: new Map(), history: new Map(), failed: new Map(), seen: new Set() };
+  const c = { startPort: 8100, probePort: 8100, probeAddr: "127.0.0.1", httpOnly: true, mtimeMs: 0, cfgPath: "/c/8100" };
+  const plan = sup.planRespawns([c], {
+    runningKeys: new Set(), listening: new Set([8100]), listeningKeys: new Set(["45.32.10.20:8100", "127.0.0.1:8100"]),
+    keyOf: (x) => x.cfgPath, nowMs: 1, settleMs: 0, maxPerHour: 5, state, bootMs: 10,
+  });
+  assert.deepStrictEqual(plan.pending, []);
+  assert.ok(state.seen.has(8100));
+});
+
+test("planAnchors: preferred nodad addresses no active cfg lists (deprovisioned batch, *.cfg.disabled, old /64 restore) are deprecated too; the primary never", () => {
+  const rows = sup.parseIfInet6Rows(
+    [
+      inet6Line("2001:db8:0:1:5400:6ff:febe:b5cf", { plen: 64, flags: 0x00 }), // primary (SLAAC)
+      inet6Line("2001:db8:0:1::a", { flags: 0x82 }), // active cfg anchor, preferred
+      inet6Line("2001:db8:0:1::e", { flags: 0x82 }), // deprovisioned batch's anchor, still on the NIC
+      inet6Line("2001:db8:0:1::d", { plen: 64, flags: 0x82 }), // a .cfg.disabled anchor the old restore re-added as /64
+      inet6Line("2001:db8:0:1::f", { flags: 0xa2 }), // already deprecated
+      inet6Line("2001:db8:0:1::7", { flags: 0xc2 }), // tentative
+      inet6Line("2001:db8:0:2::1", { flags: 0x82, ifname: "wg0" }), // another interface: not ours
+    ].join("\n")
+  );
+  const plan = sup.planAnchors([{ egress: ["2001:db8:0:1::a"] }], rows, { iface: "enp1s0" });
+  assert.deepStrictEqual(
+    plan.pendingDeprecate.map((p) => [p.addr, p.plen, Boolean(p.orphan)]),
+    [["2001:db8:0:1:0:0:0:a", 128, false], ["2001:db8:0:1:0:0:0:e", 128, true], ["2001:db8:0:1:0:0:0:d", 64, true]]
+  );
+  assert.strictEqual(plan.orphans, 2);
+  assert.strictEqual(plan.preferredNodad, 3);
+  assert.strictEqual(plan.preferredNonNodad, 1, "the primary");
+  const noIface = sup.planAnchors([{ egress: ["2001:db8:0:1::a"] }], rows, { iface: null });
+  assert.strictEqual(noIface.orphans, 0, "no egress interface known: only cfg anchors");
+  assert.strictEqual(noIface.preferredNodad, null);
+});
+
+test("tick: orphan anchors deprecated in the same batch; /health preferredNodad reaches 0", async () => {
+  const { host, supervisor } = fakeNode("orphans", { cfgs: { "3proxy_18100.cfg": CFG(18100, "2001:db8:0:1::a") } });
+  host.listening = new Set([18100]);
+  host.ifInet6 = [
+    inet6Line("2001:db8:0:1:5400:6ff:febe:b5cf", { plen: 64, flags: 0x00 }),
+    inet6Line("2001:db8:0:1::a", { flags: 0xa2 }), // the cfg anchor: deprecated already
+    inet6Line("2001:db8:0:1::e", { flags: 0x82 }), // orphan
+  ].join("\n");
+  await supervisor.tick();
+  assert.deepStrictEqual(host.batches, ["address change 2001:db8:0:1:0:0:0:e/128 dev enp1s0 nodad valid_lft forever preferred_lft 0\n"]);
+  const st = supervisor.status();
+  assert.strictEqual(st.orphanAnchorsDeprecated, 1);
+  assert.strictEqual(st.preferredNodad, 0);
+  assert.strictEqual(st.preferredNonNodad, 1);
 });

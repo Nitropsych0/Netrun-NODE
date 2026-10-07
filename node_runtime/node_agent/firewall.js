@@ -45,8 +45,33 @@
 // — a re-apply never declares new ghosts (only a fresh push does), so a batch
 // generated after the push is never blocked from a stale list. Accounting's
 // pergb_blocked.list follows (unblocked ports out, pergbBlocked in).
-// /generate lifts the blocks on the batch it is about to generate (liftPorts).
+// /generate lifts the blocks on the batch it is about to generate (liftPorts);
+// when its kill-on-rebind sweep did not finish, the ports an old occupant still
+// listens on are passed as `exclude` and keep their blocks (and list entries).
 // NODE_AGENT_FIREWALL_DESIRED=0 turns the endpoint, the re-apply and the lift off.
+//
+// Per-port account toggles win over an older desired state (audit follow-up):
+// POST /accounts/{port}/disable|enable goes through recordAccountToggle, which
+// records { blocked, atMs } for the port (and, like accounting.js, its http
+// pair port - 10000) in memory and in NODE_AGENT_FIREWALL_TOGGLES_FILE
+// (desired.toggles.json next to the state file) before the 200. Every plan
+// overlays them: a disabled port stays in pergbBlocked, an enabled one is
+// treated as live and never blocked, so neither the 15-min re-apply nor the
+// boot re-apply can undo a toggle made after the last push, and the accounting
+// list is never pruned / refilled against one. A push drops the toggles older
+// than its snapshot (computedAt, else its arrival, minus 5 min: the
+// orchestrator's rows already carry them) and keeps the newer ones; a
+// generation lift drops the toggles of its batch. The toggle itself (nft +
+// list, accounting.js) runs outside the firewall's apply chain, so a slow push
+// never delays the disable ack; a toggle that lands while a plan is being
+// applied is re-checked right before nft -f and inside the list update.
+//
+// Ephemeral-range guard (NODE_AGENT_FIREWALL_EPHEMERAL_GUARD, default on): the
+// `tcp dport @pergb_blocked drop` rule also drops the SYN-ACKs of upstream
+// connections whose ephemeral source port is a blocked port (the 2026-10-07
+// 5-7 % failure incident). A push that would ADD blocks inside
+// net.ipv4.ip_local_port_range is refused (409 ephemeral_overlap) unless
+// force; a re-apply only warns (it re-asserts what the kernel already had).
 
 const fs = require("fs");
 const fsp = require("fs/promises");
@@ -67,6 +92,9 @@ const COMPUTED_AT_MARGIN_MS = 5 * 60_000;
 const MAX_LIST = 300_000;
 const NFT_CHUNK = 500;
 const SAMPLE = 20;
+const TOGGLES_VERSION = 1;
+const MAX_TOGGLES = 70_000;
+const EPHEMERAL_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range";
 
 function execCapture(cmd, args, { timeoutMs = 30_000 } = {}) {
   return new Promise((resolve) => {
@@ -107,14 +135,70 @@ function intEnv(raw, def, min) {
   return Math.max(min, Math.floor(n));
 }
 
+// desired.json -> desired.toggles.json (any other name: <name>.toggles.json).
+function defaultTogglesFile(stateFile) {
+  return `${String(stateFile).replace(/\.json$/i, "")}.toggles.json`;
+}
+
 function readSettings(env = process.env) {
+  const stateFile = String(env.NODE_AGENT_FIREWALL_STATE_FILE || DEFAULT_STATE_FILE);
   return {
     enabled: hygieneLib.envSwitch(env.NODE_AGENT_FIREWALL_DESIRED),
-    stateFile: String(env.NODE_AGENT_FIREWALL_STATE_FILE || DEFAULT_STATE_FILE),
+    stateFile,
+    togglesFile: String(env.NODE_AGENT_FIREWALL_TOGGLES_FILE || defaultTogglesFile(stateFile)),
     reapplySec: intEnv(env.NODE_AGENT_FIREWALL_REAPPLY_SEC, DEFAULT_REAPPLY_SEC, 60),
     freshSec: intEnv(env.NODE_AGENT_FIREWALL_FRESH_SEC, DEFAULT_FRESH_SEC, 0),
     maxNewBlocks: intEnv(env.NODE_AGENT_FIREWALL_MAX_NEW_BLOCKS, DEFAULT_MAX_NEW_BLOCKS, 0),
+    ephemeralGuard: hygieneLib.envSwitch(env.NODE_AGENT_FIREWALL_EPHEMERAL_GUARD),
   };
+}
+
+// "1024\t8000" (the /proc file) -> [1024, 8000], else null.
+function parseEphemeralRange(text) {
+  const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(String(text || ""));
+  if (!m) return null;
+  const lo = Number(m[1]);
+  const hi = Number(m[2]);
+  return isPort(lo) && isPort(hi) && lo <= hi ? [lo, hi] : null;
+}
+
+function readEphemeralRangeProc() {
+  try {
+    return parseEphemeralRange(fs.readFileSync(EPHEMERAL_RANGE_PATH, "utf-8"));
+  } catch {
+    return null; // no /proc (macOS tests): unknown, the guard stays quiet
+  }
+}
+
+// Per-port toggles (Map port -> { blocked, atMs, ... }) as they act on nft:
+// each covers the port and its http pair (accounting.js _enforceBlock), the
+// newest toggle wins where two cover one port. keep(t) filters the toggles.
+function expandToggles(toggles, keep = () => true) {
+  const out = new Map();
+  for (const [p, t] of toggles || []) {
+    if (!keep(t)) continue;
+    for (const q of withHttpMirror([p])) {
+      const prev = out.get(q);
+      if (!prev || prev.atMs <= t.atMs) out.set(q, t);
+    }
+  }
+  return out;
+}
+
+// The plan inputs with the toggles laid over them: a disabled port is
+// pay-per-GB blocked, an enabled one is live and not blocked.
+function overlayToggles(live, pergb, expanded) {
+  const outLive = new Set(live);
+  const outPergb = new Set(pergb);
+  for (const [q, t] of expanded) {
+    if (t.blocked) {
+      outPergb.add(q);
+    } else {
+      outPergb.delete(q);
+      outLive.add(q);
+    }
+  }
+  return { live: outLive, pergb: outPergb };
 }
 
 const isPort = (p) => Number.isInteger(p) && p >= 1 && p <= 65535;
@@ -295,6 +379,7 @@ function createFirewall({
   now = () => Date.now(),
   log = console,
   tmpDir = os.tmpdir(),
+  readEphemeralRange = readEphemeralRangeProc, // -> [lo, hi] | null
 } = {}) {
   const settings = readSettings(env);
   const protectedSet = new Set(protectedPorts.filter(isPort));
@@ -302,6 +387,51 @@ function createFirewall({
   let timer = null;
   let tail = Promise.resolve();
   let summary; // undefined = not read yet, null = no desired state
+
+  // Per-port account toggles: port -> { blocked, atMs, seq }. seq orders them
+  // within this process (a plan knows which toggles it already saw).
+  const toggles = new Map();
+  let toggleSeq = 0;
+  let togglesTail = Promise.resolve();
+  try {
+    const raw = JSON.parse(fs.readFileSync(settings.togglesFile, "utf-8"));
+    if (raw && raw.version === TOGGLES_VERSION && raw.toggles && typeof raw.toggles === "object") {
+      for (const [k, v] of Object.entries(raw.toggles)) {
+        const p = Number(k);
+        const atMs = Number(v && v.atMs);
+        if (isPort(p) && v && typeof v.blocked === "boolean" && Number.isFinite(atMs)) toggles.set(p, { blocked: v.blocked, atMs, seq: 0 });
+      }
+    }
+  } catch {
+    // no toggles recorded yet
+  }
+
+  // One write at a time; a burst of toggles (an account's whole port list)
+  // shares the write that has not started yet — it takes its snapshot when it
+  // starts, so every caller's toggle is in the file once its promise resolves.
+  let toggleWriteQueued = null;
+  function persistToggles() {
+    if (toggleWriteQueued) return toggleWriteQueued;
+    const run = togglesTail.then(async () => {
+      toggleWriteQueued = null;
+      const body = {
+        version: TOGGLES_VERSION,
+        toggles: Object.fromEntries(
+          [...toggles].sort((a, b) => a[0] - b[0]).map(([p, t]) => [String(p), { blocked: t.blocked, atMs: t.atMs, at: new Date(t.atMs).toISOString() }])
+        ),
+      };
+      await fsp.mkdir(path.dirname(settings.togglesFile), { recursive: true });
+      const tmp = `${settings.togglesFile}.tmp`;
+      await fsp.writeFile(tmp, `${JSON.stringify(body)}\n`, { mode: 0o600 });
+      await fsp.rename(tmp, settings.togglesFile);
+    });
+    toggleWriteQueued = run;
+    togglesTail = run.catch(() => {});
+    return run;
+  }
+
+  // Toggles a plan made at planSeq has not seen yet.
+  const newerThan = (planSeq) => (t) => t.seq > planSeq;
 
   function summarize_(state) {
     return state
@@ -314,6 +444,21 @@ function createFirewall({
           ghostPorts: (state.ghostPorts || []).length,
         }
       : null;
+  }
+
+  // Ports of `ports` inside the ephemeral range (the guard), or null when the
+  // guard is off / the range is unknown.
+  function ephemeralHits(ports) {
+    if (!settings.ephemeralGuard) return null;
+    let range = null;
+    try {
+      range = readEphemeralRange();
+    } catch {
+      range = null;
+    }
+    if (!range) return null;
+    const [lo, hi] = range;
+    return { range: `${lo} ${hi}`, hits: sorted([...ports].filter((p) => p >= lo && p <= hi)) };
   }
 
   // One apply at a time (push vs the periodic re-apply vs a generation lift).
@@ -398,12 +543,28 @@ function createFirewall({
     }
   }
 
-  async function syncAccountingList(plan, pergb, live) {
+  // A toggle that landed after the plan (seq > planSeq) wins over it: never
+  // add a block on a port enabled since, never remove one disabled since.
+  function dropOvertaken(plan, planSeq) {
+    const late = expandToggles(toggles, newerThan(planSeq));
+    if (late.size === 0) return plan;
+    return {
+      ...plan,
+      add: plan.add.filter((p) => !(late.has(p) && !late.get(p).blocked)),
+      remove: plan.remove.filter((p) => !(late.has(p) && late.get(p).blocked)),
+    };
+  }
+
+  // Accounting's pergb_blocked.list follows the plan: unblocked ports out,
+  // pay-per-GB ports in — except a port toggled after the plan (checked when
+  // the list update actually runs, behind any toggle queued before it).
+  async function syncAccountingList(plan, pergb, live, planSeq) {
     const unblock = new Set(plan.remove);
     for (const p of live) if (!pergb.has(p)) unblock.add(p);
     await updateBlockedList((list) => {
-      for (const p of [...list]) if (unblock.has(p)) list.delete(p);
-      for (const p of plan.pergbWanted) list.add(p);
+      const late = expandToggles(toggles, newerThan(planSeq));
+      for (const p of [...list]) if (unblock.has(p) && !(late.has(p) && late.get(p).blocked)) list.delete(p);
+      for (const p of plan.pergbWanted) if (!(late.has(p) && !late.get(p).blocked)) list.add(p);
     });
   }
 
@@ -422,8 +583,6 @@ function createFirewall({
       const { desired } = parsed;
       const dryRun = Boolean(body && body.dryRun);
       const force = Boolean(body && body.force);
-      const live = new Set(desired.livePorts);
-      const pergb = withHttpMirror(desired.pergbBlocked);
       const [ls, cur] = await Promise.all([listening(), currentBlocked()]);
       if (!ls.ok) return { status: 500, body: { success: false, error: "ss_failed", detail: ls.error } };
       if (!cur.ok) return { status: 500, body: { success: false, error: "nft_list_failed", detail: cur.error } };
@@ -432,6 +591,12 @@ function createFirewall({
       let cutoff = nowMs - settings.freshSec * 1000;
       if (Number.isFinite(desired.computedAtMs)) cutoff = Math.min(cutoff, desired.computedAtMs - COMPUTED_AT_MARGIN_MS);
       const fresh = await freshPorts(cutoff);
+      // Toggles newer than the orchestrator's snapshot win over the payload;
+      // older ones are in the snapshot already (dropped once this push is in).
+      const snapshotCutoff = (Number.isFinite(desired.computedAtMs) ? desired.computedAtMs : nowMs) - COMPUTED_AT_MARGIN_MS;
+      const planSeq = toggleSeq;
+      const kept = expandToggles(toggles, (t) => t.atMs > snapshotCutoff);
+      const { live, pergb } = overlayToggles(new Set(desired.livePorts), withHttpMirror(desired.pergbBlocked), kept);
       const plan = planFirewall({
         mode: "push",
         listening: ls.ports,
@@ -455,39 +620,65 @@ function createFirewall({
         skippedInFlight: summarize(plan.skippedInFlight),
         freshExempt: fresh.size,
         alreadyBlocked: cur.ports.size,
+        togglesKept: kept.size,
       };
+      const eph = ephemeralHits(plan.add);
+      if (eph) base.ipLocalPortRange = eph.range;
       let refusal = null;
-      if (!force && live.size === 0 && plan.ghosts.length > 0) refusal = "empty_live_ports";
+      let extra = {};
+      if (!force && desired.livePorts.length === 0 && plan.ghosts.length > 0) refusal = "empty_live_ports";
       else if (!force && plan.add.length > settings.maxNewBlocks) refusal = "too_many_blocks";
+      else if (!force && eph && eph.hits.length > 0) {
+        refusal = "ephemeral_overlap";
+        extra = { ipLocalPortRange: eph.range, overlappingAdds: summarize(eph.hits) };
+      }
       if (refusal) {
-        log.warn(`[firewall] push refused (${refusal}): would add ${plan.add.length} block(s), ${plan.ghosts.length} ghost(s); force:true overrides`);
-        return { status: 409, body: { success: false, error: refusal, maxNewBlocks: settings.maxNewBlocks, report: base } };
+        log.warn(
+          `[firewall] push refused (${refusal}): would add ${plan.add.length} block(s), ${plan.ghosts.length} ghost(s)` +
+            `${refusal === "ephemeral_overlap" ? `, ${eph.hits.length} inside ip_local_port_range ${eph.range} (their drops would also drop upstream SYN-ACKs)` : ""}` +
+            "; force:true overrides"
+        );
+        return { status: 409, body: { success: false, error: refusal, maxNewBlocks: settings.maxNewBlocks, ...extra, report: base } };
       }
       if (dryRun) return { status: 200, body: { success: true, applied: false, report: report("push", base) } };
-      const nft = await applyNft(plan);
+      const nft = await applyNft(dropOvertaken(plan, planSeq));
       if (!nft.ok) {
         log.error(`[firewall] push: nft -f failed: ${nft.error}`);
         return { status: 500, body: { success: false, error: "nft_failed", detail: nft.error, report: report("push", { ...base, ok: false }) } };
       }
-      await syncAccountingList(plan, pergb, live);
+      await syncAccountingList(plan, pergb, live, planSeq);
       await writeState({
         version: STATE_VERSION,
         receivedAt: new Date(nowMs).toISOString(),
         computedAt: Number.isFinite(desired.computedAtMs) ? new Date(desired.computedAtMs).toISOString() : null,
         windows: desired.windows,
-        livePorts: sorted(live),
+        livePorts: sorted(new Set(desired.livePorts)),
         pergbBlocked: sorted(desired.pergbBlocked),
         ghostPorts: plan.ghosts,
       });
+      // The persisted snapshot carries every toggle older than its cutoff now
+      // (after writeState: a crash in between keeps the toggles, never the
+      // reverse). The newer ones stay and keep overriding it.
+      let pruned = 0;
+      for (const [p, t] of [...toggles]) {
+        if (t.atMs <= snapshotCutoff && t.seq <= planSeq) {
+          toggles.delete(p);
+          pruned += 1;
+        }
+      }
+      if (pruned) await persistToggles().catch((err) => log.error(`[firewall] toggles not persisted: ${(err && err.message) || err}`));
       log.log(
         `[firewall] push applied: +${plan.add.length} block(s) (${plan.ghosts.length} ghost(s), ${plan.pergbWanted.length} pergb), ` +
-          `-${plan.remove.length} stale; ${plan.skippedInFlight.length} in-flight port(s) left open`
+          `-${plan.remove.length} stale; ${plan.skippedInFlight.length} in-flight port(s) left open; ` +
+          `${toggles.size} account toggle(s) newer than the snapshot kept`
       );
       return { status: 200, body: { success: true, applied: true, report: report("push", { ...base, ok: true }) } };
     });
   }
 
   // Boot / periodic: re-assert the persisted push. Never declares new ghosts.
+  // Every account toggle recorded since the push lays over it (the last
+  // per-port intent wins, however old the push is).
   function reapply(reason = "periodic") {
     if (!settings.enabled) return Promise.resolve({ skipped: true, reason: "disabled" });
     return serialized(async () => {
@@ -500,59 +691,87 @@ function createFirewall({
       }
       const receivedMs = Date.parse(state.receivedAt);
       const fresh = await freshPorts(Number.isFinite(receivedMs) ? receivedMs - COMPUTED_AT_MARGIN_MS : 0);
-      const live = new Set(state.livePorts || []);
-      const pergb = withHttpMirror(state.pergbBlocked || []);
+      const inFlight = await inFlightPorts();
+      const planSeq = toggleSeq;
+      const { live, pergb } = overlayToggles(new Set(state.livePorts || []), withHttpMirror(state.pergbBlocked || []), expandToggles(toggles));
       const plan = planFirewall({
         mode: "reapply",
         current: cur.ports,
         live,
         pergb,
         windows: state.windows || [],
-        inFlight: await inFlightPorts(),
+        inFlight,
         fresh,
         protectedPorts: protectedSet,
         ghostPorts: new Set(state.ghostPorts || []),
       });
-      const nft = await applyNft(plan);
+      const nft = await applyNft(dropOvertaken(plan, planSeq));
       if (!nft.ok) {
         log.error(`[firewall] re-apply (${reason}): nft -f failed: ${nft.error}`);
         return report("reapply", { reason, ok: false, error: nft.error });
       }
-      await syncAccountingList(plan, pergb, live);
+      await syncAccountingList(plan, pergb, live, planSeq);
       if (plan.add.length || plan.remove.length) {
         log.log(`[firewall] re-apply (${reason}): +${plan.add.length} block(s), -${plan.remove.length} stale block(s)`);
       }
-      return report("reapply", {
+      const out = {
         reason,
         ok: true,
         added: summarize(plan.add),
         removed: summarize(plan.remove),
         skippedInFlight: summarize(plan.skippedInFlight),
-      });
+      };
+      // Never refused (the kernel had these blocks before), only reported.
+      const eph = ephemeralHits(new Set([...plan.ghosts, ...plan.pergbWanted]));
+      if (eph && eph.hits.length > 0) {
+        out.ephemeralOverlap = { ipLocalPortRange: eph.range, blockedInRange: summarize(eph.hits) };
+        log.warn(
+          `[firewall] re-apply (${reason}): ${eph.hits.length} blocked port(s) inside ip_local_port_range ${eph.range} — ` +
+            "their drops also drop upstream SYN-ACKs; lower the range (apply_capacity_tuning.sh --only sysctl)"
+        );
+      }
+      return report("reapply", out);
     });
   }
 
   // /generate: the ports of the batch about to be generated are never blocked —
   // lift what is there (a ghost / pay-per-GB block of the old occupant, an
-  // earlier failed attempt) and drop them from the persisted lists.
-  function liftPorts(ports, reason = "generation") {
+  // earlier failed attempt) and drop them from the persisted lists and toggles.
+  // exclude: ports an old occupant still listens on (the kill-on-rebind sweep
+  // did not finish) — their drops, list entries and toggles stay.
+  function liftPorts(ports, reason = "generation", { exclude = null } = {}) {
     if (!settings.enabled) return Promise.resolve({ skipped: true });
     const want = new Set((ports || []).filter(isPort));
-    if (want.size === 0) return Promise.resolve({ lifted: 0 });
+    const kept = [];
+    for (const p of exclude || []) {
+      if (want.delete(p)) kept.push(p);
+    }
+    if (kept.length) {
+      log.warn(`[firewall] lift (${reason}): ${kept.length} port(s) still have a listener — their blocks stay, e.g. ${sorted(kept).slice(0, 5).join(",")}`);
+    }
+    if (want.size === 0) return Promise.resolve({ lifted: 0, kept: kept.length });
     return serialized(async () => {
       const cur = await currentBlocked();
-      if (!cur.ok) return { lifted: 0, error: cur.error };
+      if (!cur.ok) return { lifted: 0, error: cur.error, kept: kept.length };
       const remove = sorted([...cur.ports].filter((p) => want.has(p)));
       if (remove.length) {
         const nft = await applyNft({ add: [], remove });
         if (!nft.ok) {
           log.error(`[firewall] lift (${reason}): nft -f failed: ${nft.error}`);
-          return { lifted: 0, error: nft.error };
+          return { lifted: 0, error: nft.error, kept: kept.length };
         }
       }
       await updateBlockedList((list) => {
         for (const p of [...list]) if (want.has(p)) list.delete(p);
       });
+      let toggled = 0;
+      for (const p of [...toggles.keys()]) {
+        if (want.has(p)) {
+          toggles.delete(p);
+          toggled += 1;
+        }
+      }
+      if (toggled) await persistToggles().catch((err) => log.error(`[firewall] toggles not persisted: ${(err && err.message) || err}`));
       const state = await readState();
       if (state) {
         const prune = (arr) => (arr || []).filter((p) => !want.has(p));
@@ -562,8 +781,31 @@ function createFirewall({
         }
       }
       if (remove.length) log.log(`[firewall] lift (${reason}): unblocked ${remove.length} port(s) of the batch, e.g. ${remove.slice(0, 5).join(",")}`);
-      return { lifted: remove.length, sample: remove.slice(0, SAMPLE) };
+      return { lifted: remove.length, sample: remove.slice(0, SAMPLE), kept: kept.length };
     });
+  }
+
+  // POST /accounts/{port}/disable|enable: apply = the accounting call (nft +
+  // pergb_blocked.list). The toggle is recorded first (every plan from now on
+  // sees it) and persisted before the answer; the accounting call runs outside
+  // the apply chain, so a push / re-apply in progress never delays the ack.
+  async function recordAccountToggle(port, blocked, apply) {
+    const p = Number(port);
+    if (!settings.enabled || !isPort(p)) return apply();
+    toggleSeq += 1;
+    toggles.set(p, { blocked: Boolean(blocked), atMs: now(), seq: toggleSeq });
+    if (toggles.size > MAX_TOGGLES) {
+      const oldest = [...toggles].sort((a, b) => a[1].atMs - b[1].atMs).slice(0, toggles.size - MAX_TOGGLES);
+      for (const [q] of oldest) toggles.delete(q);
+    }
+    const persisted = persistToggles().catch((err) => {
+      log.error(`[firewall] account toggle of port ${p} not persisted: ${(err && err.message) || err}`);
+    });
+    try {
+      return await apply();
+    } finally {
+      await persisted;
+    }
   }
 
   function start() {
@@ -581,7 +823,14 @@ function createFirewall({
 
   // /health: from memory (the state file is read at start and on every apply).
   function status() {
-    return { enabled: settings.enabled, reapplySec: settings.reapplySec, desired: summary || null, lastApply };
+    return {
+      enabled: settings.enabled,
+      reapplySec: settings.reapplySec,
+      desired: summary || null,
+      lastApply,
+      accountToggles: toggles.size,
+      ephemeralGuard: settings.ephemeralGuard,
+    };
   }
 
   // GET /firewall/desired: re-read, plus a ghost sample.
@@ -592,7 +841,7 @@ function createFirewall({
     return out;
   }
 
-  return { push, reapply, liftPorts, start, stop, status, statusFull, settings: () => ({ ...settings }) };
+  return { push, reapply, liftPorts, recordAccountToggle, start, stop, status, statusFull, settings: () => ({ ...settings }) };
 }
 
 module.exports = {
@@ -601,6 +850,10 @@ module.exports = {
   parseDesiredBody,
   planFirewall,
   inFlightFromLock,
+  parseEphemeralRange,
+  expandToggles,
+  overlayToggles,
+  defaultTogglesFile,
   parseSetElements,
   withHttpMirror,
   nftBatchText,
