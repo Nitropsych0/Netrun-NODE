@@ -33,9 +33,11 @@ case "$NODE_KIND:$*" in
     echo "3: enp6s0    inet 10.24.96.3/20 brd 10.24.111.255 scope global enp6s0\       valid_lft forever preferred_lft forever" ;;
   jnb:"-6 -o addr show scope global")
     echo "2: enp1s0    inet6 2a05:f480:3000:2976:5400:6ff:fed3:bc58/64 scope global mngtmpaddr noprefixroute \       valid_lft forever preferred_lft forever"
-    # 3000 /128 anchors of the same /64 (Johannesburg carries ~22k)
+    # 22000 /128 anchors of the same /64, as many as Johannesburg carries: ~2.6 MB of
+    # `ip -o` text, far over the 128 KiB a single argv string may have on Linux
+    # (the 2026-10-09 deploy failed with "Argument list too long" on it)
     python3 -c 'import random
-for i in range(3000): print("2: enp1s0    inet6 2a05:f480:3000:2976:%x:%x:%x:%x/128 scope global nodad \\       valid_lft forever preferred_lft 0sec" % tuple(random.randrange(1, 65536) for _ in range(4)))' ;;
+for i in range(22000): print("2: enp1s0    inet6 2a05:f480:3000:2976:%x:%x:%x:%x/128 scope global nodad \\       valid_lft forever preferred_lft 0sec" % tuple(random.randrange(1, 65536) for _ in range(4)))' ;;
   chi:"-6 -o addr show scope global")
     echo "2: enp1s0    inet6 2001:19f0:5c01:cdf:5400:6ff:febe:b5cf/64 scope global mngtmpaddr noprefixroute \       valid_lft forever preferred_lft forever" ;;
   jnb:"-6 route show table local dev lo") echo "local ::1 proto kernel metric 0 pref medium" ;;
@@ -87,7 +89,7 @@ out="$(NODE_KIND=chi run print)" || fail "print (chi)"
 v6="$(printf '%s\n' "$out" | grep 'ip6 daddr {')"
 [ "$v6" = "    ip6 daddr { ::1, fe80::/10, fc00::/7, ff00::/8, 2001:19f0:5c01:cdf::/64, 2602:f2dc:a9::/48 } reject" ] \
   || fail "chi: the routed /48 (a /64 inside it and a /128 host route merged away): $v6"
-ok "sets: networks only — one NIC /64 for 3000 anchors, routed /48 merged, private IPv4 covered"
+ok "sets: networks only — one NIC /64 for 22000 anchors, routed /48 merged, private IPv4 covered"
 
 # ── 2. the NDP safety check ───────────────────────────────────────
 printf '%s\n' "$out" | run check >/dev/null || fail "the generated guard fails its own check"

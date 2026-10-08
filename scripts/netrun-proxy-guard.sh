@@ -73,16 +73,24 @@ die() { echo "[netrun-proxy-guard] ERROR: $*" >&2; exit 1; }
 [[ "$PROXY_UID" =~ ^[0-9]+$ ]] || die "NETRUN_PROXY_UID must be a number"
 
 # guard_sets: two lines, "v4 <elements>" and "v6 <elements>" (comma separated),
-# from the node's addresses and local routes.
+# from the node's addresses and local routes. The `ip` output reaches python
+# through files, never argv: Johannesburg's ~22k /128 anchors are ~2.6 MB of
+# text, and Linux refuses any single argv string over 128 KiB (E2BIG,
+# "Argument list too long" — the 2026-10-09 deploy stopped on it).
 guard_sets() {
-  local v4 v6 routes
-  v4="$(ip -4 -o addr show scope global 2>/dev/null || true)"
-  v6="$(ip -6 -o addr show scope global 2>/dev/null || true)"
-  routes="$(ip -6 route show table local dev lo 2>/dev/null || true)"
-  python3 - "$v4" "$v6" "$routes" <<'PY'
+  local tmp rc=0
+  tmp="$(mktemp -d)" || return 1
+  ip -4 -o addr show scope global > "$tmp/v4" 2>/dev/null || true
+  ip -6 -o addr show scope global > "$tmp/v6" 2>/dev/null || true
+  ip -6 route show table local dev lo > "$tmp/routes" 2>/dev/null || true
+  python3 - "$tmp/v4" "$tmp/v6" "$tmp/routes" <<'PY' || rc=$?
 import ipaddress, re, sys
 
-v4_text, v6_text, routes_text = sys.argv[1:4]
+def read(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+v4_text, v6_text, routes_text = (read(p) for p in sys.argv[1:4])
 FIXED4 = ["127.0.0.0/8", "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16",
           "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4"]
 FIXED6 = ["::1/128", "fe80::/10", "fc00::/7", "ff00::/8"]
@@ -107,6 +115,8 @@ for m in re.finditer(r"^local\s+([0-9a-fA-F:]+)/(\d+)", routes_text, re.M):
 print("v4 " + ", ".join(FIXED4 + [text(n) for n in own(FIXED4, nodes4)]))
 print("v6 " + ", ".join(["::1"] + FIXED6[1:] + [text(n) for n in own(FIXED6, nodes6)]))
 PY
+  rm -rf "$tmp"
+  return "$rc"
 }
 
 guard_text() {
