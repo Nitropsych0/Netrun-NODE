@@ -380,7 +380,7 @@ function deterministicRandom() {
 
 const quiet = { log() {}, error() {} };
 
-function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07T12:00:00.000Z") }, writeState, findBin } = {}) {
+function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07T12:00:00.000Z") }, writeState, findBin, randomBytes } = {}) {
   const svc = eg.createEgressService({
     env: {
       NODE_AGENT_PROXY_ROOT: root,
@@ -394,7 +394,7 @@ function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07
     },
     run: host.run,
     now: () => clock.t,
-    randomBytes: deterministicRandom(),
+    randomBytes: randomBytes || deterministicRandom(),
     log: quiet,
     ...(writeState ? { writeState } : {}),
     ...(findBin ? { findBin } : {}),
@@ -1356,6 +1356,47 @@ test("routed /48: a restart re-adds proxy entries for NIC addresses only; the ro
   await noRoute.init();
   assert.strictEqual(noRoute.snapshot().ports[30001].current, null);
   assertConsistent(host, noRoute, root, "route gone");
+});
+
+test("routed /48: a /64 held by a cfg anchor or by a current is never handed out again", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  // a /48 batch: its anchor's /64 is 2602:f2dc:a9:77::/64
+  fs.writeFileSync(path.join(root, "3proxy", "3proxy_50000.cfg"), `daemon\nauth strong\n${block(50000, "2602:f2dc:a9:77::5").join("\n")}\n`);
+  // scripted draws (net index, host bits): 0x10 for 30000; then 0x10 (taken by
+  // 30000's current) and 0x77 (taken by the anchor) must be skipped for 30001
+  const draws = [0x10n, 0xaaaa000000000001n, 0x10n, 0x77n, 0x20n, 0xbbbb000000000002n];
+  let i = 0;
+  const randomBytes = () => {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64BE(draws[i % draws.length]);
+    i += 1;
+    return b;
+  };
+  const { svc } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48 }, randomBytes });
+  await svc.init();
+  const a = (await svc.rotate([30000])).items[0].new_ipv6;
+  const b = (await svc.rotate([30001])).items[0].new_ipv6;
+  assert.strictEqual(a, "2602:f2dc:a9:10:aaaa::1");
+  assert.strictEqual(b, "2602:f2dc:a9:20:bbbb::2", "the current's /64 and the anchor's /64 were skipped");
+  assert.strictEqual(i, 6, "every scripted draw was used");
+  assertConsistent(host, svc, root, "exclusive /64s");
+});
+
+test("routed /48: with the exit guard off and rotation off, a start still lists the routes before judging routed currents", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  const { svc, clock } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48 } });
+  await svc.init();
+  const routedAddr = (await svc.rotate([30000])).items[0].new_ipv6;
+  assert.ok(inR48(routedAddr));
+  // restart with the guard off and the rotation prefix gone from the config
+  const { svc: again } = makeService(host, root, { env: { EGRESS_EXIT_GUARD: "off" }, clock });
+  await again.init();
+  assert.ok(host.log.filter((l) => l === ROUTES).length >= 2, "the routes were listed at the second start");
+  assert.strictEqual(again.snapshot().ports[30000].current, routedAddr, "the route exists: the current stays");
 });
 
 test("routed /48: EGRESS_ROTATE_PREFIX=off keeps the /64; guard off still lists the routes; netrun.env is re-read every tick", async () => {

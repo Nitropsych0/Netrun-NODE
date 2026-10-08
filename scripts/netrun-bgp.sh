@@ -13,7 +13,8 @@
 # Settings: the environment first, then /etc/netrun/netrun.env (KEY=VALUE, the
 # same file the generator and the agent read):
 #   NETRUN_BGP_PREFIXES    prefixes to announce (space/comma separated, /32../48);
-#                          default NETRUN_IPV6_ROUTED_PREFIX (the generator's prefix)
+#                          default NETRUN_IPV6_ROUTED_PREFIX (the generator's prefix);
+#                          "none" = withdraw every prefix (a /48 moving to another node)
 #   NETRUN_BGP_LOCAL_ASN   required: the account's ASN from the Vultr portal (BGP tab)
 #   NETRUN_BGP_PASSWORD    required: the BGP password from the same tab
 #   NETRUN_BGP_PEER_ASN    default 64515 (Vultr, cloud compute)
@@ -34,9 +35,13 @@
 #       binary is missing (otherwise that is an error). Order, so an announced
 #       prefix always has its local route (without it Vultr's traffic for the
 #       prefix would bounce between the host and its default gateway):
-#         1. local routes for every new prefix
-#         2. bird.conf (checked with `bird -p` first) → `birdc configure`, or
-#            `systemctl start bird` when it is not running
+#         0. the generated bird.conf is checked with `bird -p` — rejected:
+#            nothing at all changes
+#         1. local routes for every new prefix, the boot unit
+#         2. bird.conf → `birdc configure` (or `systemctl start bird`), also
+#            whenever the routes BIRD holds (`birdc show route protocol
+#            netrun_v6`) differ from the list — a failed earlier configure is
+#            retried — then verified: BIRD must hold exactly the list
 #         3. only then (NETRUN_BGP_WITHDRAW_WAIT later) the local routes of
 #            prefixes no longer announced go
 #       A real apply also installs this script as /usr/local/sbin/netrun-bgp.
@@ -68,7 +73,11 @@ setting() {
   fi
   if [ -r "$NETRUN_ENV" ]; then
     val="$(grep -E "^${key}=" "$NETRUN_ENV" | tail -n1 | cut -d= -f2- || true)"
-    val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+    # one matching pair of surrounding quotes, never a lone one (a password may
+    # start or end with an apostrophe)
+    if [ "${#val}" -ge 2 ]; then
+      case "${val:0:1}${val: -1}" in '""'|"''") val="${val:1:${#val}-2}" ;; esac
+    fi
   fi
   printf '%s' "${val:-$def}"
 }
@@ -171,6 +180,7 @@ Type=oneshot
 RemainAfterExit=yes
 EOF
   local p
+  [ "$#" -gt 0 ] || echo "ExecStart=/bin/true"
   for p in "$@"; do echo "ExecStart=/sbin/ip -6 route replace local ${p} dev lo"; done
   for p in "$@"; do echo "ExecStop=-/sbin/ip -6 route del local ${p} dev lo"; done
   cat <<'EOF'
@@ -189,18 +199,40 @@ After=${UNIT}
 EOF
 }
 
-# write_if_changed <path> <mode> <owner:group|-> <text>: 0 when written, 1 when equal.
+# write_if_changed <path> <mode> <owner:group|-> <text>: 0 when written, 1 when
+# equal; any failed step dies (callers use it in conditions, where errexit is off).
 write_if_changed() {
   local path="$1" mode="$2" owner="$3" text="$4" tmp
   if [ -f "$path" ] && [ "$(cat "$path")" = "$text" ]; then return 1; fi
-  mkdir -p "$(dirname "$path")"
-  tmp="$(mktemp "$(dirname "$path")/.netrun-bgp.XXXXXX")"
-  printf '%s\n' "$text" > "$tmp"
-  chmod "$mode" "$tmp"
-  [ "$owner" = "-" ] || chown "$owner" "$tmp" 2>/dev/null || true
-  [ -f "$path" ] && cp -p "$path" "$path.netrun-prev"
-  mv -f "$tmp" "$path"
+  mkdir -p "$(dirname "$path")" || die "cannot create $(dirname "$path")"
+  tmp="$(mktemp "$(dirname "$path")/.netrun-bgp.XXXXXX")" || die "cannot create a temp file next to $path"
+  printf '%s\n' "$text" > "$tmp" || { rm -f "$tmp"; die "cannot write $path"; }
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; die "cannot chmod $path"; }
+  if [ "$owner" != "-" ] && ! chown "$owner" "$tmp" 2>/dev/null; then
+    log "warning: chown $owner failed for $path"
+  fi
+  if [ -f "$path" ]; then cp -p "$path" "$path.netrun-prev" || { rm -f "$tmp"; die "cannot back up $path"; }; fi
+  mv -f "$tmp" "$path" || { rm -f "$tmp"; die "cannot replace $path"; }
   return 0
+}
+
+# The prefixes BIRD's static protocol holds now (what it announces), one per
+# line, as canonical_prefixes prints them; empty when none or BIRD is not up.
+loaded_prefixes() {
+  local got
+  got="$(birdc show route protocol netrun_v6 2>/dev/null | awk '$1 ~ /^[0-9a-fA-F:]+\/[0-9]+$/ {print $1}' | tr '\n' ' ')"
+  [ -n "${got// /}" ] || return 0
+  canonical_prefixes "$got" 2>/dev/null || true
+}
+
+# netrun.env holds the BGP password: root only (bird.conf is 0640 root:bird).
+protect_env() {
+  [ -f "$NETRUN_ENV" ] && grep -q '^NETRUN_BGP_PASSWORD=' "$NETRUN_ENV" || return 0
+  local before after
+  before="$(stat -c %a "$NETRUN_ENV" 2>/dev/null || stat -f %Lp "$NETRUN_ENV")"
+  chmod go-rwx "$NETRUN_ENV" || die "cannot chmod $NETRUN_ENV"
+  after="$(stat -c %a "$NETRUN_ENV" 2>/dev/null || stat -f %Lp "$NETRUN_ENV")"
+  [ "$before" = "$after" ] || log "$NETRUN_ENV: mode $before -> $after (it holds the BGP password)"
 }
 
 # The copy `netrun-bgp` runs as; nothing to do when run from stdin or the copy itself.
@@ -229,8 +261,12 @@ has_local_route() { ip -6 route show table local dev lo | grep -qE "^local ${1}(
 load_settings() {
   local plist
   plist="$(setting NETRUN_BGP_PREFIXES "$(setting NETRUN_IPV6_ROUTED_PREFIX "")")"
-  [ -n "$plist" ] || die "no prefix: set NETRUN_BGP_PREFIXES or NETRUN_IPV6_ROUTED_PREFIX in $NETRUN_ENV"
-  PREFIXES="$(canonical_prefixes "$plist")" || die "bad prefix list: $plist"
+  [ -n "$plist" ] || die "no prefix: set NETRUN_BGP_PREFIXES or NETRUN_IPV6_ROUTED_PREFIX in $NETRUN_ENV (none = withdraw all)"
+  if [ "$(printf '%s' "$plist" | tr '[:upper:]' '[:lower:]')" = "none" ]; then
+    PREFIXES=""
+  else
+    PREFIXES="$(canonical_prefixes "$plist")" || die "bad prefix list: $plist"
+  fi
   LOCAL_ASN="$(setting NETRUN_BGP_LOCAL_ASN)"
   PASSWORD="$(setting NETRUN_BGP_PASSWORD)"
   PEER_ASN="$(setting NETRUN_BGP_PEER_ASN 64515)"
@@ -254,7 +290,7 @@ cmd_apply() {
   done
   load_settings
   local -a new=() old=() added=() removed=()
-  mapfile -t new <<< "$PREFIXES"
+  [ -z "$PREFIXES" ] || mapfile -t new <<< "$PREFIXES"
   [ -f "$LIST_FILE" ] && mapfile -t old < <(grep -v '^\s*$' "$LIST_FILE")
   local p q found
   for p in "${new[@]}"; do
@@ -273,11 +309,12 @@ cmd_apply() {
 
   if [ "$dry" = 1 ]; then
     log "dry run — nothing is changed"
-    log "prefixes: ${new[*]}"
+    log "prefixes: ${new[*]:-none}"
     [ "${#added[@]}" -gt 0 ] && log "new (local route first, then announce): ${added[*]}"
     [ "${#removed[@]}" -gt 0 ] && log "dropped (withdraw first, then the route): ${removed[*]}"
     for p in "${new[@]}"; do has_local_route "$p" || log "local route missing now: $p"; done
     log "router id $ROUTER_ID, source $SOURCE6, AS $LOCAL_ASN -> $NEIGHBOR6 AS $PEER_ASN"
+    if command -v birdc >/dev/null 2>&1; then log "BIRD announces now: $(loaded_prefixes | tr '\n' ' ')"; fi
     dry_diff bird.conf "$BIRD_CONF" "$conf"
     dry_diff "$UNIT" "$UNIT_DIR/$UNIT" "$unit"
     dry_diff "bird drop-in" "$UNIT_DIR/bird.service.d/netrun.conf" "$dropin"
@@ -290,6 +327,17 @@ cmd_apply() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y bird2 >/dev/null
   fi
 
+  # 0. the generated config, checked before anything changes
+  local tmpconf
+  tmpconf="$(mktemp)"
+  printf '%s\n' "$conf" > "$tmpconf"
+  if ! bird -p -c "$tmpconf" >/dev/null 2>&1; then
+    rm -f "$tmpconf"
+    die "bird rejects the generated config (bird -p); nothing changed"
+  fi
+  rm -f "$tmpconf"
+  protect_env
+
   # 1. local routes for every announced prefix (new ones before BIRD sees them)
   for p in "${new[@]}"; do ip -6 route replace local "$p" dev lo; done
 
@@ -300,23 +348,27 @@ cmd_apply() {
   if [ "$units_changed" = 1 ]; then systemctl daemon-reload; fi
   systemctl enable "$UNIT" >/dev/null 2>&1 || true
 
-  # 2. bird.conf, checked first
-  local tmpconf
-  tmpconf="$(mktemp)"
-  printf '%s\n' "$conf" > "$tmpconf"
-  if ! bird -p -c "$tmpconf" >/dev/null 2>&1; then
-    rm -f "$tmpconf"
-    die "bird rejects the generated config (bird -p); nothing changed in BIRD"
-  fi
-  rm -f "$tmpconf"
+  # 2. bird.conf → BIRD; reconfigured also when what it holds differs (an
+  # earlier configure failed), then verified before any route goes
+  local conf_changed=0 out i
   if write_if_changed "$BIRD_CONF" 0640 root:bird "$conf"; then
+    conf_changed=1
     log "bird.conf updated (previous: $BIRD_CONF.netrun-prev)"
-    if systemctl is-active --quiet bird; then birdc configure >/dev/null; else systemctl start bird; fi
   else
     log "bird.conf unchanged"
-    systemctl is-active --quiet bird || systemctl start bird
+  fi
+  if ! systemctl is-active --quiet bird; then
+    systemctl start bird || die "systemctl start bird failed; withdrawn prefixes keep their local routes"
+  elif [ "$conf_changed" = 1 ] || [ "$(loaded_prefixes)" != "$PREFIXES" ]; then
+    out="$(birdc configure 2>&1)" || die "birdc configure failed: ${out//$'\n'/ }; withdrawn prefixes keep their local routes"
   fi
   systemctl enable bird >/dev/null 2>&1 || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$(loaded_prefixes)" = "$PREFIXES" ] && break
+    sleep 1
+  done
+  [ "$(loaded_prefixes)" = "$PREFIXES" ] \
+    || die "BIRD holds '$(loaded_prefixes | tr '\n' ' ')' instead of '${new[*]:-none}'; withdrawn prefixes keep their local routes"
 
   # 3. routes of prefixes no longer announced
   if [ "${#removed[@]}" -gt 0 ]; then
@@ -329,7 +381,7 @@ cmd_apply() {
   fi
   write_if_changed "$LIST_FILE" 0644 - "$PREFIXES" || true
   install_self
-  log "announced: ${new[*]}"
+  log "announced: ${new[*]:-none}"
 }
 
 cmd_status() {

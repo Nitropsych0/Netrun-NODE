@@ -881,3 +881,17 @@ test("generateRoutedAddresses: a dense prefix is drawn from its free /64s; none 
   assert.deepStrictEqual([one.addrs.length, one.shared], [3, 2]);
   assert.ok(one.addrs.every((a) => eg.net64Of(a) === eg.net64Of("2602:f2dc:a9:7::")));
 });
+
+test("generateRoutedAddresses: a prefix that becomes dense while picking switches to its free list — no needless sharing", () => {
+  const prefix = "2602:f2dc:a9:100::/56"; // 256 /64s
+  const base = eg.net64Of("2602:f2dc:a9:100::");
+  const used = new Set();
+  for (let i = 0n; i < 100n; i += 1n) used.add(base + i); // 156 free: sparse at the start
+  for (let round = 0; round < 20; round += 1) {
+    const { addrs, shared } = eg.generateRoutedAddresses(prefix, 156, used);
+    assert.strictEqual(shared, 0, `round ${round}: shared while free /64s remained`);
+    const nets = addrs.map(eg.net64Of);
+    assert.strictEqual(new Set(nets).size, 156);
+    assert.ok(nets.every((k) => !used.has(k) && k >= base && k < base + 256n));
+  }
+});

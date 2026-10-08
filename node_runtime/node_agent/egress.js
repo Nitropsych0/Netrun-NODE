@@ -139,7 +139,8 @@ const NFT_CHUNK = 256;
 // Live cfgs and pay-per-GB single-port cfgs parked as `.disabled` (their
 // addresses stay on the NIC and the port may come back).
 const CFG_FILE_RE = /^3proxy_(\d+)\.cfg(\.disabled)?$/;
-const LIST_FILE_RE = /^ipv6_\d+\.list$/;
+// the generator's address lists; .tmp = a batch picking its /64s right now
+const LIST_FILE_RE = /^ipv6_\d+\.list(\.tmp)?$/;
 const IFACE_RE = /^[A-Za-z0-9_.-]{1,32}$/;
 const MODES = new Set(["static", "per_connection"]);
 const DEFAULT_MAX_EXTRA_ADDRS = 40000;
@@ -356,8 +357,9 @@ function inRoutedPrefix(addr, routed) {
 // none of `usedNets` (BigInt /64s: anchors, the generator's lists, this
 // module's addresses — anti-fraud groups by /64, so two exits in one /64 look
 // like one client) and none taken twice; the low 64 bits random, never below
-// 2^32 (like generateAddresses). A sparse prefix is sampled at random; a dense
-// one (under half free, up to 2^20 /64s) from the list of its free /64s. With
+// 2^32 (like generateAddresses). A sparse prefix is sampled at random; once it
+// is (or, while picking, becomes) dense — under half free, up to 2^20 /64s —
+// from the list of its free /64s. With
 // no free /64 left an address shares one (counted in `shared`) rather than
 // failing the call. Returns { addrs, shared }.
 function generateRoutedAddresses(prefixText, count, usedNets, randomBytes = crypto.randomBytes) {
@@ -368,14 +370,16 @@ function generateRoutedAddresses(prefixText, count, usedNets, randomBytes = cryp
   const anyNet = () => base + (rand64() & (nets - 1n));
   const used = new Set();
   for (const k of usedNets) if (k >= base && k < base + nets) used.add(k);
+  // the free list, built once the prefix is (or, while picking, becomes) dense
   let free = null;
-  if (nets <= 1n << 20n && (nets - BigInt(used.size)) * 2n < nets) {
-    free = [];
-    for (let k = base; k < base + nets; k += 1n) if (!used.has(k)) free.push(k);
-  }
+  const dense = () => nets <= 1n << 20n && (nets - BigInt(used.size)) * 2n < nets;
   const addrs = [];
   let shared = 0;
   while (addrs.length < count) {
+    if (!free && dense()) {
+      free = [];
+      for (let k = base; k < base + nets; k += 1n) if (!used.has(k)) free.push(k);
+    }
     let net = null;
     if (free) {
       if (free.length) {
@@ -1651,7 +1655,9 @@ function createEgressService({
       s.draining = s.draining.filter((d) => !index.all.has(d.addr));
       // before the re-add: an address of a routed prefix needs no proxy entry
       let routedKnown = true;
-      if (wantsRouted()) {
+      // also when the state holds routed addresses although nothing asks for
+      // the routes now (guard off, rotation off): they must not be dropped blind
+      if (wantsRouted() || addressesOf(s).some((a) => !needsProxy(a))) {
         const r = await detectRouted();
         if (r) routed = r;
         else routedKnown = false;

@@ -416,7 +416,7 @@ printf "  nf_conntrack  : "
 cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "(module not loaded)"
 if [ -n "$_bgp_asn" ]; then
   printf "  BGP           : "
-  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/netrun-bgp.sh" check 2>/dev/null | tr '\n' ' '; echo
+  { bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/netrun-bgp.sh" check 2>/dev/null || true; } | tr '\n' ' '; echo
 fi
 
 log "Follow-up v2 complete on $(hostname)"

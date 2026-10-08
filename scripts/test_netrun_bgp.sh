@@ -21,8 +21,9 @@ bash -n "$BGP" || fail "bash -n netrun-bgp.sh"
 
 # ── stubs ─────────────────────────────────────────────────────────
 STUB="$TMP/bin"; mkdir -p "$STUB"
-export MAC_FILE="$TMP/mac" STUB_LOG="$TMP/calls.log" ROUTES="$TMP/routes" BIRD_ACTIVE="$TMP/bird.active" BIRD_REJECT="$TMP/bird.reject" BIRD_SESSION="$TMP/bird.session"
-: > "$STUB_LOG"; : > "$ROUTES"
+export MAC_FILE="$TMP/mac" STUB_LOG="$TMP/calls.log" ROUTES="$TMP/routes" BIRD_ACTIVE="$TMP/bird.active" BIRD_REJECT="$TMP/bird.reject" BIRD_SESSION="$TMP/bird.session" \
+       BIRD_LOADED="$TMP/bird.loaded" BIRD_CONFIGURE_FAIL="$TMP/bird.configure_fail"
+: > "$STUB_LOG"; : > "$ROUTES"; : > "$TMP/bird.loaded"
 cat > "$STUB/ip" <<'EOF'
 #!/usr/bin/env bash
 echo "ip $*" >> "$STUB_LOG"
@@ -49,11 +50,19 @@ echo "bird $*" >> "$STUB_LOG"
 [ -f "$BIRD_REJECT" ] && { echo "bird: syntax error" >&2; exit 1; }
 exit 0
 EOF
+# BIRD's loaded config is $BIRD_LOADED (the static routes it announces): read from
+# bird.conf at start / configure; $BIRD_CONFIGURE_FAIL makes the next configure fail.
 cat > "$STUB/birdc" <<'EOF'
 #!/usr/bin/env bash
 echo "birdc $*" >> "$STUB_LOG"
 case "$*" in
-  configure) echo "Reconfigured" ;;
+  configure)
+    if [ -f "$BIRD_CONFIGURE_FAIL" ]; then rm -f "$BIRD_CONFIGURE_FAIL"; echo "8002 $NETRUN_BGP_BIRD_CONF: Permission denied"; exit 1; fi
+    awk '$1 == "route" {print $2}' "$NETRUN_BGP_BIRD_CONF" > "$BIRD_LOADED"
+    echo "Reading configuration from $NETRUN_BGP_BIRD_CONF"; echo "Reconfigured" ;;
+  "show route protocol netrun_v6")
+    echo "Table master6:"
+    while read -r r; do [ -n "$r" ] && echo "$r            unreachable [netrun_v6 13:29:04.000] * (200)"; done < "$BIRD_LOADED" ;;
   "show protocols vultr6")
     echo "Name       Proto      Table      State  Since         Info"
     echo "vultr6     BGP        ---        up     00:48:49.386  $(cat "$BIRD_SESSION" 2>/dev/null || echo Established)" ;;
@@ -64,7 +73,7 @@ cat > "$STUB/systemctl" <<'EOF'
 echo "systemctl $*" >> "$STUB_LOG"
 case "$*" in
   "is-active --quiet bird") [ -f "$BIRD_ACTIVE" ] ;;
-  "start bird") touch "$BIRD_ACTIVE" ;;
+  "start bird") touch "$BIRD_ACTIVE"; awk '$1 == "route" {print $2}' "$NETRUN_BGP_BIRD_CONF" > "$BIRD_LOADED" ;;
   *) exit 0 ;;
 esac
 EOF
@@ -198,10 +207,66 @@ run apply >/dev/null 2>&1 && fail "apply succeeded with a rejected config"
 [ "$(cat "$NETRUN_BGP_BIRD_CONF")" = "$before" ] || fail "rejected config was written"
 grep -q "birdc configure" "$STUB_LOG" && fail "rejected config was loaded"
 grep -q "route del" "$STUB_LOG" && fail "an announced prefix lost its route"
+grep -q "route replace" "$STUB_LOG" && fail "a rejected apply added a route"
+grep -q "2602:f2dc:c0::" "$NETRUN_BGP_UNIT_DIR/netrun-bgp-prefix.service" && fail "a rejected apply rewrote the boot unit"
 rm -f "$BIRD_REJECT"
 sed -i.bak 's#^NETRUN_BGP_PREFIXES=.*#NETRUN_BGP_PREFIXES=2602:f2dc:b0::/48#' "$NETRUN_BGP_ENV_FILE"
 run apply >/dev/null || fail "recovery apply"
-ok "bird -p rejects: bird.conf untouched, no reconfigure, no route removed"
+ok "bird -p rejects: nothing changes — no route, no unit, no bird.conf, no reconfigure"
+
+
+# ── part 6b: a failed configure is loud, keeps the old route, and the rerun heals ──
+sed -i.bak 's#^NETRUN_BGP_PREFIXES=.*#NETRUN_BGP_PREFIXES=2602:f2dc:d0::/48#' "$NETRUN_BGP_ENV_FILE"
+touch "$BIRD_CONFIGURE_FAIL"
+: > "$STUB_LOG"
+out="$(run apply 2>&1)" && fail "apply passed with a failed configure: $out"
+echo "$out" | grep -q "birdc configure failed: .*Permission denied.*keep their local routes" || fail "loud configure failure: $out"
+grep -qx "2602:f2dc:b0::/48" "$ROUTES" || fail "the old, still announced prefix lost its route"
+[ "$(cat "$NETRUN_BGP_LIST_FILE")" = "2602:f2dc:b0::/48" ] || fail "the list moved on without BIRD"
+: > "$STUB_LOG"
+out="$(run apply)" || fail "rerun after a failed configure: $out"
+echo "$out" | grep -q "bird.conf unchanged" || fail "rerun: bird.conf is already the new one"
+grep -q "birdc configure" "$STUB_LOG" || fail "rerun: BIRD still holds the old list → configure again"
+[ "$(cat "$ROUTES")" = "2602:f2dc:d0::/48" ] && [ "$(cat "$BIRD_LOADED")" = "2602:f2dc:d0::/48" ] || fail "rerun: routes $(cat "$ROUTES") / BIRD $(cat "$BIRD_LOADED")"
+ok "a failed configure: loud, old route kept, list unchanged; the rerun reconfigures (BIRD differs) and then withdraws"
+
+# ── part 6c: none = withdraw everything (a /48 moving to another node) ──
+sed -i.bak 's#^NETRUN_BGP_PREFIXES=.*#NETRUN_BGP_PREFIXES=none#' "$NETRUN_BGP_ENV_FILE"
+: > "$STUB_LOG"
+out="$(run apply)" || fail "apply none: $out"
+[ -s "$ROUTES" ] && fail "routes left after none: $(cat "$ROUTES")"
+[ -s "$BIRD_LOADED" ] && fail "BIRD still announces: $(cat "$BIRD_LOADED")"
+grep -q "unreachable" "$NETRUN_BGP_BIRD_CONF" && fail "bird.conf still has a route"
+grep -qx "ExecStart=/bin/true" "$NETRUN_BGP_UNIT_DIR/netrun-bgp-prefix.service" || fail "unit without prefixes needs an ExecStart"
+echo "$out" | grep -q "announced: none" || fail "none: $out"
+[ "$(run check)" = "ok" ] || fail "check with no prefixes: the session only"
+sed -i.bak 's#^NETRUN_BGP_PREFIXES=.*#NETRUN_BGP_PREFIXES=2602:f2dc:b0::/48#' "$NETRUN_BGP_ENV_FILE"
+run apply >/dev/null || fail "back from none"
+ok "NETRUN_BGP_PREFIXES=none: withdrawn from BIRD, then the routes; unit ExecStart=/bin/true; check = session only"
+
+# ── part 6d: password quoting and netrun.env permissions ──
+cp "$NETRUN_BGP_ENV_FILE" "$TMP/env.keep"
+printf "NETRUN_BGP_PASSWORD=it's-fine'\n" >> "$NETRUN_BGP_ENV_FILE"
+[ "$(NETRUN_BGP_SOURCED=1 bash -c 'source "$1"; setting NETRUN_BGP_PASSWORD' _ "$BGP")" = "it's-fine'" ] || fail "a lone trailing apostrophe was stripped"
+printf "NETRUN_BGP_PASSWORD='quoted pw'\n" >> "$NETRUN_BGP_ENV_FILE"
+[ "$(NETRUN_BGP_SOURCED=1 bash -c 'source "$1"; setting NETRUN_BGP_PASSWORD' _ "$BGP")" = "quoted pw" ] || fail "a quoted value keeps its quotes"
+cp "$TMP/env.keep" "$NETRUN_BGP_ENV_FILE"; chmod 0644 "$NETRUN_BGP_ENV_FILE"
+out="$(run apply)" || fail "apply for perms"
+[ "$(stat -f %Lp "$NETRUN_BGP_ENV_FILE" 2>/dev/null || stat -c %a "$NETRUN_BGP_ENV_FILE")" = "600" ] || fail "netrun.env with the password is not 0600"
+echo "$out" | grep -q "mode 644 -> 600" || fail "the chmod is logged: $out"
+ok "setting(): only a matching quote pair is stripped; netrun.env holding the password becomes 0600"
+
+# ── part 6e: a write that fails stops the apply ──
+chmod 0555 "$NETRUN_BGP_UNIT_DIR"
+sed -i.bak 's#^NETRUN_BGP_PREFIXES=.*#NETRUN_BGP_PREFIXES=2602:f2dc:e0::/48#' "$NETRUN_BGP_ENV_FILE"
+out="$(run apply 2>&1)" && fail "apply passed with an unwritable unit dir"
+echo "$out" | grep -q "ERROR: cannot create a temp file next to" || fail "write failure message: $out"
+grep -q "2602:f2dc:e0::" "$NETRUN_BGP_BIRD_CONF" && fail "bird.conf written after a failed unit write"
+chmod 0755 "$NETRUN_BGP_UNIT_DIR"
+sed -i.bak 's#^NETRUN_BGP_PREFIXES=.*#NETRUN_BGP_PREFIXES=2602:f2dc:b0::/48#' "$NETRUN_BGP_ENV_FILE"
+run apply >/dev/null || fail "recovery after the write failure"
+ip -6 route del local 2602:f2dc:e0::/48 dev lo 2>/dev/null || true
+ok "a failed write dies before BIRD is touched"
 
 # ── part 7: settings validation ───────────────────────────────────
 cp "$NETRUN_BGP_ENV_FILE" "$TMP/env.ok"

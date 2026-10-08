@@ -708,6 +708,14 @@ that prefix instead of the NIC /64:
   (route gone, typo) new addresses come from the NIC /64 again (logged); a start without
   the route forgets routed currents (their ports leave from their anchors), a start whose
   route listing fails keeps them;
+- **drain in a routed prefix**: a due address is only forgotten — nothing can be deleted,
+  so its open connections keep working (unlike the /64, where the proxy entry goes) and
+  its /64 may be handed out again; a connection that outlives its drain can then share
+  its /64 with a new exit for a while;
+- the agent and the generator pick /64s without a common lock: each skips the other's
+  (the agent reads the generator's `ipv6_*.list` and `ipv6_*.list.tmp`, the generator
+  the agent's `egress_state.json`), so only picks made within the same few milliseconds
+  can land in one /64;
 - `/health` → `egress.rotate_prefix` and `GET /egress` → `rotate_prefix` say where new
   addresses come from.
 
@@ -1012,11 +1020,21 @@ and `netrun-bgp apply --install` (or `node_followup_v2.sh`, which runs it when
   (`Requires=`): the prefix is withdrawn before its route goes.
 - A second prefix on the same node: add it to `NETRUN_BGP_PREFIXES` (space separated)
   and `apply`. Moving a /48 to another node: `apply` on the new node first (after the
-  portal shows it there), then remove it from the old node's list and `apply` there.
+  portal shows it there), then on the old node drop it from its list —
+  `NETRUN_BGP_PREFIXES=none` when it was the only one (and remove
+  `NETRUN_IPV6_ROUTED_PREFIX` there, or the generator keeps using it) — and `apply`:
+  BIRD withdraws it, the local route goes `NETRUN_BGP_WITHDRAW_WAIT` later.
+- Safety: `bird -p` checks the generated config before anything changes (rejected:
+  nothing changes). After writing bird.conf, `apply` reconfigures BIRD — also on a rerun
+  whenever what BIRD holds (`birdc show route protocol netrun_v6`) differs from the
+  list, so a failed configure is retried — and verifies BIRD holds exactly the list
+  before any local route is removed; a failure is an error with the old routes kept.
+  `/etc/netrun/netrun.env` holding `NETRUN_BGP_PASSWORD` is made 0600.
 
 Tests: `bash scripts/test_netrun_bgp.sh` (stubs for ip/bird/birdc/systemctl; checks the
-order, idempotence, the dry run, a rejected config, and that the generated bird.conf
-equals Chicago's hand-made one).
+order, idempotence, the dry run, a rejected config, a failed configure and its rerun,
+`none`, write failures, quoting, and that the generated bird.conf equals Chicago's
+hand-made one).
 
 ## Smoke Generate
 
