@@ -215,12 +215,17 @@ function inRouted(hex, routed) {
   return routed.some(({ net, plen }) => addr >> BigInt(128 - plen) === net >> BigInt(128 - plen));
 }
 
-// The host's local routes; an error (no `ip`, a timeout) is no routed prefix,
-// never a failed probe.
+// The host's local routes on lo (a routed prefix lives there; the whole local
+// table also lists every NIC anchor — 1.4 MB on a 22k-anchor node, past
+// execFile's default 1 MB buffer). An error (no `ip`, a timeout) is no routed
+// prefix, never a failed probe.
 function readLocalRoutes({ timeoutMs = 5000 } = {}) {
   return new Promise((resolve) => {
-    execFile("ip", ["-6", "route", "show", "table", "local"], { timeout: timeoutMs }, (err, stdout) =>
-      resolve(err ? [] : parseLocalRoutes(stdout))
+    execFile(
+      "ip",
+      ["-6", "route", "show", "table", "local", "dev", "lo"],
+      { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => resolve(err ? [] : parseLocalRoutes(stdout))
     );
   });
 }

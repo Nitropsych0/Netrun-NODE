@@ -195,6 +195,9 @@ test("an address of a prefix routed to the host (local route on lo) is present",
   );
   assert.strictEqual(routes.length, 1, "only the /48: host addresses and non-local routes are no prefix");
   assert.strictEqual(routes[0].plen, 48);
+  // `ip -6 route show table local dev lo` drops the "dev lo" part.
+  const lo = cfgStatus.parseLocalRoutes("local ::1 proto kernel metric 0 pref medium\nlocal 2602:f2dc:a9::/48 metric 1024 pref medium\n");
+  assert.deepStrictEqual(lo.map((r) => r.plen), [48]);
   const cov = cfgStatus.computeAddressCoverage(
     ["2602:f2dc:a9:1::1", "2602:f2dc:a9:ffff:ffff:ffff:ffff:ffff", "2602:f2dc:aa::1", "2001:db8:0:1:a:b:c:1"],
     new Set(["20010db800000001000a000b000c0001"]),
