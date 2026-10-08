@@ -38,6 +38,11 @@ RESTORE_SCRIPT="/opt/netrun/scripts/restore_3proxy.sh"
 LEGACY_RESTORE_SCRIPT="/opt/netrun/scripts/restore-3proxy.sh"
 DOCTOR_SCRIPT="/opt/netrun/scripts/netrun-doctor.sh"
 HEALTH_URL="http://127.0.0.1:8085/health"
+# Audit 2026-10-08 — the agent fails closed without a key: the installer makes
+# one (the same drop-in `netrun-harden.sh agent-key` writes; a key already
+# there is kept). Give it to the orchestrator: register's agent_api_key /
+# enroll's api_key = nodes.api_key.
+AGENT_KEY_FILE="/etc/systemd/system/${SERVICE_NAME}.service.d/20-api-key.conf"
 
 CLEAN_REQUESTED=0
 REMOVE_LEGACY_ROOT=0
@@ -476,13 +481,17 @@ configure_nftables() {
   # MSS, and the kernel already advertises 1460/1440 at MTU 1500), and the old
   # 1340 clamp read as OpenVPN (incident 2026-05-23). The SYN is pinned by
   # 99-zz-netrun-tcp.conf instead.
-  # Now ruleset has ONLY our tables (no xt-compat) → valid for nft -f on boot
-  nft list ruleset > /etc/nftables.conf
+  # Now ruleset has ONLY our tables (no xt-compat) → valid for nft -f on boot.
+  # Audit 2026-10-08 — saved atomically (temp + nft -c + rename, .prev kept,
+  # one lock for every writer) by netrun-nft-persist, whose nftables.service
+  # drop-in boots .prev when the main file is empty or rejected.
+  bash "$NETRUN_HOME/scripts/netrun-nft-persist.sh" install
+  bash "$NETRUN_HOME/scripts/netrun-nft-persist.sh" save
   systemctl restart nftables 2>/dev/null || systemctl start nftables 2>/dev/null || true
 }
 
-# Wave IPV6-ROTATION — `nft list ruleset > /etc/nftables.conf` (here, the
-# generator, deprovision, netrun-harden, netrun-https) also saves the agent's
+# Wave IPV6-ROTATION — the saved ruleset (netrun-nft-persist: here, the
+# generator, deprovision, netrun-harden, netrun-https) also holds the agent's
 # table ip6 netrun_egress, whose rotated / pool addresses (proxy-NDP entries)
 # are gone after a reboot. This drop-in deletes it right after nftables.service loads the file:
 # proxies leave from their anchors until the agent rebuilds the table from
@@ -545,6 +554,25 @@ ensure_legacy_root_proxyserver_symlink() {
   fi
   ln -sfn "$PROXY_ROOT" /root/proxyserver
 }
+
+# Audit 2026-10-08 — a per-node agent key before the first start (fail closed).
+ensure_agent_api_key() {
+  mkdir -p "$(dirname "$AGENT_KEY_FILE")"
+  if grep -qE '^Environment=NODE_AGENT_API_KEY=[0-9a-f]{32,128}$' "$AGENT_KEY_FILE" 2>/dev/null; then
+    chmod 0600 "$AGENT_KEY_FILE"
+    log "node-agent API key present ($AGENT_KEY_FILE) — kept"
+    return 0
+  fi
+  local key
+  key="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  [ "${#key}" -eq 64 ] || die "cannot generate the node-agent API key"
+  (umask 077 && printf '[Service]\nEnvironment=NODE_AGENT_API_KEY=%s\n' "$key" > "$AGENT_KEY_FILE") \
+    || die "cannot write $AGENT_KEY_FILE"
+  chmod 0600 "$AGENT_KEY_FILE"
+  log "node-agent API key generated in $AGENT_KEY_FILE (the orchestrator needs it: nodes.api_key)"
+}
+
+agent_api_key() { sed -n 's/^Environment=NODE_AGENT_API_KEY=//p' "$AGENT_KEY_FILE" 2>/dev/null | tail -n1; }
 
 # === CHANGE 4: patch node-agent.service with raised limits ===
 install_systemd_service() {
@@ -620,7 +648,8 @@ if command -v ufw >/dev/null 2>&1; then fail "ufw still installed"; else ok "ufw
 c "5. node-agent"
 if systemctl is-active --quiet netrun-node-agent; then
   ok "netrun-node-agent active"
-  curl -m 3 -fsS http://127.0.0.1:8085/health 2>/dev/null | head -c 200; echo
+  key="$(sed -n 's/^Environment=NODE_AGENT_API_KEY=//p' /etc/systemd/system/netrun-node-agent.service.d/20-api-key.conf 2>/dev/null | tail -n1)"
+  curl -m 10 -fsS -H "X-API-KEY: $key" http://127.0.0.1:8085/health 2>/dev/null | head -c 200; echo
 else
   fail "netrun-node-agent NOT active"
 fi
@@ -708,11 +737,24 @@ EOF
   systemctl enable netrun-ipv6-restore.service >/dev/null 2>&1 || true
 }
 
+# Audit 2026-10-08 — netrun-harden.sh secure: the 3proxy egress guard (uid
+# 65535 may not reach the node itself, private / metadata addresses, the
+# node's prefixes), credential files root-only, ssh keys only, unbound's
+# recursion from the node's own /64 of a routed prefix (none yet on a fresh
+# node: a no-op until node_followup_v2.sh / netrun-bgp configure one). The
+# atomic ruleset saves + boot fallback were installed by configure_nftables.
+install_security() {
+  log "Applying the 2026-10-08 security fixes (netrun-harden.sh secure)"
+  bash "$NETRUN_HOME/scripts/netrun-harden.sh" secure \
+    || warn "netrun-harden.sh secure reported a failure — rerun it: bash $NETRUN_HOME/scripts/netrun-harden.sh secure"
+}
+
 verify_health() {
   log "Waiting for /health"
-  local health=""
+  local health="" key
+  key="$(agent_api_key)"
   for _ in $(seq 1 30); do
-    health="$(curl -fsS "$HEALTH_URL" 2>/dev/null || true)"
+    health="$(curl -fsS -H "X-API-KEY: $key" "$HEALTH_URL" 2>/dev/null || true)"
     if [ -n "$health" ] && printf '%s' "$health" | jq -e '.success == true and .status == "ready"' >/dev/null 2>&1; then
       printf '%s\n' "$health" | jq .
       return 0
@@ -745,12 +787,14 @@ main() {
   write_bootstrap_marker
   seed_egress_mode_state
   ensure_legacy_root_proxyserver_symlink
+  ensure_agent_api_key
   install_systemd_service
 
   install_3proxy_restore_unit
   install_doctor_script
   install_trend_monitor
   install_ipv6_restore_unit
+  install_security
 
   verify_health
 

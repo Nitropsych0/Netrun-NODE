@@ -96,8 +96,11 @@ ok "installer, follow-up and tuning step write the same modules-load / udev file
 # ── 4. netrun-https: accounting rule convergence ──────────────────
 eval "$(extract "$HTTPS" netrun_setting)"
 eval "$(extract "$HTTPS" accounting_rules_to_fix)"
-# fix_accounting persists to /etc/nftables.conf; point that write at the temp dir.
-eval "$(extract "$HTTPS" fix_accounting | sed "s#/etc/nftables.conf#$TMP/nftables.conf#")"
+# fix_accounting persists through nft_persist (audit 2026-10-08: atomic, via
+# netrun-nft-persist when installed); point its target at the temp dir.
+eval "$(extract "$HTTPS" nft_persist)"
+eval "$(extract "$HTTPS" fix_accounting)"
+export NETRUN_NFT_CONF="$TMP/nftables.conf"
 log() { echo "LOG $*" >> "$TMP/https_calls"; }
 public_ipv4() { echo 45.32.10.20; }
 chain_in() { # form: plain | lo | v4

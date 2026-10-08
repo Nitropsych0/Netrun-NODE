@@ -16,6 +16,7 @@ const path = require("path");
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "netrun-blockfail-"));
 process.env.NODE_AGENT_PROXY_ROOT = ROOT;
+process.env.NODE_AGENT_API_KEY = "test-key"; // audit 2026-10-08: the agent fails closed without a key
 process.env.NODE_AGENT_JOBS_ROOT = path.join(ROOT, "jobs");
 process.env.NODE_AGENT_DISABLE_GRACE_MS = "0";
 process.env.NODE_AGENT_CLEANUP_CRON_AFTER_RUN = "0";
@@ -177,7 +178,7 @@ test("reapplyPergbBlocks: counts failures, heals at most once, never throws", as
 
 function post(port, urlPath) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: urlPath, method: "POST" }, (r) => {
+    const req = http.request({ host: "127.0.0.1", port, path: urlPath, method: "POST", headers: { "X-API-KEY": "test-key" } }, (r) => {
       let t = "";
       r.on("data", (c) => (t += c));
       r.on("end", () => resolve({ status: r.statusCode, json: JSON.parse(t) }));

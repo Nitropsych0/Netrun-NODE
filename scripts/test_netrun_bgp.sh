@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# netrun-bgp: prefix canonicalisation, the generated bird.conf (byte-equal in
+# netrun-bgp: the :179 guard (only the neighbour may reach BIRD; loaded before
+# BIRD starts, boot drop-in, `check` fails without it) and the 3proxy egress
+# guard refresh after an apply (audit 2026-10-08);
+# prefix canonicalisation, the generated bird.conf (byte-equal in
 # its body to the hand-made Chicago config of 2026-10-08), the boot unit and
 # the bird drop-in, the order of route / announce changes, idempotence,
 # --dry-run touching nothing, settings validation, and `check`. ip / bird /
@@ -81,12 +84,29 @@ cat > "$STUB/apt-get" <<'EOF'
 #!/usr/bin/env bash
 echo "apt-get $*" >> "$STUB_LOG"
 EOF
+# nft: `-c -f` rejects while $NFT_REJECT exists; `-f` loads the guard table.
+export NFT_LOADED="$TMP/nft.loaded" NFT_REJECT="$TMP/nft.reject"
+cat > "$STUB/nft" <<'EOF'
+#!/usr/bin/env bash
+echo "nft $*" >> "$STUB_LOG"
+case "$*" in
+  "-c -f "*) [ ! -f "$NFT_REJECT" ] ;;
+  "-f "*) cp "$2" "$NFT_LOADED" ;;
+  "list table inet netrun_bgp_guard") [ -f "$NFT_LOADED" ] && cat "$NFT_LOADED" ;;
+  *) exit 1 ;;
+esac
+EOF
+cat > "$STUB/proxy-guard" <<'EOF'
+#!/usr/bin/env bash
+echo "proxy-guard $*" >> "$STUB_LOG"
+EOF
 chmod +x "$STUB"/*
 export PATH="$STUB:$PATH"
 
 export NETRUN_BGP_ENV_FILE="$TMP/netrun.env" NETRUN_BGP_BIRD_CONF="$TMP/bird/bird.conf" \
        NETRUN_BGP_UNIT_DIR="$TMP/systemd" NETRUN_BGP_LIST_FILE="$TMP/bgp-prefixes" \
-       NETRUN_BGP_SELF="$TMP/sbin/netrun-bgp" NETRUN_BGP_WITHDRAW_WAIT=0
+       NETRUN_BGP_SELF="$TMP/sbin/netrun-bgp" NETRUN_BGP_WITHDRAW_WAIT=0 \
+       NETRUN_BGP_GUARD_FILE="$TMP/netrun/nft-bgp-guard.nft" NETRUN_BGP_PROXY_GUARD="$STUB/proxy-guard"
 cat > "$NETRUN_BGP_ENV_FILE" <<'EOF'
 NETRUN_IPV6_ROUTED_PREFIX=2602:f2dc:a9::/48
 NETRUN_BGP_LOCAL_ASN=4288000384
@@ -136,6 +156,21 @@ grep -qx "Requires=netrun-bgp-prefix.service" "$dropin" && grep -qx "After=netru
 cmp -s "$BGP" "$NETRUN_BGP_SELF" && [ -x "$NETRUN_BGP_SELF" ] || fail "netrun-bgp copy installed"
 ok "apply: route first, checked config, 0640 bird.conf, boot unit, bird drop-in, list file, netrun-bgp copy"
 
+# The :179 guard: only the neighbour, loaded (after nft -c) before BIRD starts,
+# re-applied at boot; the 3proxy egress guard refreshed after the apply.
+grep -qx "    tcp dport 179 ip6 saddr 2001:19f0:ffff::1 accept" "$NETRUN_BGP_GUARD_FILE" \
+  && grep -qx "    tcp dport 179 drop" "$NETRUN_BGP_GUARD_FILE" || fail ":179 guard rules: $(cat "$NETRUN_BGP_GUARD_FILE")"
+grep -q "type filter hook input priority filter - 20; policy accept;" "$NETRUN_BGP_GUARD_FILE" || fail ":179 guard hook"
+[ "$(sed -n '3,5p' "$NETRUN_BGP_GUARD_FILE" | tr '\n' '|')" = "table inet netrun_bgp_guard|delete table inet netrun_bgp_guard|table inet netrun_bgp_guard {|" ] \
+  || fail ":179 guard is one transaction (add + delete + define)"
+cmp -s "$NETRUN_BGP_GUARD_FILE" "$NFT_LOADED" || fail ":179 guard loaded"
+chk=$(grep -n "nft -c -f" "$STUB_LOG" | head -1 | cut -d: -f1)
+load=$(grep -n "nft -f $NETRUN_BGP_GUARD_FILE" "$STUB_LOG" | head -1 | cut -d: -f1)
+[ -n "$chk" ] && [ -n "$load" ] && [ "$chk" -lt "$load" ] && [ "$load" -lt "$start_line" ] || fail "order: nft -c ($chk) < guard load ($load) < bird start ($start_line)"
+grep -qx "ExecStartPost=-.*nft -f $NETRUN_BGP_GUARD_FILE" "$NETRUN_BGP_UNIT_DIR/nftables.service.d/netrun-bgp-guard.conf" || fail ":179 guard boot drop-in"
+grep -qx "proxy-guard apply" "$STUB_LOG" || fail "the 3proxy egress guard is refreshed"
+ok ":179 guard: only the neighbour, checked + loaded before BIRD starts, boot drop-in; proxy guard refreshed"
+
 # The body (after the 3 comment lines) equals the hand-made Chicago config of
 # 2026-10-08 (password replaced): an apply on Chicago changes nothing BIRD cares about.
 expected_body='log syslog all;
@@ -173,9 +208,9 @@ grep -q "birdc configure" "$STUB_LOG" && fail "second apply reconfigured bird"
 grep -q "daemon-reload" "$STUB_LOG" && fail "second apply reloaded systemd"
 [ ! -e "$NETRUN_BGP_BIRD_CONF.netrun-prev" ] || fail "no backup when nothing changed"
 out="$(run apply --dry-run)" || fail "dry run after apply"
-[ "$(echo "$out" | grep -c ": unchanged$")" = 3 ] || fail "dry run after apply: bird.conf, unit, drop-in unchanged: $out"
+[ "$(echo "$out" | grep -c ": unchanged$")" = 4 ] || fail "dry run after apply: bird.conf, unit, drop-in, :179 guard unchanged: $out"
 echo "$out" | grep -q "s3cret" && fail "dry run printed the password"
-ok "apply again: nothing rewritten, no reconfigure, no daemon-reload; dry run: 3 × unchanged"
+ok "apply again: nothing rewritten, no reconfigure, no daemon-reload; dry run: 4 × unchanged"
 
 # ── part 5: prefix change — add before announce, withdraw before removal ──
 sed -i.bak 's#^NETRUN_IPV6_ROUTED_PREFIX=.*#NETRUN_BGP_PREFIXES=2602:f2dc:b0::/48#' "$NETRUN_BGP_ENV_FILE"
@@ -286,8 +321,19 @@ echo "$out" | grep -q "source 2001:db8::5," || fail "explicit source used: $out"
 rm -f "$MAC_FILE"
 ok "source: the EUI-64 address (not the anchor route get picks); none → error unless NETRUN_BGP_SOURCE6"
 
+# ── part 7c: a guard nft rejects stops the apply before BIRD ─────────
+touch "$NFT_REJECT"; : > "$STUB_LOG"
+out="$(run apply 2>&1)" && fail "apply passed with nft rejecting the :179 guard"
+echo "$out" | grep -q "nft rejects the :179 guard" || fail "reason: $out"
+grep -q "birdc configure\|systemctl start bird" "$STUB_LOG" && fail "BIRD touched after a rejected guard"
+rm -f "$NFT_REJECT"
+ok "a :179 guard nft rejects: the apply stops before BIRD is touched"
+
 # ── part 8: check ─────────────────────────────────────────────────
 [ "$(run check)" = "ok" ] || fail "check ok"
+mv "$NFT_LOADED" "$NFT_LOADED.keep"
+run check >/dev/null && fail "check passes without the :179 guard"
+mv "$NFT_LOADED.keep" "$NFT_LOADED"
 echo "Active" > "$BIRD_SESSION"
 run check >/dev/null && fail "check passes without an Established session"
 echo "Established" > "$BIRD_SESSION"

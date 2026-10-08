@@ -102,18 +102,13 @@ ufw:        absent-ok
 
 ### 3.1 API-ключ (ВАЖНО — security)
 
-`server.js`: если `NODE_AGENT_API_KEY` пустой → **node-agent принимает запросы БЕЗ авторизации** (открыт на 0.0.0.0:8085 всему интернету). Для prod **обязательно** задать ключ и согласовать с orchestrator:
+С аудита 2026-10-08 агент **закрыт без ключа**: без `NODE_AGENT_API_KEY` он отвечает только liveness `GET /health` → `{"ok":true}`, всё остальное — 401. `install_node_v2.sh` сам генерирует ключ в `/etc/systemd/system/netrun-node-agent.service.d/20-api-key.conf` (существующий не трогает); сменить ключ: `bash scripts/netrun-harden.sh agent-key <hex>`.
 
 ```bash
-# на ноде — задать ключ в env node-agent
-KEY=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 40)
-echo "$KEY"   # запиши — он же пойдёт в orchestrator nodes.api_key
-sed -i "s|^# *NODE_AGENT_API_KEY=.*|NODE_AGENT_API_KEY=$KEY|" /opt/netrun/.env 2>/dev/null \
-  || echo "NODE_AGENT_API_KEY=$KEY" >> /opt/netrun/.env
-# убедись что service читает /opt/netrun/.env (EnvironmentFile) либо передай через Environment=
-systemctl restart netrun-node-agent
+# ключ на ноде (он же пойдёт в orchestrator nodes.api_key)
+sed -n 's/^Environment=NODE_AGENT_API_KEY=//p' /etc/systemd/system/netrun-node-agent.service.d/20-api-key.conf
 ```
-> Если node-agent не читает .env — добавь `EnvironmentFile=/opt/netrun/.env` в `netrun-node-agent.service` или `Environment=NODE_AGENT_API_KEY=...`. **Ключ на ноде ДОЛЖЕН совпадать с `nodes.api_key` в orchestrator БД**, иначе orchestrator получит 401.
+> **Ключ на ноде ДОЛЖЕН совпадать с `nodes.api_key` в orchestrator БД**, иначе orchestrator получит 401 (а `/health` без ключа — только `{ok:true}`, нода не «ready»).
 
 ### 3.2 Регистрация в orchestrator (`51.38.205.194`)
 

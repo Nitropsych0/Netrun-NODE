@@ -115,7 +115,10 @@ ok "install_node_v2.sh finished"
 
 # === 4. Verify /health ===
 log "4/6 Verifying node-agent /health"
-HEALTH=$(curl -fsS -m 10 http://127.0.0.1:8085/health || die "node-agent /health failed")
+# Audit 2026-10-08 — the full /health needs the agent key the installer made.
+AGENT_KEY="$(sed -n 's/^Environment=NODE_AGENT_API_KEY=//p' /etc/systemd/system/netrun-node-agent.service.d/20-api-key.conf 2>/dev/null | tail -n1)"
+[ -n "$AGENT_KEY" ] || die "no node-agent API key (install_node_v2.sh writes netrun-node-agent.service.d/20-api-key.conf)"
+HEALTH=$(curl -fsS -m 20 -H "X-API-KEY: $AGENT_KEY" http://127.0.0.1:8085/health || die "node-agent /health failed")
 if ! echo "$HEALTH" | jq -e '.success == true and .status == "ready"' >/dev/null; then
   echo "$HEALTH" | jq .
   die "node-agent unhealthy"
@@ -133,7 +136,8 @@ log "    Node URL: $NODE_URL"
 #   agent_url    (required) — node-agent HTTP URL
 #   name         (optional) — human-readable name
 #   geo_code     (optional) — 2-letter country code
-#   api_key      (optional) — node-side api key (we don't use one)
+#   api_key      the node-agent key install_node_v2.sh generated (audit
+#                2026-10-08: the agent answers nothing else without it)
 #   force        (default false) — overwrite existing entry by url
 #   auto_bind_active_skus — if true, auto-binds to SKU matching geo_code
 #                            (saves operator from manual SQL binding)
@@ -143,7 +147,8 @@ ENROLL_PAYLOAD=$(jq -n \
   --arg name "$NODE_NAME" \
   --arg agent_url "$NODE_URL" \
   --arg geo_code "$GEO" \
-  '{name: $name, agent_url: $agent_url, geo_code: $geo_code, force: true, auto_bind_active_skus: true}')
+  --arg api_key "$AGENT_KEY" \
+  '{name: $name, agent_url: $agent_url, geo_code: $geo_code, api_key: $api_key, force: true, auto_bind_active_skus: true}')
 
 ENROLL_RESPONSE=$(curl -fsS -X POST "$ORCH_URL/v1/nodes/enroll" \
   -H "X-Netrun-Api-Key: $ORCH_API_KEY" \

@@ -200,120 +200,23 @@ else
   rm -f "$RESTORE_DROPIN"
 fi
 
-# ── 4) Install netrun-watchdog v3 (two-tier: restart, then reboot) ────
-log "Installing netrun-watchdog (v3 — restart-then-reboot for Vultr abuse-block)"
+# ── 4) Install netrun-watchdog v4 (restart; reboot only with the data plane down) ──
+# deploy/node/watchdog_probe.sh (audit 2026-10-08): /health failing 5 times in a
+# row → agent restart; 20 times → reboot ONLY when no 3proxy listens or no
+# probed SOCKS port answers; an egress / IPv6 self-check failure → alert +
+# agent restart, never a reboot (v3 rebooted after 20 failures whatever the
+# cause). The script used to be a heredoc here.
+log "Installing netrun-watchdog (v4 — restart; reboot only when the data plane is down)"
 
 WATCHDOG_SCRIPT="/opt/netrun/scripts/watchdog_probe.sh"
-mkdir -p /var/lib/netrun
-
-cat > "$WATCHDOG_SCRIPT" <<'WATCHDOG'
-#!/usr/bin/env bash
-# v3 watchdog with two tiers (Incident 2026-05-18 finding):
-#
-#   Tier 1: RESTART_THRESHOLD (5) consecutive /health fails →
-#           `systemctl restart netrun-node-agent`.
-#           Cooldown 10 min between restarts.
-#           Lечит локальные зависания node-agent.
-#
-#   Tier 2: REBOOT_THRESHOLD (20) consecutive fails — i.e. ~20 min
-#           continuous downtime → `reboot`.
-#           Cooldown 4 hours between reboots.
-#           Lечит Vultr abuse-network-block (VM Running но сетка blocked,
-#           SSH/8085 unreachable извне; reboot снимает block).
-#
-# v1 (rebooted at 3 fails) — too aggressive, daily reboots.
-# v2 (restart only, no reboot) — Vultr-block остаётся, ноды лежат намертво.
-# v3 (restart + reboot fallback) — компромисс: локальные зависания и
-# Vultr-block обрабатываются разной механикой.
-set -u
-STATE_FAIL="/var/lib/netrun/watchdog_failures"
-STATE_LAST_RESTART="/var/lib/netrun/watchdog_last_restart"
-STATE_LAST_REBOOT="/var/lib/netrun/watchdog_last_reboot"
-LOG_TAG="netrun-watchdog"
-RESTART_THRESHOLD=5
-RESTART_COOLDOWN_SEC=600
-REBOOT_THRESHOLD=20
-REBOOT_COOLDOWN_SEC=14400
-# Incident 2026-10-07: a 1500-proxy generation on a 2 vCPU node slows /health
-# past 5 s; the restart tier then killed the agent mid-generation, the job
-# failed, refill retried it, and so on. 15 s is still far below a dead agent.
-PROBE_TIMEOUT=15
-GENLOCK="/opt/netrun/jobs/.generation.lock"
-GENLOCK_MAX_AGE_SEC=1800
-
-current=$(cat "$STATE_FAIL" 2>/dev/null || echo 0)
-current=${current//[^0-9]/}
-: "${current:=0}"
-
-# A generation in progress is not an outage: do not count (or act on) a slow
-# probe while a fresh generation lock exists. A lock older than
-# GENLOCK_MAX_AGE_SEC is a leftover and does not shield anything.
-if [ -e "$GENLOCK" ]; then
-  lock_age=$(( $(date +%s) - $(stat -c %Y "$GENLOCK" 2>/dev/null || echo 0) ))
-  if [ "$lock_age" -lt "$GENLOCK_MAX_AGE_SEC" ]; then
-    exit 0
-  fi
-fi
-
-if curl --silent --fail --max-time "$PROBE_TIMEOUT" http://127.0.0.1:8085/health >/dev/null 2>&1; then
-  if [ "$current" -gt 0 ]; then
-    logger -t "$LOG_TAG" "recovery: was $current consecutive failures, now OK"
-    echo 0 > "$STATE_FAIL"
-  fi
-  exit 0
-fi
-
-new=$((current + 1))
-echo "$new" > "$STATE_FAIL"
-logger -t "$LOG_TAG" "probe failed ($new fails — restart@$RESTART_THRESHOLD, reboot@$REBOOT_THRESHOLD)"
-
-now=$(date +%s)
-
-# ── Tier 2: REBOOT after $REBOOT_THRESHOLD continuous failures ──
-if [ "$new" -ge "$REBOOT_THRESHOLD" ]; then
-  last_reboot=$(cat "$STATE_LAST_REBOOT" 2>/dev/null || echo 0)
-  last_reboot=${last_reboot//[^0-9]/}
-  : "${last_reboot:=0}"
-  elapsed=$((now - last_reboot))
-
-  if [ "$elapsed" -ge "$REBOOT_COOLDOWN_SEC" ]; then
-    logger -t "$LOG_TAG" "REBOOT — $REBOOT_THRESHOLD consecutive /health failures (~$(( new * 60 / 60 )) min downtime), last reboot ${elapsed}s ago"
-    echo "$now" > "$STATE_LAST_REBOOT"
-    echo 0 > "$STATE_FAIL"
-    /sbin/reboot
-    exit 0
-  else
-    logger -t "$LOG_TAG" "reboot threshold reached but in cooldown ($elapsed/${REBOOT_COOLDOWN_SEC}s) — waiting"
-    exit 0
-  fi
-fi
-
-# ── Tier 1: RESTART netrun-node-agent after $RESTART_THRESHOLD failures ──
-if [ "$new" -lt "$RESTART_THRESHOLD" ]; then
-  exit 0
-fi
-
-last_restart=$(cat "$STATE_LAST_RESTART" 2>/dev/null || echo 0)
-last_restart=${last_restart//[^0-9]/}
-: "${last_restart:=0}"
-elapsed=$((now - last_restart))
-
-if [ "$elapsed" -lt "$RESTART_COOLDOWN_SEC" ]; then
-  logger -t "$LOG_TAG" "restart threshold reached but in cooldown ($elapsed/${RESTART_COOLDOWN_SEC}s) — waiting"
-  exit 0
-fi
-
-logger -t "$LOG_TAG" "RESTART netrun-node-agent — $RESTART_THRESHOLD consecutive /health failures"
-echo "$now" > "$STATE_LAST_RESTART"
-# Note: do NOT reset STATE_FAIL here — let it keep counting up to REBOOT_THRESHOLD
-# in case restart didn't help (i.e. Vultr-block, not local hang).
-systemctl restart netrun-node-agent || logger -t "$LOG_TAG" "systemctl restart failed: $?"
-WATCHDOG
-chmod +x "$WATCHDOG_SCRIPT"
+WATCHDOG_SRC="$SELF_DIR/../deploy/node/watchdog_probe.sh"
+[ -f "$WATCHDOG_SRC" ] || fail "missing $WATCHDOG_SRC"
+mkdir -p /var/lib/netrun /opt/netrun/scripts
+install -m 0755 "$WATCHDOG_SRC" "$WATCHDOG_SCRIPT"
 
 cat > /etc/systemd/system/netrun-watchdog.service <<EOF
 [Unit]
-Description=NETRUN — /health watchdog (v3: restart-then-reboot tier)
+Description=NETRUN — /health watchdog (v4: restart; reboot only with the data plane down)
 After=netrun-node-agent.service
 
 [Service]
@@ -396,6 +299,18 @@ if [ -n "$_bgp_asn" ]; then
   fi
 fi
 
+# ── 5d) Audit 2026-10-08 security fixes ──────────────────────────
+# netrun-harden.sh secure (idempotent; nothing restarts 3proxy): atomic
+# ruleset saves + boot fallback (netrun-nft-persist), the 3proxy egress guard
+# (netrun-proxy-guard), credential files root-only, ssh keys only, unbound's
+# recursion from the node's own /64 of the routed prefix (after 5c, which
+# routes and announces it).
+_harden_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/netrun-harden.sh"
+if [ -f "$_harden_script" ]; then
+  log "Applying the 2026-10-08 security fixes (netrun-harden.sh secure)"
+  bash "$_harden_script" secure || warn "WARNING: netrun-harden.sh secure reported a failure — rerun it"
+fi
+
 # ── 6) Post-conditions ──────────────────────────────────────────
 log "─── Verification ───"
 printf "  restore unit  : "
@@ -406,8 +321,10 @@ printf "  watchdog next : "
 systemctl list-timers netrun-watchdog.timer --no-pager 2>/dev/null \
   | awk 'NR==2 {print $1, $2}'
 printf "  /health probe : "
-curl -s --max-time 3 http://127.0.0.1:8085/health >/dev/null \
-  && echo "200 OK" || echo "FAIL (watchdog will restart node-agent if persists)"
+curl -s --fail --max-time 15 http://127.0.0.1:8085/health >/dev/null \
+  && echo "200 OK (liveness)" || echo "FAIL (watchdog will restart node-agent if persists)"
+printf "  3proxy guard  : "
+{ nft list table inet netrun_proxy_guard 2>/dev/null | grep -q "meta skuid 65535 jump" && echo on; } || echo "OFF — run: netrun-proxy-guard apply"
 printf "  pid_max       : "
 cat /proc/sys/kernel/pid_max
 printf "  threads-max   : "

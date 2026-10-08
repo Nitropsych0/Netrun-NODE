@@ -20,6 +20,9 @@ process.env.NODE_AGENT_PROXY_ROOT = PROXY_ROOT;
 process.env.NODE_AGENT_JOBS_ROOT = path.join(TMP, "jobs");
 process.env.NODE_AGENT_IPV6_EGRESS_URL = "https://127.0.0.1:9/";
 process.env.PATH = `${BIN}:${process.env.PATH}`;
+process.env.NODE_AGENT_API_KEY = "test-key"; // audit 2026-10-08: the agent fails closed without a key
+process.env.NETRUN_ENV_FILE = path.join(TMP, "no-netrun.env");
+delete process.env.NETRUN_IPV6_ROUTED_PREFIX;
 // 18100 listens, 20000 does not; neither has a 3proxy process here.
 fs.writeFileSync(
   path.join(BIN, "ss"),
@@ -38,12 +41,12 @@ fs.writeFileSync(
 const test = require("node:test");
 const assert = require("node:assert");
 const http = require("http");
-const { server } = require("./server.js");
+const { server, apiKeyMatches } = require("./server.js");
 
-function get(port, p) {
+function get(port, p, key = "test-key") {
   return new Promise((resolve, reject) => {
     http
-      .get({ host: "127.0.0.1", port, path: p }, (res) => {
+      .get({ host: "127.0.0.1", port, path: p, headers: key === null ? {} : { "X-API-KEY": key } }, (res) => {
         let body = "";
         res.on("data", (c) => (body += c));
         res.on("end", () => resolve({ status: res.statusCode, json: JSON.parse(body) }));
@@ -51,6 +54,39 @@ function get(port, p) {
       .on("error", reject);
   });
 }
+
+// Audit 2026-10-08 — /health and /describe answered anyone. Without the key:
+// /health is a liveness 200 {ok:true} that leaks nothing (the node watchdog
+// and the orchestrator's reachability checks use it); everything else is 401.
+test("auth: /health without (or with a wrong) key = {ok:true} only; /describe, /jobs, /load need the key", { timeout: 30_000 }, async () => {
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const port = server.address().port;
+    for (const key of [null, "", "wrong-key", "test-key-and-more"]) {
+      const h = await get(port, "/health", key);
+      assert.strictEqual(h.status, 200, `liveness answers (key ${key})`);
+      assert.deepStrictEqual(h.json, { ok: true }, `nothing but ok (key ${key})`);
+      for (const p of ["/describe", "/jobs", "/load", "/instances", "/firewall/desired"]) {
+        const r = await get(port, p, key);
+        assert.strictEqual(r.status, 401, `${p} without the key (key ${key})`);
+      }
+    }
+    const d = await get(port, "/describe");
+    assert.strictEqual(d.status, 200, "describe with the key");
+    assert.strictEqual(d.json.api_key_required, true);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("auth: fail closed — no configured key matches nothing, not even an empty header", () => {
+  assert.strictEqual(apiKeyMatches("", ""), false);
+  assert.strictEqual(apiKeyMatches("anything", ""), false);
+  assert.strictEqual(apiKeyMatches(undefined, ""), false);
+  assert.strictEqual(apiKeyMatches("k", "k"), true);
+  assert.strictEqual(apiKeyMatches(" k ", "k"), true, "header whitespace trimmed as before");
+  assert.strictEqual(apiKeyMatches("K", "k"), false);
+});
 
 test("GET /health: old fields kept, cfg + address fields added", { timeout: 30_000 }, async () => {
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -65,6 +101,7 @@ test("GET /health: old fields kept, cfg + address fields added", { timeout: 30_0
       assert.ok(key in json, `pre-existing field ${key} kept`);
     }
     assert.strictEqual(json.service, "proxy-node-agent");
+    assert.strictEqual(json.ipv6EgressRouted, null, "no routed prefix configured: null");
     // Incident 2026-10-07 — duplicate reaper counters next to duplicateStatePresent.
     assert.strictEqual(json.duplicatesReaped, 0);
     assert.strictEqual(json.lastReapAt, null);

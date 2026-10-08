@@ -14,7 +14,10 @@ bash install_node_v2.sh
 > limits, DAD/MLD off, bounded 3proxy restore through the spawn helper, the
 > pinned TCP signature `deploy/node/99-zz-netrun-tcp.conf`, unbound resolver,
 > trend + IPv6-egress restore units). `install_node.sh` is now a thin shim that
-> execs v2, so either filename works on a fresh node.
+> execs v2, so either filename works on a fresh node. It also generates the
+> node-agent API key (`/etc/systemd/system/netrun-node-agent.service.d/20-api-key.conf`,
+> kept when present; the orchestrator needs it as `nodes.api_key`) and applies the
+> 2026-10-08 hardening (`netrun-harden.sh secure`, see "Security hardening" below).
 
 ## Archive Install
 
@@ -41,9 +44,16 @@ bash install_node_v2.sh
 ## Health Check
 
 ```bash
-curl http://127.0.0.1:8085/health | jq .
-bash scripts/smoke_health.sh
+KEY="$(sed -n 's/^Environment=NODE_AGENT_API_KEY=//p' /etc/systemd/system/netrun-node-agent.service.d/20-api-key.conf)"
+curl -H "X-API-KEY: $KEY" http://127.0.0.1:8085/health | jq .
+bash scripts/smoke_health.sh      # reads the key the same way
 ```
+
+Without the key (or with a wrong one) `/health` is a liveness answer only:
+`200 {"ok":true}`, no probes, nothing about the node (the node watchdog and the
+orchestrator's reachability checks use it). Every other endpoint answers 401 without
+the key, and an agent with no `NODE_AGENT_API_KEY` answers nothing else at all (fail
+closed, audit 2026-10-08).
 
 Expected health state:
 
@@ -76,6 +86,12 @@ Audit N2 additive fields (every older field is unchanged):
 | `cfgsLegacyDns` | `{count, items: [{startPort, nservers}]}` — cfgs whose `nserver` lines name a third-party resolver (the 2026-05 geo seed); the spawn helper rewrites them at the batch's next start |
 | `cfgsEgressFamily` | in `ipv6_only` egress mode: `{expectedFlag: "-6", mismatched, items: [{startPort, flags}]}` — cfgs that can leave over IPv4 (`-64`/`-46`/`-4`/no flag); `{expectedFlag: null, mismatched: null}` otherwise. Replaces the generator's dual-stack self-check, which the agent always skipped |
 | `nodeTuning` | `{ipLocalPortRange, ephemeralOverlapsProxyPorts, proxyListenFloor, tcpTimestamps, ipDefaultTtl, tcpRmem, pipeUserPagesSoft}` — `ephemeralOverlapsProxyPorts: true` is the 2026-10-07 5–7 % failure bug coming back |
+
+Audit 2026-10-08 additive field:
+
+| Field | Meaning |
+|---|---|
+| `ipv6EgressRouted` | `{ok, prefix, address, error, statusCode, observed, checkedAt, ttlSec}` — the canary (`NODE_AGENT_IPV6_EGRESS_URL`) fetched FROM `<the node's own /64>::1` of the routed prefix (`NETRUN_IPV6_ROUTED_PREFIX`, else `EGRESS_ROTATE_PREFIX`); `ok` only when it answers with that address. `ipv6Egress` leaves from the primary address, so a dead BGP session / local route used to look healthy while every /48 proxy was down: `ok: false` = stop selling the node's /48 proxies. Cached `NODE_AGENT_ROUTED_EGRESS_TTL_SEC` (60). `null` without a routed prefix. |
 
 `proxyReady` / `proxyReadiness` probe each instance on the same first socks port.
 The agent binds `NODE_AGENT_HOST` (default `0.0.0.0`; the unit template has always
@@ -299,10 +315,81 @@ Tests: `bash scripts/test_3proxy_spawn.sh`, `bash scripts/test_generator_flags.s
 `cd node_runtime/node_agent && node --test` (`supervisor`, `firewall`, `proxy_spawn`,
 `cfg_checks`, `server.n2`, `server.lift_exclude`).
 
+## Security hardening (audit 2026-10-08)
+
+`bash scripts/netrun-harden.sh secure` (installer and `node_followup_v2.sh` run it;
+existing nodes: `apply_capacity_tuning.sh --apply --only security`) — idempotent, never
+restarts 3proxy:
+
+- **3proxy egress guard** — `scripts/netrun-proxy-guard.sh` (installed as
+  `/usr/local/sbin/netrun-proxy-guard`): `table inet netrun_proxy_guard`, output hook,
+  `meta skuid 65535 jump proxy`; chain `proxy` keeps DNS to the local unbound and
+  replies, and rejects 127/8, 0/8, 10/8, 100.64/10, 169.254/16 (metadata), 172.16/12,
+  192.168/16, 224/4, the node's IPv4s, `::1`, fe80::/10, fc00::/7, ff00::/8, the NIC
+  /64(s) and the prefixes routed to the host (`ip -6 route show table local dev lo`).
+  Networks only (one /64 for any number of /128 anchors). Written to
+  `/etc/netrun/nft-proxy-guard.nft`, loaded in one transaction, re-applied after every
+  boot load by `nftables.service.d/netrun-proxy-guard.conf`. Re-run by
+  `netrun-bgp apply` and by the agent at start / when the routed prefixes change
+  (`EGRESS_PROXY_GUARD_BIN`, `off` = never). **Never `meta skuid != 65535 accept`**:
+  packets without a user socket (the kernel's NDP, MLD, ICMPv6 errors) make `meta skuid`
+  BREAK, skip that accept and hit the rejects — the hand-made first version did that,
+  and after the 22:5x reboots of 2026-10-08 neither node could resolve its IPv6 router.
+  `apply` refuses a text, and deletes a loaded table, in which a hooked chain holds
+  anything but `meta skuid <uid> jump|goto` (`netrun-proxy-guard check` = that test).
+- **Atomic ruleset saves** — `scripts/netrun-nft-persist.sh`
+  (`/usr/local/sbin/netrun-nft-persist`). Every writer of `/etc/nftables.conf` (the
+  generator, `/deprovision`, the 5-min `netrun-https sync`, `netrun-harden`, the
+  installer, `apply_capacity_tuning`, `clean_node`) calls `save`: one flock, a 0600
+  temp file checked with `nft -c -f` (an empty dump is refused), fsync, the whole
+  previous file kept as `.prev`, rename. The in-place `nft list ruleset >` left the
+  5 MB file empty for seconds of every sync. `install` replaces nftables.service's
+  `ExecStart` (drop-in `netrun-boot-fallback.conf`) with `boot-load`: the main file when
+  `nft -c -f` accepts it, else `.prev`.
+- **Credentials root-only** (`perms`) — 3proxy cfgs, start-up scripts, ipv6 / users /
+  backconnect lists, port maps, `egress_state.json` (0600 files, 0700 dirs), every job
+  directory, `/etc/nftables.conf*`, `netrun.env`. New files: `umask 077` in the agent,
+  the generator and each batch's start-up script (its cfg is also `chmod 600`ed when an
+  old one is overwritten); `egress_state.json` is written 0600. Nothing non-root reads
+  them: 3proxy parses its cfg as root before `setuid 65535` and never re-reads it,
+  haproxy reads `/etc/haproxy` + `/etc/netrun/tls`, everything else runs as root.
+- **SSH keys only** (`ssh`) — `/etc/ssh/sshd_config.d/00-netrun-hardening.conf`, the file
+  already on the live nodes; skipped while root has no authorized key; `sshd -t`, reload.
+- **DNS egress** (`dns-egress`) — see "Node's own /64" below.
+- **Agent API key** — see "Health Check"; **BIRD :179** — see the BGP section.
+
+### Node's own /64 of the routed prefix
+
+The LAST /64 of `NETRUN_IPV6_ROUTED_PREFIX` (`<prefix>:ffff::/64` of a /48;
+`2602:f2dc:a9:ffff::/64` on Chicago) belongs to the node and is never a proxy's: the
+generator's routed allocator and the agent's rotation (`egress.js nodeReservedNet`,
+not even when a full prefix makes addresses share a /64) skip it. unbound recurses from
+`<that /64>::53` (`/etc/unbound/unbound.conf.d/netrun-egress.conf`:
+`outgoing-interface: 0.0.0.0` — IPv4 recursion as before — plus
+`outgoing-interface: <net>::53`, `prefer-ip6: yes`; `do-ip4` untouched) instead of the
+primary IPv6 next to the customer exits; the `/48` self-check leaves from `<net>::1`.
+`dns-egress` writes it only while the prefix is routed to the host, checks it with
+`unbound-checkconf`, reloads unbound and verifies a lookup — a failure puts the old
+config back. Binding works through the local route + `net.ipv6.ip_nonlocal_bind=1`.
+
+### Node watchdog v4
+
+`deploy/node/watchdog_probe.sh` (`netrun-watchdog.timer`, every 60 s): `/health` failing 5
+times in a row → alert + agent restart (cooldown 10 min); 20 times → **reboot only when the
+data plane is down** (no 3proxy listener, or no probed SOCKS port of up to 3 batches
+answers the greeting; else an alert, proxies keep serving); `ipv6Egress` /
+`ipv6EgressRouted` false 5 times in a row → alert + agent restart (cooldown 30 min),
+never a reboot. Alerts: `journalctl -t netrun-watchdog -p err`, last one in
+`/var/lib/netrun/watchdog_alert`. The agent key is read from the unit drop-in.
+
+Tests: `scripts/test_netrun_proxy_guard.sh`, `test_nft_persist.sh`,
+`test_netrun_harden_security.sh`, `test_watchdog_probe.sh`; agent:
+`server.health_http.test.js` (auth), `server.routed_egress.test.js`.
+
 ## Self-describe (for orchestrator enroll)
 
 ```bash
-curl http://127.0.0.1:8085/describe | jq .
+curl -H "X-API-KEY: $KEY" http://127.0.0.1:8085/describe | jq .
 ```
 
 Returns a single JSON snapshot the orchestrator consumes via `POST /v1/nodes/enroll {agent_url}` — no per-node manual parameters required. Includes:
@@ -318,7 +405,7 @@ Returns a single JSON snapshot the orchestrator consumes via `POST /v1/nodes/enr
   `firewall_desired`: `POST /firewall/desired` is served; `supervisor`: dead batches are
   respawned — audit N2; `https_hostnames`: `POST /https/hostnames` is switched on — FO-08)
 
-Open access (mirrors `/health`); set `NODE_AGENT_API_KEY` only if you want auth on the write endpoints.
+Needs `X-API-KEY` (401 otherwise; since audit 2026-10-08 — it used to be open).
 
 ## HTTPS certificates for the node's DNS names (audit FO-08)
 
@@ -615,7 +702,7 @@ curl -X POST http://127.0.0.1:8085/accounts/32001/disable
 curl -X POST http://127.0.0.1:8085/accounts/32001/enable
 ```
 
-All three endpoints honor `X-API-KEY` if `NODE_AGENT_API_KEY` is set,
+All three endpoints need `X-API-KEY` (like every endpoint but the liveness `/health`),
 and are idempotent:
 
 - disabling an already-disabled port returns 200 `already_disabled`
@@ -835,7 +922,7 @@ the NIC (it still works there) and the GC deletes both copies once it has draine
 this one-time move takes as long as the old version's addresses need — ~25 s for a
 1024-address pool plus a hundred rotated ports.
 
-All endpoints honour `X-API-KEY`; at most 1000 ports per call; a port is the SOCKS port.
+All endpoints need `X-API-KEY`; at most 1000 ports per call; a port is the SOCKS port.
 
 ```bash
 # new random address for new connections (mode becomes static; the old one drains)
@@ -916,7 +1003,7 @@ gone (an address that cannot be re-added is forgotten: that port leaves from its
 until it is rotated again).
 
 Boot: the generator, `/deprovision`, `netrun-harden`, `netrun-https` and the install
-scripts save the whole ruleset (`nft list ruleset > /etc/nftables.conf`), this table
+scripts save the whole ruleset (`netrun-nft-persist save`), this table
 included. So that a reboot never maps ports to addresses that are not back yet, a
 drop-in on `nftables.service` deletes the table right after the boot load:
 
@@ -942,7 +1029,7 @@ IF="$(ip -6 route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev"
 ip -6 neigh show proxy dev "$IF" | awk -v d="$IF" 'NF { print "neigh del proxy " $1 " dev " d }' | ip -6 -force -batch -
 nft delete table ip6 netrun_egress          # every port leaves from its anchor again; the exit guard goes too
 rm -f /opt/netrun/proxyserver/egress_state.json /etc/sysctl.d/99-netrun-egress.conf
-nft list ruleset > /etc/nftables.conf       # the saved copy goes too
+netrun-nft-persist save                     # the saved copy goes too
 # the drop-in may stay (a missing table is ignored); proxy_ndp=1 with no entries is harmless
 ```
 
@@ -1014,8 +1101,15 @@ and `netrun-bgp apply --install` (or `node_followup_v2.sh`, which runs it when
 - `apply --dry-run` changes nothing: the prefix delta, routes missing now, the session
   parameters, and a diff (password redacted; "only the password changes" otherwise) of
   bird.conf, the unit and the drop-in.
-- `status`: each prefix's local route and the BGP session; `check`: exit 1 unless every
-  route exists and the session is Established.
+- `status`: each prefix's local route, the BGP session and the :179 guard; `check`: exit 1
+  unless every route exists, the session is Established and the :179 guard is loaded.
+- :179 guard (audit 2026-10-08: BIRD answered the whole internet on the primary IPv6):
+  `table inet netrun_bgp_guard` (input, priority filter - 20) accepts tcp dport 179 only
+  from `NETRUN_BGP_NEIGHBOR6` and drops the rest (IPv4 too); our own connection to the
+  neighbour has dport 179 on its side, so the session is untouched. `/etc/netrun/nft-bgp-guard.nft`,
+  checked with `nft -c` and loaded before BIRD is (re)configured, re-applied at boot by
+  `nftables.service.d/netrun-bgp-guard.conf`. After every apply `netrun-proxy-guard apply`
+  refreshes the 3proxy egress guard (it rejects the routed prefixes).
 - Restarting or stopping `netrun-bgp-prefix.service` restarts / stops BIRD with it
   (`Requires=`): the prefix is withdrawn before its route goes.
 - A second prefix on the same node: add it to `NETRUN_BGP_PREFIXES` (space separated)
@@ -1031,8 +1125,8 @@ and `netrun-bgp apply --install` (or `node_followup_v2.sh`, which runs it when
   before any local route is removed; a failure is an error with the old routes kept.
   `/etc/netrun/netrun.env` holding `NETRUN_BGP_PASSWORD` is made 0600.
 
-Tests: `bash scripts/test_netrun_bgp.sh` (stubs for ip/bird/birdc/systemctl; checks the
-order, idempotence, the dry run, a rejected config, a failed configure and its rerun,
+Tests: `bash scripts/test_netrun_bgp.sh` (stubs for ip/bird/birdc/systemctl/nft; checks the
+order, the :179 guard, idempotence, the dry run, a rejected config, a failed configure and its rerun,
 `none`, write failures, quoting, and that the generated bird.conf equals Chicago's
 hand-made one).
 

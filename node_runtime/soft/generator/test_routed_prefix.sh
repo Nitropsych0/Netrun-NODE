@@ -65,17 +65,29 @@ if routed_ipv6_addresses 2001:db8:d::/62 2 "$D3" "$D3/ipv6_2.list" > /dev/null 2
   fail "allocated a /64 of the egress state"
 fi
 echo 'not json' > "$D3/egress_state.json"
-routed_ipv6_addresses 2001:db8:d::/62 3 "$D3" "$D3/ipv6_3.list" > /dev/null || fail "an unreadable state blocks nothing"
+# d:1 is ipv6_1.list's, d:3 the node's own (the last /64): d:0 and d:2 are free
+routed_ipv6_addresses 2001:db8:d::/62 2 "$D3" "$D3/ipv6_3.list" > /dev/null || fail "an unreadable state blocks nothing"
 ok "egress_state.json: currents, pool and draining /64s are taken; junk entries and an unreadable file ignored"
+
+# ── 2c. the node's own /64 (the last of the prefix) is never a proxy's ──
+# (audit 2026-10-08: unbound's recursion <net>::53 and the agent's /48
+# self-check <net>::1 leave from it; egress.js nodeReservedNet skips it too)
+D4="$TMP/reserved"; mkdir -p "$D4"
+routed_ipv6_addresses 2001:db8:e::/62 3 "$D4" "$D4/ipv6_1.list" > "$D4/ipv6_1.list" || fail "/62: three /64s for proxies"
+grep -q '^2001:db8:e:3:' "$D4/ipv6_1.list" && fail "the node's own last /64 was handed out: $(cat "$D4/ipv6_1.list")"
+if routed_ipv6_addresses 2001:db8:e::/62 4 "$TMP/empty-dir" "$TMP/y.list" > /dev/null 2>&1; then
+  fail "a /62 gave its fourth (the node's) /64 to a proxy"
+fi
+ok "the node's own last /64 of the prefix (2001:db8:e:3::/64) is never allocated"
 
 # ── 3. exhaustion fails closed ────────────────────────────────────
 D2="$TMP/small"; mkdir -p "$D2"
-routed_ipv6_addresses 2001:db8:b::/60 16 "$D2" "$D2/ipv6_1.list" > "$D2/ipv6_1.list" || fail "/60 has 16 /64s"
+routed_ipv6_addresses 2001:db8:b::/60 15 "$D2" "$D2/ipv6_1.list" > "$D2/ipv6_1.list" || fail "/60 has 16 /64s, 15 for proxies"
 if routed_ipv6_addresses 2001:db8:b::/60 1 "$D2" "$D2/ipv6_2.list" > /dev/null 2>&1; then
   fail "allocated past the end of the prefix"
 fi
-if routed_ipv6_addresses 2001:db8:b::/60 17 "$TMP/empty-dir" "$TMP/x.list" > /dev/null 2>&1; then
-  fail "allocated 17 /64s of a /60"
+if routed_ipv6_addresses 2001:db8:b::/60 16 "$TMP/empty-dir" "$TMP/x.list" > /dev/null 2>&1; then
+  fail "allocated 16 /64s of a /60 (the last one is the node's)"
 fi
 if routed_ipv6_addresses 2001:db8:b::/72 1 "$TMP/empty-dir" "$TMP/x.list" > /dev/null 2>&1; then
   fail "accepted a prefix longer than /64"

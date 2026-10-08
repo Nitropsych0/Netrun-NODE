@@ -44,7 +44,20 @@
 #            retried — then verified: BIRD must hold exactly the list
 #         3. only then (NETRUN_BGP_WITHDRAW_WAIT later) the local routes of
 #            prefixes no longer announced go
-#       A real apply also installs this script as /usr/local/sbin/netrun-bgp.
+#       A real apply also installs this script as /usr/local/sbin/netrun-bgp,
+#       loads the :179 guard (below) and refreshes the 3proxy egress guard
+#       (netrun-proxy-guard apply: the routed prefixes are in its reject set).
+#
+#       :179 guard (audit 2026-10-08): BIRD listens on [::]:179 and answered
+#       the whole internet on the primary IPv6 (the exit guard only covers
+#       customer addresses). table inet netrun_bgp_guard (input, priority
+#       filter - 20, before the exit guard and accounting) accepts tcp dport
+#       179 from NETRUN_BGP_NEIGHBOR6 only and drops the rest (IPv4 too). The
+#       session itself is untouched: the neighbour stays allowed, and our own
+#       connection to it has dport 179 on ITS side. Written to
+#       /etc/netrun/nft-bgp-guard.nft (when changed), loaded in one transaction,
+#       re-applied after every boot load by the nftables.service drop-in
+#       netrun-bgp-guard.conf.
 #       Boot: netrun-bgp-prefix.service (oneshot, one ExecStart per prefix) adds
 #       the routes; a bird.service drop-in Requires= it and orders bird After= it,
 #       so bird never announces before the routes exist.
@@ -58,6 +71,10 @@ BIRD_CONF="${NETRUN_BGP_BIRD_CONF:-/etc/bird/bird.conf}"
 UNIT_DIR="${NETRUN_BGP_UNIT_DIR:-/etc/systemd/system}"
 LIST_FILE="${NETRUN_BGP_LIST_FILE:-/etc/netrun/bgp-prefixes}"
 SELF="${NETRUN_BGP_SELF:-/usr/local/sbin/netrun-bgp}"
+GUARD_FILE="${NETRUN_BGP_GUARD_FILE:-/etc/netrun/nft-bgp-guard.nft}"
+GUARD_TABLE="netrun_bgp_guard"
+# the 3proxy egress guard to refresh after a prefix change ("off" = none)
+PROXY_GUARD="${NETRUN_BGP_PROXY_GUARD:-}"
 UNIT="netrun-bgp-prefix.service"
 PROTO="vultr6"
 
@@ -190,6 +207,67 @@ WantedBy=multi-user.target
 EOF
 }
 
+guard_text() {  # <neighbor6>
+  cat <<EOF
+# NETRUN — BIRD's tcp/179 only for the BGP neighbour $1 (audit 2026-10-08).
+# Written by netrun-bgp (scripts/netrun-bgp.sh): do not edit, run \`netrun-bgp apply\`.
+table inet ${GUARD_TABLE}
+delete table inet ${GUARD_TABLE}
+table inet ${GUARD_TABLE} {
+  chain input {
+    type filter hook input priority filter - 20; policy accept;
+    iifname "lo" accept
+    tcp dport 179 ip6 saddr $1 accept
+    tcp dport 179 drop
+  }
+}
+EOF
+}
+
+guard_dropin_text() {  # <nft binary>
+  cat <<EOF
+# NETRUN — re-apply the BGP :179 guard after the boot load (netrun-bgp, audit 2026-10-08)
+[Service]
+ExecStartPost=-$1 -f ${GUARD_FILE}
+EOF
+}
+
+# Load the :179 guard (checked first); the drop-in re-applies it at boot.
+apply_guard() {
+  local text tmp nft_bin
+  command -v nft >/dev/null 2>&1 || die "nft not found (the :179 guard needs it)"
+  text="$(guard_text "$NEIGHBOR6")"
+  tmp="$(mktemp)"
+  printf '%s\n' "$text" > "$tmp"
+  if ! nft -c -f "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    die "nft rejects the :179 guard for neighbour $NEIGHBOR6; nothing changed"
+  fi
+  rm -f "$tmp"
+  if write_if_changed "$GUARD_FILE" 0644 - "$text"; then log "wrote $GUARD_FILE"; fi
+  nft -f "$GUARD_FILE" || die "nft -f $GUARD_FILE failed"
+  nft_bin="$(command -v nft)"
+  case "$nft_bin" in /*) ;; *) nft_bin=/usr/sbin/nft ;; esac
+  if write_if_changed "$UNIT_DIR/nftables.service.d/netrun-bgp-guard.conf" 0644 - "$(guard_dropin_text "$nft_bin")"; then
+    return 0   # the caller's daemon-reload covers it
+  fi
+  return 1
+}
+
+# The 3proxy egress guard rejects the routed prefixes: refresh it after a
+# change (best effort — BGP is up either way).
+refresh_proxy_guard() {
+  local g="$PROXY_GUARD" here
+  if [ -z "$g" ]; then
+    here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P || true)"
+    for g in /usr/local/sbin/netrun-proxy-guard "$here/netrun-proxy-guard.sh" ""; do
+      [ -n "$g" ] && [ -f "$g" ] && break
+    done
+  fi
+  [ -n "$g" ] && [ "$g" != off ] && [ -f "$g" ] || { log "netrun-proxy-guard not installed — 3proxy egress guard not refreshed"; return 0; }
+  bash "$g" apply >/dev/null || log "WARNING: netrun-proxy-guard apply failed — rerun it by hand"
+}
+
 bird_dropin_text() {
   cat <<EOF
 # Written by netrun-bgp: never announce before the local routes exist.
@@ -318,6 +396,7 @@ cmd_apply() {
     dry_diff bird.conf "$BIRD_CONF" "$conf"
     dry_diff "$UNIT" "$UNIT_DIR/$UNIT" "$unit"
     dry_diff "bird drop-in" "$UNIT_DIR/bird.service.d/netrun.conf" "$dropin"
+    dry_diff ":179 guard" "$GUARD_FILE" "$(guard_text "$NEIGHBOR6")"
     return 0
   fi
 
@@ -341,8 +420,10 @@ cmd_apply() {
   # 1. local routes for every announced prefix (new ones before BIRD sees them)
   for p in "${new[@]}"; do ip -6 route replace local "$p" dev lo; done
 
-  # boot: the routes unit and the bird ordering
+  # boot: the routes unit and the bird ordering; the :179 guard before BIRD
+  # (re)starts listening
   local units_changed=0
+  apply_guard && units_changed=1
   write_if_changed "$UNIT_DIR/$UNIT" 0644 - "$unit" && units_changed=1
   write_if_changed "$UNIT_DIR/bird.service.d/netrun.conf" 0644 - "$dropin" && units_changed=1
   if [ "$units_changed" = 1 ]; then systemctl daemon-reload; fi
@@ -381,6 +462,7 @@ cmd_apply() {
   fi
   write_if_changed "$LIST_FILE" 0644 - "$PREFIXES" || true
   install_self
+  refresh_proxy_guard
   log "announced: ${new[*]:-none}"
 }
 
@@ -391,6 +473,7 @@ cmd_status() {
     if has_local_route "$p"; then echo "route  $p  local dev lo: yes"; else echo "route  $p  local dev lo: MISSING"; fi
   done
   birdc show protocols "$PROTO" 2>/dev/null | tail -n +2 || echo "bird: not running"
+  if nft list table inet "$GUARD_TABLE" >/dev/null 2>&1; then echo ":179 guard: loaded (only $NEIGHBOR6)"; else echo ":179 guard: NOT loaded"; fi
 }
 
 cmd_check() {
@@ -399,6 +482,9 @@ cmd_check() {
   for p in $PREFIXES; do has_local_route "$p" || { echo "missing local route: $p"; bad=1; }; done
   if ! birdc show protocols "$PROTO" 2>/dev/null | grep -q Established; then
     echo "BGP session $PROTO is not Established"; bad=1
+  fi
+  if ! nft list table inet "$GUARD_TABLE" 2>/dev/null | grep -q "tcp dport 179 drop"; then
+    echo "the :179 guard (table inet $GUARD_TABLE) is not loaded"; bad=1
   fi
   [ "$bad" = 0 ] && echo "ok"
   return "$bad"

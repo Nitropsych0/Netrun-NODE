@@ -175,7 +175,7 @@ unset -f od
   # called in the generator's own shell (not inside $(...)).
   get_subnet_mask() { if [ -z "$subnet_mask" ]; then ip -6 addr >/dev/null; subnet_mask="2001:db8:0:1"; fi; echo "$subnet_mask"; }
   log_err_and_exit() { echo "EXIT $1"; exit 3; }
-  subnet=64; subnet_mask=""; proxy_count=200; random_ipv6_list_file="$TMP/ipv6_18100.list"
+  subnet=64; subnet_mask=""; proxy_count=200; random_ipv6_list_file="$TMP/ipv6_18100.list"; routed_prefix=""
   generate_ipv6_addresses_if_needed >/dev/null
   [ "$(wc -l < "$TMP/ipv6_18100.list" | tr -d ' ')" = 200 ] || fail "list size"
   [ "$(wc -l < "$IP_CALLS" | tr -d ' ')" = 2 ] || fail "expected 2 ip calls (prefix + one snapshot) for 200 addresses: $(cat "$IP_CALLS")"
@@ -219,6 +219,14 @@ grep -qx "helper BIN=$TMP/h1/proxyserver/3proxy/bin/3proxy $TMP/h1/proxyserver/3
   || fail "spawn helper not called with the cfg: $(cat "$TMP/helper_calls" 2>/dev/null)"
 grep -qx 'address add 2001:db8:0:1::a/128 dev eth9 nodad preferred_lft 0' "$TMP/batch" || fail "deprecated /128 anchor: $(cat "$TMP/batch")"
 grep -qE '^[[:space:]]*maxconn 512$' "$TMP/h1/proxyserver/3proxy/3proxy_18100.cfg" || fail "cfg maxconn 512"
+# Audit 2026-10-08 — the cfg names customer logins / passwords: root-only,
+# also when an older 0644 cfg is overwritten; the generator itself runs umask 077.
+cfgmode() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+[ "$(cfgmode "$TMP/h1/proxyserver/3proxy/3proxy_18100.cfg")" = 600 ] || fail "cfg mode $(cfgmode "$TMP/h1/proxyserver/3proxy/3proxy_18100.cfg")"
+chmod 0644 "$TMP/h1/proxyserver/3proxy/3proxy_18100.cfg"
+PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$S" >/dev/null 2>&1 || fail "start-up script rerun"
+[ "$(cfgmode "$TMP/h1/proxyserver/3proxy/3proxy_18100.cfg")" = 600 ] || fail "an overwritten 0644 cfg stays readable"
+grep -qx 'umask 077' "$GEN" && grep -qE '^[[:space:]]+umask 077$' "$GEN" || fail "umask 077 in the generator and its start-up script"
 rm -f "$TMP/h1/proxyserver/ipv6_18100.list" "$TMP/helper_calls"
 PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$S" >/dev/null 2>&1 && fail "start-up script ran without its address list"
 [ ! -f "$TMP/helper_calls" ] || fail "spawned a batch with no address list"
@@ -238,6 +246,6 @@ mk_script false False || fail "create_startup_script (False)"
 rm -f "$TMP/batch"
 PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$TMP/hfalse/proxyserver/proxy-startup_18100.sh" >/dev/null 2>&1
 grep -qx 'address add 2001:db8:0:1::a/128 dev eth9 nodad' "$TMP/batch" || fail "NETRUN_ANCHOR_DEPRECATE=False: $(cat "$TMP/batch" 2>/dev/null)"
-ok "start-up script: spawn helper with the cfg, refuses a missing address list, NETRUN_ANCHOR_DEPRECATE=0/off/OFF/False adds preferred anchors"
+ok "start-up script: spawn helper with the cfg (0600, umask 077), refuses a missing address list, NETRUN_ANCHOR_DEPRECATE=0/off/OFF/False adds preferred anchors"
 
 echo "test_generator_flags.sh — all $PASS checks passed"

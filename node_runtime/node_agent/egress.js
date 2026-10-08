@@ -147,6 +147,7 @@ const DEFAULT_MAX_EXTRA_ADDRS = 40000;
 const DEFAULT_NFT_DROPIN = "/etc/systemd/system/nftables.service.d/netrun-egress.conf";
 const DEFAULT_SYSCTL_CONF = "/etc/sysctl.d/99-netrun-egress.conf";
 const DEFAULT_PROC_SYS = "/proc/sys";
+const DEFAULT_PROXY_GUARD_BIN = "/usr/local/sbin/netrun-proxy-guard";
 // More candidate primary addresses than this → none (parsePrimaryAddrs): the
 // /64 then carries something unexpected, and the guard must not open it all.
 const MAX_PRIMARY_ADDRS = 8;
@@ -340,6 +341,29 @@ function rotationPrefix(configured, routed) {
   return covered ? { prefix: canon, problem: null } : { prefix: null, problem: `${canon} is not routed to this host (no local route on lo)` };
 }
 
+// The node's OWN /64 of a routed prefix — the LAST /64 of it
+// (<prefix>:ffff::/64 of a /48) — as a BigInt /64 key, or null for a prefix
+// of /64 or longer (nothing to reserve) or not a prefix. Never a proxy's
+// (usedNets, the generator's routed allocator): unbound's recursion leaves
+// from <net>::53 and the agent's /48 egress self-check from <net>::1
+// (audit 2026-10-08: both used to leave from the primary address, next to the
+// customer exits). Same rule in netrun-harden.sh (reserved_net).
+function nodeReservedNet(prefixText) {
+  const canon = canonicalRoutedPrefix(prefixText);
+  if (!canon) return null;
+  const [addr, len] = canon.split("/");
+  const plen = Number(len);
+  if (plen >= 64) return null;
+  return (groupsToBig(ipv6Groups(addr)) >> 64n) + (1n << BigInt(64 - plen)) - 1n;
+}
+
+// <the node's /64>::<host> of a routed prefix (host 0x53 = unbound, 1 = the
+// /48 self-check), or null (nodeReservedNet).
+function nodeReservedAddress(prefixText, host = 1n) {
+  const net = nodeReservedNet(prefixText);
+  return net === null ? null : formatIpv6(bigToGroups((net << 64n) | BigInt(host)));
+}
+
 // Whether `addr` is inside one of the routed prefixes: such an address is
 // local already (the `local … dev lo` route) and needs no proxy entry.
 function inRoutedPrefix(addr, routed) {
@@ -361,8 +385,9 @@ function inRoutedPrefix(addr, routed) {
 // is (or, while picking, becomes) dense — under half free, up to 2^20 /64s —
 // from the list of its free /64s. With
 // no free /64 left an address shares one (counted in `shared`) rather than
-// failing the call. Returns { addrs, shared }.
-function generateRoutedAddresses(prefixText, count, usedNets, randomBytes = crypto.randomBytes) {
+// failing the call — never one of `never` (the node's own /64,
+// nodeReservedNet). Returns { addrs, shared }.
+function generateRoutedAddresses(prefixText, count, usedNets, randomBytes = crypto.randomBytes, never = new Set()) {
   const [addrText, lenText] = String(prefixText).split("/");
   const nets = 1n << BigInt(64 - Number(lenText));
   const base = (groupsToBig(ipv6Groups(addrText)) >> 64n) & ~(nets - 1n);
@@ -370,6 +395,7 @@ function generateRoutedAddresses(prefixText, count, usedNets, randomBytes = cryp
   const anyNet = () => base + (rand64() & (nets - 1n));
   const used = new Set();
   for (const k of usedNets) if (k >= base && k < base + nets) used.add(k);
+  for (const k of never) if (k >= base && k < base + nets) used.add(k);
   // the free list, built once the prefix is (or, while picking, becomes) dense
   let free = null;
   const dense = () => nets <= 1n << 20n && (nets - BigInt(used.size)) * 2n < nets;
@@ -395,7 +421,8 @@ function generateRoutedAddresses(prefixText, count, usedNets, randomBytes = cryp
       }
     }
     if (net === null) {
-      net = anyNet();
+      for (let i = 0; i < 256 && (net === null || never.has(net)); i += 1) net = anyNet();
+      if (never.has(net)) throw new Error("address_generation_exhausted");
       shared += 1;
     }
     used.add(net);
@@ -1102,13 +1129,16 @@ function execCapture(cmd, args, { timeoutMs = 30000 } = {}) {
 // tmp + fsync + rename (+ directory fsync): a crash leaves the old file or
 // the new one, never a torn one. A failed write removes its tmp: a partial
 // one left by ENOSPC would hold the space the next write (or the nft
-// rollback's script file) needs.
-function writeFileAtomic(filePath, text) {
+// rollback's script file) needs. `mode` is set explicitly (not left to the
+// umask): 0600 by default — egress_state.json maps customer ports to their
+// exit addresses (audit 2026-10-08); the sysctl / unit files pass 0644.
+function writeFileAtomic(filePath, text, mode = 0o600) {
   const tmp = `${filePath}.tmp`;
   const buf = Buffer.from(text, "utf-8");
   try {
-    const fd = fs.openSync(tmp, "w");
+    const fd = fs.openSync(tmp, "w", mode);
     try {
+      fs.fchmodSync(fd, mode);
       let off = 0;
       while (off < buf.length) off += fs.writeSync(fd, buf, off, buf.length - off);
       fs.fsyncSync(fd);
@@ -1159,6 +1189,10 @@ function readConfig(env) {
     procSys: path.normalize(String(env.EGRESS_PROC_SYS || "").trim() || DEFAULT_PROC_SYS),
     // "off" = no chain exit_guard (anything else, unset included, = on)
     exitGuard: String(env.EGRESS_EXIT_GUARD || "").trim().toLowerCase() !== "off",
+    // the 3proxy egress guard script run when the routed prefixes change; "off" = none
+    proxyGuardBin: String(env.EGRESS_PROXY_GUARD_BIN || "").trim().toLowerCase() === "off"
+      ? null
+      : path.normalize(String(env.EGRESS_PROXY_GUARD_BIN || "").trim() || DEFAULT_PROXY_GUARD_BIN),
   };
 }
 
@@ -1309,9 +1343,22 @@ function createEgressService({
     return out;
   }
 
-  // Every /64 in use: cfg anchors, the generator's lists, this module's addresses.
+  // The node's own /64 of the routed prefix (and of the rotation prefix):
+  // never a proxy's, not even shared (nodeReservedNet).
+  function reservedNets() {
+    const out = new Set();
+    for (const p of [nodeSetting("NETRUN_IPV6_ROUTED_PREFIX", "", { env }), rotation]) {
+      const k = nodeReservedNet(p);
+      if (k !== null) out.add(k);
+    }
+    return out;
+  }
+
+  // Every /64 in use: cfg anchors, the generator's lists, this module's
+  // addresses, and the node's own /64 (reservedNets).
   function usedNets(cfgAnchors, s) {
     const out = readListNets();
+    for (const k of reservedNets()) out.add(k);
     const add = (a) => {
       const k = net64Of(a);
       if (k !== null) out.add(k);
@@ -1324,6 +1371,18 @@ function createEgressService({
 
   function rebuildScript(s) {
     return nftRebuildScript(s, prefix.text, { exitGuard: cfg.exitGuard, primary, routed });
+  }
+
+  // Audit 2026-10-08 — the 3proxy egress guard (scripts/netrun-proxy-guard.sh)
+  // rejects the node's prefixes for uid 65535: refreshed at start and when
+  // the routed prefixes change. Best effort, never fails the caller.
+  async function refreshProxyGuard(why) {
+    const bin = cfg.proxyGuardBin;
+    if (!bin || !fs.existsSync(bin)) return null;
+    const res = await run("bash", [bin, "apply"], { timeoutMs: 120000 });
+    if (res.code !== 0) log.error(`[egress] netrun-proxy-guard apply (${why}) failed: ${stderrOf(res)}`);
+    else log.log(`[egress] netrun-proxy-guard applied (${why})`);
+    return res;
   }
 
   // The routed prefixes now (null: the listing failed — keep what we have).
@@ -1389,7 +1448,7 @@ function createEgressService({
   async function runWithFile(ext, text, cmd, args, timeoutMs) {
     const file = tmpFile(ext);
     try {
-      fs.writeFileSync(file, text);
+      fs.writeFileSync(file, text, { mode: 0o600 });
     } catch (err) {
       return { code: -1, stdout: "", stderr: `tmp_write_failed: ${errText(err)}` };
     }
@@ -1500,7 +1559,7 @@ function createEgressService({
     const acceptRa = pinnedRa || (current !== null && current.split("\n").includes(raLine));
     const text = sysctlConfText(iface, { acceptRa });
     if (current === text) return { changed: false };
-    writeFileAtomic(file, text);
+    writeFileAtomic(file, text, 0o644);
     log.log(`[egress] wrote ${file}`);
     return { changed: true };
   }
@@ -1659,8 +1718,10 @@ function createEgressService({
       // the routes now (guard off, rotation off): they must not be dropped blind
       if (wantsRouted() || addressesOf(s).some((a) => !needsProxy(a))) {
         const r = await detectRouted();
-        if (r) routed = r;
-        else routedKnown = false;
+        if (r) {
+          routed = r;
+          await refreshProxyGuard("start");
+        } else routedKnown = false;
       }
       updateRotation();
       const addrs = addressesOf(s);
@@ -1751,7 +1812,7 @@ function createEgressService({
   // … dev lo` route), so nothing is provisioned — the address is journaled and
   // usable at once. Each one gets a /64 nothing else uses.
   function provisionRouted(before, count, cfgAnchors, nowMs) {
-    const { addrs, shared } = generateRoutedAddresses(rotation, count, usedNets(cfgAnchors, before), randomBytes);
+    const { addrs, shared } = generateRoutedAddresses(rotation, count, usedNets(cfgAnchors, before), randomBytes, reservedNets());
     if (shared) log.error(`[egress] ${rotation}: no free /64 left; ${shared} address(es) share a /64`);
     const journal = cloneState(before);
     for (const a of addrs) addDraining(journal, a, nowMs);
@@ -1927,6 +1988,7 @@ function createEgressService({
         log.log(`[egress] routed ${routed.join(",") || "none"} -> ${r.join(",") || "none"}`);
         routed = r;
         if (cfg.exitGuard) changed = true;
+        await refreshProxyGuard("routed prefixes changed");
       }
     }
     updateRotation();
@@ -2145,7 +2207,7 @@ function createEgressService({
     try { current = fs.readFileSync(file, "utf-8"); } catch {}
     if (current === text) return { changed: false };
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    writeFileAtomic(file, text);
+    writeFileAtomic(file, text, 0o644);
     log.log(`[egress] wrote ${file}`);
     const res = await run("systemctl", ["daemon-reload"], { timeoutMs: 60000 });
     if (res.code !== 0) log.error(`[egress] systemctl daemon-reload: ${stderrOf(res)}`);
@@ -2239,6 +2301,8 @@ module.exports = {
   parseRoutedPrefixes,
   rotationPrefix,
   inRoutedPrefix,
+  nodeReservedNet,
+  nodeReservedAddress,
   net64Of,
   generateAddresses,
   generateRoutedAddresses,

@@ -85,6 +85,10 @@
 # one flock (/run/netrun/https-sync.lock): the generator, the timer and
 # /deprovision call it concurrently.
 set -euo pipefail
+# Audit 2026-10-08 — a batch's start-up script (umask 077, it writes customer
+# credentials) also runs `netrun-https sync`: keep this script's own file modes
+# (haproxy frontends 0644; certificates are written 0600 explicitly).
+umask 022
 
 PROXY_DIR="${NETRUN_PROXY_DIR:-/opt/netrun/proxyserver/3proxy}"
 PROXY_BIN="$PROXY_DIR/bin/3proxy"
@@ -132,6 +136,18 @@ setting_off() {
     0|off|false|no) return 0 ;;
   esac
   return 1
+}
+
+# Audit 2026-10-08 — the ruleset reaches /etc/nftables.conf only through
+# netrun-nft-persist (atomic, one lock for every writer, .prev kept). Without
+# it (a node not yet given the code): an atomic temp + rename here.
+nft_persist() {
+  local h t
+  for h in "${NETRUN_NFT_PERSIST_BIN:-}" /usr/local/sbin/netrun-nft-persist /opt/netrun/scripts/netrun-nft-persist.sh; do
+    if [ -n "$h" ] && [ -f "$h" ]; then bash "$h" save "$@"; return; fi
+  done
+  t="$(mktemp "$(dirname "${NETRUN_NFT_CONF:-/etc/nftables.conf}")/.nftables.conf.XXXXXX")" || return 1
+  if nft list ruleset > "$t" && [ -s "$t" ]; then mv -f "$t" "${NETRUN_NFT_CONF:-/etc/nftables.conf}"; else rm -f "$t"; return 1; fi
 }
 
 public_ipv4() {
@@ -971,8 +987,9 @@ fix_accounting() {
     fi
   done
   # Always persisted (as before): the 5-min sync is also what snapshots the
-  # counter VALUES into /etc/nftables.conf for a reboot.
-  nft list ruleset > /etc/nftables.conf
+  # counter VALUES into /etc/nftables.conf for a reboot. Atomically, under the
+  # writers' shared lock (netrun-nft-persist); a refused save keeps the old file.
+  nft_persist || log "WARNING: the ruleset was not persisted (the previous /etc/nftables.conf is kept)"
 }
 
 # ── commands ──────────────────────────────────────────────────────

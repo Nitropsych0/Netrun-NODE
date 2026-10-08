@@ -121,6 +121,7 @@ case "\$*" in
   "list table inet proxy_normalization") [ -n "\${NORM_DIR:-}" ] && [ -f "\$NORM_DIR/table.txt" ] && { cat "\$NORM_DIR/table.txt"; exit 0; }; exit 1 ;;
   "-a list chain inet proxy_normalization output") [ -n "\${NORM_DIR:-}" ] && cat "\$NORM_DIR/output.txt" ;;
   "-a list chain inet proxy_normalization postrouting") [ -n "\${NORM_DIR:-}" ] && cat "\$NORM_DIR/postrouting.txt" ;;
+  -c\ -f\ *) exit 0 ;;
   -f\ *) cp "\$2" "$TMP/nft_batch.applied"; [ "\${NFT_FAIL:-0}" = 1 ] && { echo "Error: Could not process rule" >&2; exit 1; }; exit 0 ;;
   *) exit 1 ;;
 esac
@@ -431,6 +432,7 @@ printf '[Service]\nExecStart=/opt/netrun/scripts/restore-3proxy.sh\n' > "$R/etc/
 printf '#!/usr/bin/env bash\n# heredoc copy\n' > "$R/opt/netrun/scripts/restore-3proxy.sh"
 printf '[Service]\nType=oneshot\nExecStart=/usr/local/sbin/netrun-https sync\n' > "$R/etc/systemd/system/netrun-https-sync.service"
 mkdir -p "$R/usr/local/sbin"; printf '#!/usr/bin/env bash\n# copy taken at setup\n' > "$R/usr/local/sbin/netrun-https"
+printf '#!/usr/bin/env bash\n# watchdog v3 heredoc copy\n' > "$R/opt/netrun/scripts/watchdog_probe.sh"
 rc="$(run_tool "$R" --apply --only units)"
 [ "$rc" = 2 ] && grep -qE 'units +REFUSED .*restore_3proxy.sh' "$TMP/out" || { cat "$TMP/out"; fail "units must refuse before the code is deployed"; }
 cp "$REPO_ROOT/scripts/restore_3proxy.sh" "$REPO_ROOT/scripts/netrun-3proxy-spawn.sh" "$R/opt/netrun/scripts/"
@@ -440,7 +442,7 @@ rc="$(run_tool "$R" --only units)"
 chmod 0644 "$R/opt/netrun/scripts/restore_3proxy.sh"   # a deploy that lost the exec bit
 grep -qE 'units +would-apply .*restore-unit' "$TMP/out" || { cat "$TMP/out"; fail "units plan"; }
 rc="$(run_tool "$R" --only units)"
-grep -qE 'units +would-apply .*restore-unit exec-bits legacy-restore-script https-sync-killmode netrun-https-copy' "$TMP/out" || { cat "$TMP/out"; fail "units plan"; }
+grep -qE 'units +would-apply .*restore-unit exec-bits legacy-restore-script https-sync-killmode netrun-https-copy watchdog-v4' "$TMP/out" || { cat "$TMP/out"; fail "units plan"; }
 rc="$(run_tool "$R" --apply --only units)"
 [ "$rc" = 0 ] || { cat "$TMP/out"; fail "units apply exit $rc"; }
 cmp -s "$REPO_ROOT/deploy/node/netrun-3proxy-restore.service" "$R/etc/systemd/system/netrun-3proxy-restore.service" || fail "restore unit not the repo unit"
@@ -448,12 +450,33 @@ grep -qx 'ExecStart=/opt/netrun/scripts/restore_3proxy.sh' "$R/etc/systemd/syste
 [ ! -e "$R/opt/netrun/scripts/restore-3proxy.sh" ] || fail "legacy restore-3proxy.sh kept"
 grep -qx 'KillMode=process' "$R/etc/systemd/system/netrun-https-sync.service.d/10-killmode.conf" || fail "https-sync KillMode drop-in"
 cmp -s "$REPO_ROOT/scripts/netrun-https.sh" "$R/usr/local/sbin/netrun-https" || fail "netrun-https copy not refreshed"
+cmp -s "$REPO_ROOT/deploy/node/watchdog_probe.sh" "$R/opt/netrun/scripts/watchdog_probe.sh" && [ -x "$R/opt/netrun/scripts/watchdog_probe.sh" ] || fail "watchdog v4 not installed"
 [ -x "$R/opt/netrun/scripts/restore_3proxy.sh" ] || fail "restore script not executable"
 grep -qx 'systemctl daemon-reload' "$CALLS" || fail "no daemon-reload"
 ! grep -qE 'systemctl (start|stop|restart|reload) ' "$CALLS" || { cat "$CALLS"; fail "units step started/stopped something"; }
 rc="$(run_tool "$R" --apply --only units)"
 [ "$rc" = 0 ] && grep -qE '\] units +ok ' "$TMP/out" || { cat "$TMP/out"; fail "units rerun not ok"; }
-ok "units: restore unit -> repo restore_3proxy.sh (+ legacy copy gone), https-sync KillMode=process, netrun-https refreshed, daemon-reload only; refuses before the code deploy"
+ok "units: restore unit -> repo restore_3proxy.sh (+ legacy copy gone), https-sync KillMode=process, netrun-https + watchdog v4 refreshed, daemon-reload only; refuses before the code deploy"
+
+# ── 16b. security (opt-in, audit 2026-10-08): netrun-harden.sh secure from the repo ─
+FAKE="$TMP/fakerepo"; mkdir -p "$FAKE/scripts"
+printf '#!/usr/bin/env bash\necho "harden $*" >> "%s"\n[ "$1" = status ] && echo "[netrun-harden] 2026-10-08 3proxy egress guard: OFF"\n[ "${HARDEN_FAIL:-0}" = 1 ] && [ "$1" = secure ] && exit 1\nexit 0\n' "$CALLS" > "$FAKE/scripts/netrun-harden.sh"
+printf '#!/usr/bin/env bash\necho "guard $*" >> "%s"\n' "$CALLS" > "$FAKE/scripts/netrun-proxy-guard.sh"
+R="$(new_root security)"
+before="$(snapshot "$R")"
+rc="$(PATH="$BIN:$PATH" NETRUN_TUNE_ROOT="$R" NETRUN_TUNE_REPO="$FAKE" bash "$SCRIPT" --only security > "$TMP/out" 2>&1; echo $?)"
+[ "$rc" = 0 ] && grep -qE 'security +would-apply' "$TMP/out" && grep -qx 'guard apply --dry-run' "$CALLS" && ! grep -q 'harden secure' "$CALLS" \
+  || { cat "$TMP/out"; cat "$CALLS"; fail "security dry run"; }
+grep -q '3proxy egress guard: OFF' "$TMP/out" || fail "security dry run shows the status"
+[ "$before" = "$(snapshot "$R")" ] || fail "security dry run changed files"
+: > "$CALLS"
+rc="$(PATH="$BIN:$PATH" NETRUN_TUNE_ROOT="$R" NETRUN_TUNE_REPO="$FAKE" bash "$SCRIPT" --apply --only security > "$TMP/out" 2>&1; echo $?)"
+[ "$rc" = 0 ] && grep -qx 'harden secure' "$CALLS" && grep -qE 'security +applied' "$TMP/out" || { cat "$TMP/out"; fail "security apply"; }
+rc="$(PATH="$BIN:$PATH" NETRUN_TUNE_ROOT="$R" NETRUN_TUNE_REPO="$FAKE" HARDEN_FAIL=1 bash "$SCRIPT" --apply --only security > "$TMP/out" 2>&1; echo $?)"
+[ "$rc" = 1 ] && grep -qE 'security +FAILED' "$TMP/out" || { cat "$TMP/out"; fail "security failure must be FAILED"; }
+rc="$(PATH="$BIN:$PATH" NETRUN_TUNE_ROOT="$R" NETRUN_TUNE_REPO="$TMP/no-repo" bash "$SCRIPT" --apply --only security > "$TMP/out" 2>&1; echo $?)"
+[ "$rc" = 2 ] && grep -qE 'security +REFUSED' "$TMP/out" || { cat "$TMP/out"; fail "security without the code must refuse"; }
+ok "security: dry run = guard diff + status, nothing written; apply = netrun-harden.sh secure; failure FAILED; no code REFUSED"
 
 # ── 17. fingerprint (opt-in, FP-01): TCP pins, sysctl.conf purge, normalization rules ─
 R="$(new_root fp)"

@@ -43,6 +43,14 @@ const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
 const PROXY_BIN = path.join(PROXY_ROOT, "3proxy", "bin", "3proxy");
 const NFT_TABLE = "proxy_accounting";
 const NFTABLES_PERSIST = process.env.NODE_AGENT_NFT_PERSIST || "/etc/nftables.conf";
+// Audit 2026-10-08 — the ruleset reaches the file only through
+// netrun-nft-persist (atomic temp + rename under the lock every writer shares,
+// .prev kept): the installed copy, else the repo's.
+const NFT_PERSIST_HELPERS = [
+  process.env.NODE_AGENT_NFT_PERSIST_BIN,
+  "/usr/local/sbin/netrun-nft-persist",
+  path.join(__dirname, "..", "..", "scripts", "netrun-nft-persist.sh"),
+];
 // HTTPS frontend reconciler (scripts/netrun-https.sh, installed by followup).
 const HTTPS_SYNC_BIN = process.env.NODE_AGENT_HTTPS_SYNC_BIN || "/usr/local/sbin/netrun-https";
 const HTTP_PORT_OFFSET = 10000; // paired http port = socks port - 10000
@@ -327,7 +335,9 @@ async function deprovisionPorts(rawPorts) {
             }
           }
           const tmp = cfgPath + ".deprov.tmp";
-          fs.writeFileSync(tmp, body);
+          // Audit 2026-10-08 — a cfg holds customer logins / passwords: 0600.
+          fs.writeFileSync(tmp, body, { mode: 0o600 });
+          fs.chmodSync(tmp, 0o600);
           fs.renameSync(tmp, cfgPath);
           const kill = await killCfgProcess(startPort);
           if (kill.stillAlive) throw new Error("respawn_failed:old_process_still_running");
@@ -366,7 +376,7 @@ async function deprovisionPorts(rawPorts) {
     } catch (err) {
       result.egress = { ok: false, error: String((err && err.message) || err) };
     }
-    await execCapture("bash", ["-c", `nft list ruleset > ${NFTABLES_PERSIST}`], { timeoutMs: 60000 });
+    result.persist = await persistRuleset();
   }
   // HTTPS frontend: haproxy still binds the removed HTTP ports until its
   // frontends are rewritten — release them now, so a later generate that reuses
@@ -383,8 +393,28 @@ async function deprovisionPorts(rawPorts) {
   return result;
 }
 
+// Save the live ruleset for a reboot. Never throws; { ok, code, detail }.
+async function persistRuleset({ helpers = NFT_PERSIST_HELPERS, target = NFTABLES_PERSIST, exec = execCapture } = {}) {
+  const helper = helpers.find((p) => p && fs.existsSync(p));
+  const res = helper
+    ? await exec("bash", [helper, "save"], { timeoutMs: 180000, env: { ...process.env, NETRUN_NFT_CONF: target } })
+    : await exec(
+        "bash",
+        [
+          "-c",
+          't="$(mktemp "$(dirname "$1")/.nftables.conf.XXXXXX")" || exit 1; ' +
+            'if nft list ruleset > "$t" && [ -s "$t" ]; then mv -f "$t" "$1"; else rm -f "$t"; exit 1; fi',
+          "_",
+          target,
+        ],
+        { timeoutMs: 60000 }
+      );
+  return { ok: res.code === 0, code: res.code, detail: res.code === 0 ? null : String(res.stderr || "").trim().slice(0, 300) };
+}
+
 module.exports = {
   deprovisionPorts,
+  persistRuleset,
   // exported for unit tests
   parseCfg,
   planRewrite,

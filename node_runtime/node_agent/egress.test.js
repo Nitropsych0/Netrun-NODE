@@ -895,3 +895,23 @@ test("generateRoutedAddresses: a prefix that becomes dense while picking switche
     assert.ok(nets.every((k) => !used.has(k) && k >= base && k < base + 256n));
   }
 });
+
+// Audit 2026-10-08 — the node's own /64 of a routed prefix (unbound ::53, the
+// /48 self-check ::1): the LAST /64; none for a /64 or longer.
+test("nodeReservedNet / nodeReservedAddress: the last /64 of the prefix", () => {
+  assert.strictEqual(eg.nodeReservedAddress("2602:f2dc:a9::/48", 0x53n), "2602:f2dc:a9:ffff::53");
+  assert.strictEqual(eg.nodeReservedAddress("2602:F2DC:A9:0::5/48"), "2602:f2dc:a9:ffff::1");
+  assert.strictEqual(eg.nodeReservedAddress("2602:f2dc:a0::/44"), "2602:f2dc:af:ffff::1");
+  assert.strictEqual(eg.nodeReservedNet("2602:f2dc:a9:ffff::/64"), null);
+  assert.strictEqual(eg.nodeReservedNet("nope"), null);
+  assert.strictEqual(eg.nodeReservedNet(""), null);
+  assert.strictEqual(eg.nodeReservedNet("2602:f2dc:a9::/48"), eg.net64Of("2602:f2dc:a9:ffff::1"));
+});
+
+test("generateRoutedAddresses: a `never` /64 is skipped, also when every other /64 is taken (shared)", () => {
+  const never = new Set([eg.net64Of("2602:f2dc:a9:3::1")]);
+  const { addrs, shared } = eg.generateRoutedAddresses("2602:f2dc:a9::/62", 12, new Set(), undefined, never);
+  assert.strictEqual(addrs.length, 12);
+  assert.ok(addrs.every((a) => eg.net64Of(a) !== eg.net64Of("2602:f2dc:a9:3::1")), addrs.join());
+  assert.strictEqual(shared, 9, "3 free /64s, 9 shared");
+});

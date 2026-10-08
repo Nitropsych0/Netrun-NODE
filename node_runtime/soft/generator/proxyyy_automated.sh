@@ -9,6 +9,24 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# Audit 2026-10-08 — everything this script writes (3proxy cfgs, the start-up
+# script, ipv6/users/backconnect lists, the port map, logs) names customer
+# logins, passwords or exit addresses: root only. 3proxy reads its cfg as root,
+# before `setuid 65535`; nothing non-root reads these files.
+umask 077
+
+# Audit 2026-10-08 — the ruleset reaches /etc/nftables.conf only through
+# netrun-nft-persist (atomic, one lock for every writer, .prev kept). Without
+# it (a node not yet given the code): an atomic temp + rename here.
+function nft_persist() {
+  local h t
+  for h in "${NETRUN_NFT_PERSIST_BIN:-}" /usr/local/sbin/netrun-nft-persist /opt/netrun/scripts/netrun-nft-persist.sh; do
+    if [ -n "$h" ] && [ -f "$h" ]; then bash "$h" save "$@"; return; fi
+  done
+  t="$(mktemp "$(dirname "${NETRUN_NFT_CONF:-/etc/nftables.conf}")/.nftables.conf.XXXXXX")" || return 1
+  if nft list ruleset > "$t" && [ -s "$t" ]; then mv -f "$t" "${NETRUN_NFT_CONF:-/etc/nftables.conf}"; else rm -f "$t"; return 1; fi
+}
+
 # Wave FLEET-HEALTH (SPD-05) — a node setting: the environment wins, then
 # ${NETRUN_ENV_FILE:-/etc/netrun/netrun.env} (KEY=VALUE lines), then the default.
 function netrun_setting() {
@@ -659,7 +677,8 @@ function random_ipv6_suffixes() {
 # no other batch's list under PROXY_DIR uses and no rotated / pool / draining
 # address of the agent's PROXY_DIR/egress_state.json is in (the agent rotates
 # inside the same prefix and skips these lists in turn; anti-fraud groups by
-# /64, so two proxies in one /64 look like one client), the low 64 bits random.
+# /64, so two proxies in one /64 look like one client) and never the node's own
+# last /64 of the prefix, the low 64 bits random.
 # Exit 1 when the prefix has fewer free /64s than COUNT.
 function routed_ipv6_addresses() {
   local prefix="$1" count="$2" dir="$3" own="$4"
@@ -699,6 +718,11 @@ for raw in taken:
     if addr in prefix:
         used.add(int(addr) >> 64)
 base, nets = int(prefix.network_address) >> 64, 1 << (64 - prefix.prefixlen)
+# The node's own /64 — the LAST one of the prefix (<prefix>:ffff::/64 of a
+# /48) — is never a proxy's: unbound's recursion and the agent's /48 egress
+# self-check leave from it (README, "Node's own /64"). Same rule: egress.js.
+if nets > 1:
+    used.add(base + nets - 1)
 if nets - len(used) < count:
     sys.exit(f"routed prefix {prefix}: {nets - len(used)} free /64 left, {count} needed")
 rng = random.SystemRandom()
@@ -821,6 +845,10 @@ function create_startup_script() {
 	# This script starts ONLY this specific proxy instance (ports $start_port-$last_port)
 	# It does NOT touch other instances!
 
+	# Audit 2026-10-08 — the cfg written below holds customer logins and
+	# passwords: root only (3proxy reads it as root, before setuid 65535).
+	umask 077
+
 	function dedent() {
 	  local -n reference="\$1"
 	  reference="\$(echo "\$reference" | sed 's/^[[:space:]]*//')"
@@ -872,6 +900,7 @@ $dns_nserver_lines
 	dedent access_rules_part;
 
 	echo "\$immutable_config_part"\$'\n'"\$auth_part"\$'\n'"\$access_rules_part"  > $proxyserver_config_path;
+	chmod 600 $proxyserver_config_path;
 
 	port=$start_port
 	count=0
@@ -1156,7 +1185,7 @@ function setup_nftables_counters() {
       echo "   [PROGRESS] Setup $proxy_count/$proxy_count counters (fast batch)..."
       echo "   Setup $added_count nftables counters (client-port based, batched)"
       echo "   Saving nftables rules for persistence..."
-      nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+      nft_persist 2>&1 || echo "   WARNING: the ruleset was not persisted (the previous /etc/nftables.conf is kept)"
       return 0
     fi
     rm -f "$_batch_file"
@@ -1251,7 +1280,7 @@ function setup_nftables_counters() {
   
   # Save nftables rules for persistence
   echo "СЂСџвЂ™С• Saving nftables rules for persistence..."
-  nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+  nft_persist 2>&1 || echo "   WARNING: the ruleset was not persisted (the previous /etc/nftables.conf is kept)"
   echo "   РІСљвЂ¦ nftables rules saved to /etc/nftables.conf"
   
   # Show sample counter for verification
@@ -1450,7 +1479,7 @@ function cleanup_nftables_rules() {
   echo "РІСљвЂ¦ Cleaned $cleaned_count nftables rules"
   
   # Save nftables state
-  nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+  nft_persist 2>&1 || echo "   WARNING: the ruleset was not persisted (the previous /etc/nftables.conf is kept)"
 }
 
 function cleanup_iptables_rules() {

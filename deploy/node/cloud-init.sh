@@ -107,6 +107,9 @@ log "self_ip=${SELF_IP:-<unknown>}"
 set +x
 SECRET="__SECRET__"
 REGISTER_URL="${ORCH_URL%/}${REGISTER_PATH}"
+# Audit 2026-10-08 — the node-agent key install_node_v2.sh generated (the agent
+# fails closed without it); the orchestrator stores it as nodes.api_key.
+AGENT_API_KEY="$(sed -n 's/^Environment=NODE_AGENT_API_KEY=//p' /etc/systemd/system/netrun-node-agent.service.d/20-api-key.conf 2>/dev/null | tail -n1)"
 
 PAYLOAD="$(jq -n \
   --arg ip "$SELF_IP" \
@@ -116,14 +119,16 @@ PAYLOAD="$(jq -n \
   --arg log_tail "$LOG_TAIL" \
   --arg hostname "$(hostname)" \
   --arg agent_version "$AGENT_VERSION" \
+  --arg agent_api_key "$AGENT_API_KEY" \
   '{
      ip: $ip,
      secret: $secret,
      install_result: { ok: $ok, exit_code: $exit_code, log_tail: $log_tail },
      hostname: $hostname,
-     agent_version: $agent_version
+     agent_version: $agent_version,
+     agent_api_key: $agent_api_key
    }')"
-unset SECRET
+unset SECRET AGENT_API_KEY
 
 log "POST ${REGISTER_URL} (retry up to ${CALLBACK_RETRIES}× on network/5xx)"
 attempt=0

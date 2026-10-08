@@ -24,6 +24,7 @@ const NFT_SET = path.join(TMP, "nft_set.txt");
 fs.mkdirSync(path.join(PROXY_ROOT, "3proxy"), { recursive: true });
 fs.mkdirSync(BIN, { recursive: true });
 process.env.NODE_AGENT_PROXY_ROOT = PROXY_ROOT;
+process.env.NODE_AGENT_API_KEY = "test-key"; // audit 2026-10-08: the agent fails closed without a key
 process.env.NODE_AGENT_JOBS_ROOT = JOBS_ROOT;
 process.env.NODE_AGENT_CLEANUP_CRON_AFTER_RUN = "0";
 process.env.NODE_AGENT_JOBS_KEEP = "0";
@@ -74,7 +75,7 @@ function request(port, method, p, body) {
   return new Promise((resolve, reject) => {
     const data = body === undefined ? null : JSON.stringify(body);
     const req = http.request(
-      { host: "127.0.0.1", port, path: p, method, headers: data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {} },
+      { host: "127.0.0.1", port, path: p, method, headers: data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data), "X-API-KEY": "test-key" } : { "X-API-KEY": "test-key" } },
       (res) => {
         let text = "";
         res.on("data", (c) => (text += c));

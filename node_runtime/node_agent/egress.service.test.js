@@ -390,6 +390,7 @@ function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07
       EGRESS_SYSCTL_CONF: "off",
       EGRESS_PROC_SYS: host.procSys,
       NETRUN_ENV_FILE: path.join(root, "no-such-netrun.env"),
+      EGRESS_PROXY_GUARD_BIN: "off",
       ...env,
     },
     run: host.run,
@@ -1307,6 +1308,42 @@ test("routed /48: rotate and the pool take one free /64 each — no proxy NDP, n
   assert.ok(!svc.snapshot().draining.some((d) => d.addr === got[0]), "forgotten");
   assert.strictEqual(host.ipBatches.length, batches, "no delete batch");
   assertConsistent(host, svc, root, "routed gc");
+});
+
+// Audit 2026-10-08 — the node's own /64 (the last of the routed prefix:
+// <prefix>:ffff::/64) carries unbound's recursion and the /48 self-check:
+// never a proxy's, not even when the prefix is full and addresses share.
+test("routed prefix: the node's own last /64 is never handed out, not even shared", async () => {
+  const host = fakeHost();
+  const R63 = "2602:f2dc:a9:fffe::/63"; // two /64s: fffe (free) and ffff (the node's)
+  host.localRoutes = [R63];
+  const root = makeRoot();
+  const { svc } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R63 } });
+  await svc.init();
+  assert.strictEqual(svc.status().rotate_prefix, R63);
+  const r = await svc.rotate([30000, 30001, 30002]);
+  assert.strictEqual(r.ok, true);
+  const got = r.items.map((it) => it.new_ipv6);
+  assert.ok(got.every((a) => a.startsWith("2602:f2dc:a9:fffe:")), `only the free /64, shared: ${got.join()}`);
+  assert.strictEqual(eg.nodeReservedAddress(R63, 0x53n), "2602:f2dc:a9:ffff::53");
+  assertConsistent(host, svc, root, "reserved /64");
+});
+
+test("routed prefix: the 3proxy egress guard is refreshed at start and when the routed prefixes change", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  const bin = path.join(root, "netrun-proxy-guard");
+  fs.writeFileSync(bin, "#!/bin/sh\n");
+  const { svc } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48, EGRESS_PROXY_GUARD_BIN: bin } });
+  await svc.init();
+  const calls = () => host.log.filter((l) => l === `bash ${bin} apply`).length;
+  assert.strictEqual(calls(), 1, "applied once at start");
+  await svc.gcTick();
+  assert.strictEqual(calls(), 1, "no change, no call");
+  host.localRoutes = [R48, "2602:f2dc:b0::/48"];
+  await svc.gcTick();
+  assert.strictEqual(calls(), 2, "a new routed prefix: applied again");
 });
 
 test("routed /48: a restart re-adds proxy entries for NIC addresses only; the route gone → the /64 again, and a start forgets routed addresses", async () => {

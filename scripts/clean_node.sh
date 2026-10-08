@@ -94,7 +94,15 @@ if command -v nft >/dev/null 2>&1; then
   nft delete table inet proxy_normalization 2>/dev/null || true
   nft delete table inet proxy_accounting 2>/dev/null || true
   nft delete table ip6 netrun_egress 2>/dev/null || true
-  nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+  # Audit 2026-10-08 — atomically, under the writers' lock; an empty ruleset
+  # is saved as such (the boot load must not fall back to the old rules).
+  _persist="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/netrun-nft-persist.sh"
+  if [ -f "$_persist" ]; then
+    bash "$_persist" save --allow-empty || true
+  else
+    t="/etc/.nftables.conf.clean.$$"
+    if nft list ruleset > "$t" 2>/dev/null; then mv -f "$t" /etc/nftables.conf; else rm -f "$t"; fi
+  fi
 fi
 
 systemctl daemon-reload 2>/dev/null || true

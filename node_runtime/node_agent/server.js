@@ -6,6 +6,7 @@ const path = require("path");
 const net = require("net");
 const https = require("https");
 const dns = require("dns");
+const crypto = require("crypto");
 const { buildDescribe } = require("./describe.js");
 const accounting = require("./accounting.js");
 const egressMode = require("./egress_mode.js");
@@ -20,6 +21,7 @@ const supervisorLib = require("./supervisor.js");
 const firewallLib = require("./firewall.js");
 const proxySpawn = require("./proxy_spawn.js");
 const httpsHostnamesLib = require("./https_hostnames.js");
+const { nodeSetting } = require("./node_settings.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 // Wave FLEET-HEALTH (RES-10) — bind address. The unit template has always set
@@ -128,12 +130,20 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// Audit 2026-10-08 — fail CLOSED: an agent without NODE_AGENT_API_KEY answers
+// nothing but the liveness /health (it used to answer everything to anyone).
+// The installer always sets a key (install_node_v2.sh ensure_agent_api_key).
+// Compared through SHA-256 digests with timingSafeEqual: no length or prefix
+// timing signal.
+function apiKeyMatches(given, expected = API_KEY) {
+  if (!expected) return false;
+  const a = crypto.createHash("sha256").update(String(given || "").trim()).digest();
+  const b = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 function ensureAuthorized(req) {
-  if (!API_KEY) {
-    return true;
-  }
-  const headerKey = String(req.headers["x-api-key"] || "").trim();
-  return headerKey === API_KEY;
+  return apiKeyMatches(req.headers["x-api-key"]);
 }
 
 function parseJsonBody(req) {
@@ -294,8 +304,9 @@ async function readJsonIfExists(filePath) {
   }
 }
 
+// Audit 2026-10-08 — job files name customer logins / passwords: 0600.
 async function writeJsonFile(filePath, data) {
-  await fsp.writeFile(filePath, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+  await fsp.writeFile(filePath, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
 }
 
 async function readTail(filePath, maxChars = RESPONSE_TAIL_LIMIT) {
@@ -1939,7 +1950,10 @@ async function runLocalAuthChecks(items, sampleCount) {
   };
 }
 
-async function checkIpv6Egress(url, timeoutMs = 8000) {
+// `localAddress` (audit 2026-10-08): bind the request to that source address
+// — the /48 self-check (createRoutedEgressProbe) leaves from inside the routed
+// prefix, which only works while the prefix is announced and routed back here.
+async function checkIpv6Egress(url, timeoutMs = 8000, { localAddress = null } = {}) {
   const target = String(url || "").trim() || DEFAULT_IPV6_EGRESS_URL;
   return new Promise((resolve) => {
     const req = https.get(
@@ -1947,6 +1961,7 @@ async function checkIpv6Egress(url, timeoutMs = 8000) {
       {
         timeout: timeoutMs,
         family: 6,
+        ...(localAddress ? { localAddress } : {}),
       },
       (res) => {
         let body = "";
@@ -1981,6 +1996,87 @@ async function checkIpv6Egress(url, timeoutMs = 8000) {
     });
   });
 }
+
+// Audit 2026-10-08 — /health ipv6EgressRouted: the egress self-check above
+// leaves from the node's primary address, so a node whose routed /48 (BGP
+// session, local route) is dead still looked healthy while every /48 proxy
+// was down. When a routed prefix is configured (NETRUN_IPV6_ROUTED_PREFIX,
+// else EGRESS_ROTATE_PREFIX; env, then netrun.env) the canary is fetched FROM
+// an address of the node's own /64 of it (<last /64>::1, egress.js
+// nodeReservedAddress — never a proxy's; <prefix>::1 for a /64 prefix) and
+// must answer with that address. Cached like ipv6Addresses
+// (NODE_AGENT_ROUTED_EGRESS_TTL_SEC, default 60): one request a minute.
+const ROUTED_EGRESS_TTL_MS = Math.max(15000, Number(process.env.NODE_AGENT_ROUTED_EGRESS_TTL_SEC || 60) * 1000);
+
+// { prefix, address } of the configured routed prefix, or null (none / "off").
+function routedEgressTarget(env = process.env) {
+  for (const key of ["NETRUN_IPV6_ROUTED_PREFIX", "EGRESS_ROTATE_PREFIX"]) {
+    const raw = String(nodeSetting(key, "", { env }) || "").trim();
+    if (!raw || raw.toLowerCase() === "off") continue;
+    const prefix = egress.canonicalRoutedPrefix(raw);
+    if (!prefix) return { prefix: raw, address: null };
+    let address = egress.nodeReservedAddress(prefix, 1n);
+    if (!address) {
+      const g = egress.ipv6Groups(prefix.split("/")[0]);
+      g[7] = 1;
+      address = egress.formatIpv6(g);
+    }
+    return { prefix, address };
+  }
+  return null;
+}
+
+// The /health shape of one routed check: ok only for a 2xx whose body is
+// our bound address (anything else egressed from somewhere else).
+function routedEgressVerdict(target, res, checkedAt) {
+  const out = { ok: false, prefix: target.prefix, address: target.address, error: null, statusCode: null, observed: null, checkedAt };
+  if (!target.address) return { ...out, error: "bad_routed_prefix" };
+  out.statusCode = res.statusCode || 0;
+  const body = String(res.body || "").trim();
+  out.observed = body ? body.slice(0, 64) : null;
+  if (!res.ok) return { ...out, error: res.error || "ipv6_http_failed" };
+  const seen = egress.normalizeIpv6(body);
+  if (seen && seen !== egress.normalizeIpv6(target.address)) return { ...out, error: "egress_address_mismatch" };
+  return { ...out, ok: true };
+}
+
+function createRoutedEgressProbe({
+  ttlMs = ROUTED_EGRESS_TTL_MS,
+  target = () => routedEgressTarget(),
+  check = (t) => checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000, { localAddress: t.address }),
+  now = () => Date.now(),
+} = {}) {
+  let cached = null;
+  let inFlight = null;
+  async function get() {
+    const t = target();
+    if (!t) return null;
+    const key = `${t.prefix}|${t.address}`;
+    if (cached && cached.key === key && now() - cached.atMs < ttlMs) return cached.value;
+    if (inFlight && inFlight.key === key) return inFlight.promise;
+    const promise = (async () => {
+      const at = now();
+      let res;
+      try {
+        res = t.address ? await check(t) : { ok: false };
+      } catch (err) {
+        res = { ok: false, statusCode: 0, body: "", error: `ipv6_error:${(err && err.message) || err}` };
+      }
+      const value = routedEgressVerdict(t, res, new Date(at).toISOString());
+      cached = { key, atMs: now(), value };
+      return value;
+    })();
+    inFlight = { key, promise };
+    try {
+      return await promise;
+    } finally {
+      if (inFlight && inFlight.promise === promise) inFlight = null;
+    }
+  }
+  return { get };
+}
+
+const routedEgress = createRoutedEgressProbe();
 
 // DNS-leak probe. Mirrors checkIpv6Egress shape: never throws, always
 // resolves to a flat object that the orchestrator can pass through to
@@ -2531,8 +2627,8 @@ async function runGenerator({
   stderrLogPath,
 }) {
   return new Promise((resolve) => {
-    const stdoutLog = fs.createWriteStream(stdoutLogPath, { flags: "a" });
-    const stderrLog = fs.createWriteStream(stderrLogPath, { flags: "a" });
+    const stdoutLog = fs.createWriteStream(stdoutLogPath, { flags: "a", mode: 0o600 });
+    const stderrLog = fs.createWriteStream(stderrLogPath, { flags: "a", mode: 0o600 });
     let stdoutTail = "";
     let stderrTail = "";
     let timeoutHandle = null;
@@ -3175,7 +3271,7 @@ async function handleGenerate(req, res) {
   let generatorStartedMs = 0; // set right before the generator runs
 
   try {
-    await fsp.mkdir(jobDir, { recursive: true });
+    await fsp.mkdir(jobDir, { recursive: true, mode: 0o700 });
 
     await safeUnlink(proxiesListPath);
     await safeUnlink(mapCsvPath);
@@ -4046,12 +4142,13 @@ async function handleHealth(req, res) {
     if (p > 0) probePorts.add(p);
   }
   for (const c of inventory.cfgs) probePorts.add(probeOf(c.startPort));
-  const [ipv6Check, dnsCheck, listenState, ipv6Addresses, httpsHostnamesStatus] = await Promise.all([
+  const [ipv6Check, dnsCheck, listenState, ipv6Addresses, httpsHostnamesStatus, ipv6EgressRouted] = await Promise.all([
     checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
     checkDns(5000),
     listListeningExactPorts([...probePorts]),
     ipv6Coverage.get(),
     httpsHostnames.healthStatus(),
+    routedEgress.get(),
   ]);
   // Wave NODE-GENLOCK-HARDENING — 3proxy readiness, additive. Lets the
   // orchestrator distinguish "agent up but 3proxy not listening yet" (fresh
@@ -4127,6 +4224,11 @@ async function handleHealth(req, res) {
     instances: instancesPayload,
     ipv6,
     ipv6Egress: ipv6,
+    // Audit 2026-10-08 — additive. The egress self-check FROM the routed
+    // prefix ({ok, prefix, address, error, statusCode, observed, checkedAt},
+    // cached ttlSec); null = no routed prefix configured. ok false = the /48
+    // (BGP / route) is dead even though ipv6Egress is fine: stop selling it.
+    ipv6EgressRouted: ipv6EgressRouted ? { ...ipv6EgressRouted, ttlSec: Math.round(ROUTED_EGRESS_TTL_MS / 1000) } : null,
     dns: dnsCheck,
     // Wave NODE-LOAD-GUARD — additive; the guard itself polls GET /load.
     load: loadSampler.snapshot(),
@@ -4204,7 +4306,14 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   const pathname = url.pathname;
 
+  // Audit 2026-10-08 — without the key /health is a liveness answer that
+  // leaks nothing (200 {ok:true}, no probes): the node's watchdog and the
+  // orchestrator's reachability checks use it. The full payload needs the key.
   if (req.method === "GET" && pathname === "/health") {
+    if (!ensureAuthorized(req)) {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
     await handleHealth(req, res);
     return;
   }
@@ -4221,6 +4330,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && pathname === "/describe") {
+    if (!ensureAuthorized(req)) {
+      sendJson(res, 401, { success: false, status: "failed", error: "unauthorized" });
+      return;
+    }
     await handleDescribe(req, res);
     return;
   }
@@ -4455,6 +4568,12 @@ function listenAgent(srv = server, onListening = () => {}) {
 }
 
 if (require.main === module) {
+  // Audit 2026-10-08 — every file the agent (and the generator / start-up
+  // scripts it runs) creates is root-only unless written with an explicit
+  // mode: job outputs, cfgs and lists name customer logins, passwords and exit
+  // addresses. Nothing non-root reads them (3proxy parses its cfg as root,
+  // before `setuid 65535`; haproxy reads only /etc/haproxy + /etc/netrun/tls).
+  process.umask(0o077);
   loadSampler.start();
   listenAgent(server, () => {
     console.log(
@@ -4530,6 +4649,12 @@ module.exports = {
   server,
   // Wave FLEET-HEALTH — exported for unit tests.
   listenAgent,
+  // Audit 2026-10-08 — exported for unit tests.
+  apiKeyMatches,
+  ensureAuthorized,
+  routedEgressTarget,
+  routedEgressVerdict,
+  createRoutedEgressProbe,
   LISTEN_HOST,
   planRebindKills,
   perStartPortFiles,

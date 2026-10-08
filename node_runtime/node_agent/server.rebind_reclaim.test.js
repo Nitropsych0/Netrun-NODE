@@ -19,6 +19,7 @@ const BIN = path.join(TMP, "bin");
 fs.mkdirSync(path.join(PROXY_ROOT, "3proxy"), { recursive: true });
 fs.mkdirSync(BIN, { recursive: true });
 process.env.NODE_AGENT_PROXY_ROOT = PROXY_ROOT;
+process.env.NODE_AGENT_API_KEY = "test-key"; // audit 2026-10-08: the agent fails closed without a key
 process.env.NODE_AGENT_JOBS_ROOT = path.join(TMP, "jobs");
 process.env.PATH = `${BIN}:${process.env.PATH}`;
 process.env.NODE_AGENT_CLEANUP_CRON_AFTER_RUN = "0";
@@ -268,7 +269,7 @@ test("POST /generate with reclaimStartPorts [] over a live batch -> 200 ports_in
     });
     const res = await new Promise((resolve, reject) => {
       const req = http.request(
-        { host: "127.0.0.1", port: srv.server.address().port, path: "/generate", method: "POST", headers: { "Content-Type": "application/json" } },
+        { host: "127.0.0.1", port: srv.server.address().port, path: "/generate", method: "POST", headers: { "Content-Type": "application/json", "X-API-KEY": "test-key" } },
         (r) => {
           let t = "";
           r.on("data", (c) => (t += c));

@@ -267,7 +267,9 @@ async function applyEgressMode(mode) {
       // Write to a temp file in the same dir then rename for an atomic swap, so
       // a crash mid-write can never leave a half-written 3proxy config.
       const tmp = `${cfgPath}.egress.tmp`;
-      await fsp.writeFile(tmp, text, "utf-8");
+      // Audit 2026-10-08 — a cfg holds customer logins / passwords: 0600.
+      await fsp.writeFile(tmp, text, { encoding: "utf-8", mode: 0o600 });
+      await fsp.chmod(tmp, 0o600);
       await fsp.rename(tmp, cfgPath);
     } catch (err) {
       restartErrors.push({ cfg: path.basename(cfgPath), error: `write_failed: ${(err && err.message) || err}` });

@@ -63,7 +63,10 @@
 #                spawn helper); the legacy heredoc restore-3proxy.sh is removed;
 #                netrun-https-sync.service gets a KillMode=process drop-in; the
 #                /usr/local/sbin/netrun-https copy the timers run is refreshed from
-#                the repo (haproxy is then reloaded only when its config changes).
+#                the repo (haproxy is then reloaded only when its config changes);
+#                /opt/netrun/scripts/watchdog_probe.sh -> deploy/node/watchdog_probe.sh
+#                (v4, audit 2026-10-08: reboot only with the data plane down; the
+#                timer runs the new file at its next tick).
 #                daemon-reload only: NOTHING is started, stopped or restarted.
 #   fingerprint  OPT-IN (audit FP-01). /etc/sysctl.d/99-zz-netrun-tcp.conf from
 #                deploy/node (pinned TTL 64, timestamps, SACK, window scaling,
@@ -79,6 +82,12 @@
 #                (check_bootstrap_ready), so a rollback to it must find it — and
 #                restoring /etc/nftables.conf alone does not reload anything.
 #                Refused while a generation holds the genlock (ruleset persist).
+#   security     OPT-IN (audit 2026-10-08). `netrun-harden.sh secure` from the
+#                repo: atomic ruleset saves + boot fallback (netrun-nft-persist
+#                install), the 3proxy egress guard (netrun-proxy-guard apply),
+#                credential files root-only, ssh keys only, unbound's recursion
+#                from the node's own /64 of the routed prefix. Dry run: the guard
+#                diff and `netrun-harden.sh status`. 3proxy is never touched.
 #   pipes        OPT-IN (speed audit). fs.pipe-user-pages-soft sized by RAM (the
 #                largest power of two <= MemTotal/32 in pages, 16384..262144;
 #                2c/4GB -> 65536 = full 64 KiB splice pipes for ~2048 relayed
@@ -95,7 +104,7 @@
 # Options:
 #   --dry-run                 default; print what would be done
 #   --apply                   do it (root)
-#   --only LIST               comma list of: sysctl,unbound,nft,ipv6restore,conntrack,units,fingerprint,pipes
+#   --only LIST               comma list of: sysctl,unbound,nft,ipv6restore,conntrack,units,fingerprint,pipes,security
 #                             (default: sysctl,unbound,nft,ipv6restore — the others are opt-in)
 #   --ephemeral-range LO-HI   default 1024-8000
 #   --conntrack-max N         conntrack step target (default: sized by MemTotal)
@@ -144,6 +153,7 @@ SPAWN_SCRIPT="$ROOT/opt/netrun/scripts/netrun-3proxy-spawn.sh"
 HTTPS_SYNC_UNIT="$SYSTEMD_DIR/netrun-https-sync.service"
 HTTPS_SYNC_DROPIN="$SYSTEMD_DIR/netrun-https-sync.service.d/10-killmode.conf"
 HTTPS_SBIN="$ROOT/usr/local/sbin/netrun-https"
+WATCHDOG_SCRIPT="$ROOT/opt/netrun/scripts/watchdog_probe.sh"
 TCP_FILE="$ROOT/etc/sysctl.d/99-zz-netrun-tcp.conf"
 SYSCTL_CONF="$ROOT/etc/sysctl.conf"
 PROC_PIPE_SOFT="$ROOT/proc/sys/fs/pipe-user-pages-soft"
@@ -175,7 +185,7 @@ refused() { step_status "$1" "REFUSED" "$2"; RC_REFUSED=1; }
 failed() { step_status "$1" "FAILED" "$2"; RC_FAILED=1; }
 die() { log "ERROR: $*" >&2; exit 1; }
 
-usage() { sed -n '2,108p' "$0" 2>/dev/null; }
+usage() { sed -n '2,122p' "$0" 2>/dev/null; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -200,7 +210,7 @@ case "$EPH_LO$EPH_HI" in *[!0-9]*|"") die "--ephemeral-range must be LO-HI (inte
 [ "$EPH_LO" -ge 1024 ] && [ "$EPH_HI" -gt "$EPH_LO" ] && [ "$EPH_HI" -lt "$PROXY_PORT_FLOOR" ] \
   || die "--ephemeral-range: need 1024 <= LO < HI < $PROXY_PORT_FLOOR (the range must stay below every proxy listener)"
 for s in $(printf '%s' "$ONLY" | tr ',' ' '); do
-  case "$s" in sysctl|unbound|nft|ipv6restore|conntrack|units|fingerprint|pipes) ;; *) die "--only: unknown step '$s'" ;; esac
+  case "$s" in sysctl|unbound|nft|ipv6restore|conntrack|units|fingerprint|pipes|security) ;; *) die "--only: unknown step '$s'" ;; esac
 done
 if [ -n "$CT_MAX_OVERRIDE" ]; then
   case "$CT_MAX_OVERRIDE" in *[!0-9]*) die "--conntrack-max must be an integer" ;; esac
@@ -226,6 +236,17 @@ if [ "$MODE" = "apply" ] && command -v flock >/dev/null 2>&1; then
 fi
 
 # ── helpers ────────────────────────────────────────────────────────
+
+# Audit 2026-10-08 — the ruleset reaches $NFT_PERSIST only through
+# netrun-nft-persist (atomic temp + rename, the writers' shared lock, .prev).
+persist_ruleset() {
+  local h t
+  for h in "${NETRUN_NFT_PERSIST_BIN:-}" "$ROOT/usr/local/sbin/netrun-nft-persist" "${REPO:+$REPO/scripts/netrun-nft-persist.sh}"; do
+    if [ -n "$h" ] && [ -f "$h" ]; then NETRUN_NFT_CONF="$NFT_PERSIST" NETRUN_NFT_LOCK="${NETRUN_NFT_LOCK:-$ROOT/run/lock/netrun-nft-persist.lock}" bash "$h" save; return; fi
+  done
+  t="$(mktemp "$(dirname "$NFT_PERSIST")/.nftables.conf.XXXXXX")" || return 1
+  if nft list ruleset > "$t" && [ -s "$t" ]; then mv -f "$t" "$NFT_PERSIST"; else rm -f "$t"; return 1; fi
+}
 
 ss_listen() { ss -Hltn${1:-} 2>/dev/null || ss -ltn${1:-} 2>/dev/null; }
 
@@ -546,7 +567,7 @@ step_nft() {
     return 0
   fi
   if [ -f "$NFT_PERSIST" ]; then cp -p "$NFT_PERSIST" "$NFT_PERSIST.bak-capacity-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true; fi
-  nft list ruleset > "$NFT_PERSIST" 2>/dev/null || log "  WARNING: could not persist the ruleset to $NFT_PERSIST"
+  persist_ruleset || log "  WARNING: could not persist the ruleset to $NFT_PERSIST"
   step_status nft applied "deleted $n_del + migrated $n_mig legacy per-port rule(s); kept $n_keep; ruleset persisted to $NFT_PERSIST"
 }
 
@@ -661,7 +682,7 @@ step_conntrack() {
 # ── step: boot units (opt-in, audit RES-11) ───────────────────────
 
 step_units() {
-  local need=() src_unit="$REPO/deploy/node/netrun-3proxy-restore.service" src_https="$REPO/scripts/netrun-https.sh"
+  local need=() src_unit="$REPO/deploy/node/netrun-3proxy-restore.service" src_https="$REPO/scripts/netrun-https.sh" src_wd="$REPO/deploy/node/watchdog_probe.sh"
   if [ ! -f "$src_unit" ]; then
     refused units "repo unit $src_unit not found (deploy the code first)"
     return 0
@@ -675,8 +696,9 @@ step_units() {
   [ ! -e "$RESTORE3_LEGACY" ] || need+=("legacy-restore-script")
   if [ -f "$HTTPS_SYNC_UNIT" ] && ! grep -qs '^KillMode=process' "$HTTPS_SYNC_UNIT" "$HTTPS_SYNC_DROPIN"; then need+=("https-sync-killmode"); fi
   if [ -f "$HTTPS_SBIN" ] && [ -f "$src_https" ] && ! cmp -s "$src_https" "$HTTPS_SBIN"; then need+=("netrun-https-copy"); fi
+  if [ -f "$WATCHDOG_SCRIPT" ] && [ -f "$src_wd" ] && ! cmp -s "$src_wd" "$WATCHDOG_SCRIPT"; then need+=("watchdog-v4"); fi
   if [ "${#need[@]}" -eq 0 ]; then
-    step_status units ok "restore unit = repo unit (restore_3proxy.sh + spawn helper), https-sync KillMode=process, netrun-https copy current"
+    step_status units ok "restore unit = repo unit (restore_3proxy.sh + spawn helper), https-sync KillMode=process, netrun-https + watchdog copies current"
     return 0
   fi
   if [ "$MODE" = "dry-run" ]; then
@@ -700,6 +722,11 @@ KillMode=process' || { failed units "cannot write $HTTPS_SYNC_DROPIN"; return 0;
     cp -p "$HTTPS_SBIN" "$HTTPS_SBIN.bak-units-$stamp" 2>/dev/null || true
     cat "$src_https" > "$HTTPS_SBIN.new.$$" && chmod 0755 "$HTTPS_SBIN.new.$$" && mv -f "$HTTPS_SBIN.new.$$" "$HTTPS_SBIN" \
       || { failed units "cannot refresh $HTTPS_SBIN"; return 0; } ;;
+  esac
+  case " ${need[*]} " in *" watchdog-v4 "*)
+    cp -p "$WATCHDOG_SCRIPT" "$WATCHDOG_SCRIPT.bak-units-$stamp" 2>/dev/null || true
+    cat "$src_wd" > "$WATCHDOG_SCRIPT.new.$$" && chmod 0755 "$WATCHDOG_SCRIPT.new.$$" && mv -f "$WATCHDOG_SCRIPT.new.$$" "$WATCHDOG_SCRIPT" \
+      || { failed units "cannot refresh $WATCHDOG_SCRIPT"; return 0; } ;;
   esac
   systemctl daemon-reload >/dev/null 2>&1 || log "  WARNING: systemctl daemon-reload failed — run it by hand"
   step_status units applied "${need[*]}; daemon-reload (nothing restarted; the restore unit runs at the next boot)"
@@ -769,7 +796,7 @@ step_fingerprint() {
       return 0
     fi
     if [ -f "$NFT_PERSIST" ]; then cp -p "$NFT_PERSIST" "$NFT_PERSIST.bak-fingerprint-$stamp" 2>/dev/null || true; fi
-    nft list ruleset > "$NFT_PERSIST" 2>/dev/null || log "  WARNING: could not persist the ruleset to $NFT_PERSIST"
+    persist_ruleset || log "  WARNING: could not persist the ruleset to $NFT_PERSIST"
   fi
   step_status fingerprint applied "${need[*]}; runtime tcp_timestamps=$(sysctl -n net.ipv4.tcp_timestamps 2>/dev/null) tcp_rmem='$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)'"
 }
@@ -815,6 +842,29 @@ step_pipes() {
   step_status pipes applied "fs.pipe-user-pages-soft = $target (persisted${runtime:+, runtime was $runtime})"
 }
 
+# ── step: audit 2026-10-08 security fixes (opt-in) ────────────────
+
+step_security() {
+  local harden="$REPO/scripts/netrun-harden.sh" guard="$REPO/scripts/netrun-proxy-guard.sh" out
+  if [ ! -f "$harden" ] || [ ! -f "$guard" ]; then
+    refused security "$harden / $guard not found (deploy the code first)"
+    return 0
+  fi
+  if [ "$MODE" = "dry-run" ]; then
+    step_status security would-apply "bash $harden secure: nft-persist install, proxy guard, perms, ssh keys-only, dns-egress"
+    bash "$guard" apply --dry-run 2>&1 | sed 's/^/[capacity-tuning]     /' | head -n 30
+    bash "$harden" status 2>&1 | grep '2026-10-08' | sed 's/^/[capacity-tuning]     /'
+    return 0
+  fi
+  if out="$(bash "$harden" secure 2>&1)"; then
+    printf '%s\n' "$out" | sed 's/^/[capacity-tuning]     /'
+    step_status security applied "netrun-harden.sh secure (3proxy untouched)"
+  else
+    printf '%s\n' "$out" | sed 's/^/[capacity-tuning]     /'
+    failed security "netrun-harden.sh secure reported a failure (see above)"
+  fi
+}
+
 # ── main ──────────────────────────────────────────────────────────
 
 log "mode: $MODE | steps: $ONLY | ephemeral range target: $EPH_LO-$EPH_HI${ROOT:+ | root: $ROOT}"
@@ -829,6 +879,7 @@ want conntrack && step_conntrack
 want units && step_units
 want fingerprint && step_fingerprint
 want pipes && step_pipes
+want security && step_security
 
 if [ "$RC_FAILED" = 1 ]; then log "result: a step FAILED (see above)"; exit 1; fi
 if [ "$RC_REFUSED" = 1 ]; then log "result: a step was REFUSED by a safety check (nothing changed for it)"; exit 2; fi
