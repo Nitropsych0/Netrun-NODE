@@ -280,6 +280,9 @@ instance_id="$start_port"
 proxyserver_config_path="$proxy_dir/3proxy/3proxy_${instance_id}.cfg"
 proxyserver_info_file="$proxy_dir/running_server_${instance_id}.info"
 random_ipv6_list_file="$proxy_dir/ipv6_${instance_id}.list"
+# A BGP-announced block routed to this host (e.g. 2602:f2dc:a9::/48): new
+# batches take one /64 of it per proxy instead of the NIC's /64. Empty = off.
+routed_prefix="$(netrun_setting NETRUN_IPV6_ROUTED_PREFIX "")"
 random_users_list_file="$proxy_dir/random_users_${instance_id}.list"
 if [[ $backconnect_proxies_file == "default" ]]; then backconnect_proxies_file="$proxy_dir/backconnect_proxies_${instance_id}.list"; fi;
 if [[ $port_ipv6_map_file == "default" ]]; then port_ipv6_map_file="$proxy_dir/port_ipv6_map_${instance_id}.csv"; fi;
@@ -651,11 +654,82 @@ function random_ipv6_suffixes() {
     END { if (n < count) exit 1 }'
 }
 
+# Routed prefix — COUNT addresses of PREFIX (a BGP-announced block routed to
+# this host: `ip -6 route add local PREFIX dev lo`), each in its OWN /64 that
+# no other batch's list under PROXY_DIR uses (anti-fraud groups by /64, so two
+# proxies in one /64 look like one client), the low 64 bits random. Exit 1
+# when the prefix has fewer free /64s than COUNT.
+function routed_ipv6_addresses() {
+  local prefix="$1" count="$2" dir="$3" own="$4"
+  python3 - "$prefix" "$count" "$dir" "$own" <<'PY'
+import glob, ipaddress, os, random, sys
+
+prefix = ipaddress.IPv6Network(sys.argv[1], strict=True)
+count, own = int(sys.argv[2]), os.path.abspath(sys.argv[4])
+if not 32 <= prefix.prefixlen <= 64:
+    sys.exit("routed prefix must be /32 .. /64")
+used = set()
+for path in glob.glob(os.path.join(sys.argv[3], "ipv6_*.list")):
+    if os.path.abspath(path) == own:
+        continue
+    with open(path) as f:
+        for line in f:
+            try:
+                addr = ipaddress.IPv6Address(line.strip())
+            except ValueError:
+                continue
+            if addr in prefix:
+                used.add(int(addr) >> 64)
+base, nets = int(prefix.network_address) >> 64, 1 << (64 - prefix.prefixlen)
+if nets - len(used) < count:
+    sys.exit(f"routed prefix {prefix}: {nets - len(used)} free /64 left, {count} needed")
+rng = random.SystemRandom()
+if nets <= 1 << 20:
+    picked = rng.sample([base + i for i in range(nets) if base + i not in used], count)
+else:
+    picked = set()
+    while len(picked) < count:
+        net = base + rng.randrange(nets)
+        if net not in used:
+            picked.add(net)
+for net in picked:
+    print(ipaddress.IPv6Address((net << 64) | rng.randrange(1, 1 << 64)))
+PY
+}
+
+# Every non-empty line of LIST is an address inside PREFIX (exit 0), else 1.
+function routed_list_inside() {
+  local prefix="$1" list="$2"
+  [ -s "$list" ] || return 1
+  python3 - "$prefix" "$list" <<'PY'
+import ipaddress, sys
+
+prefix = ipaddress.IPv6Network(sys.argv[1], strict=True)
+with open(sys.argv[2]) as f:
+    lines = [l.strip() for l in f if l.strip()]
+try:
+    sys.exit(0 if lines and all(ipaddress.IPv6Address(l) in prefix for l in lines) else 1)
+except ValueError:
+    sys.exit(1)
+PY
+}
+
 function generate_ipv6_addresses_if_needed() {
   # Generate IPv6 addresses early if they don't exist yet
   # This is needed for nftables counter setup
   if [ -f "$random_ipv6_list_file" ]; then
     echo "   Using existing IPv6 addresses from $random_ipv6_list_file"
+    return
+  fi
+
+  if [ -n "$routed_prefix" ]; then
+    echo "   Generating $proxy_count IPv6 addresses of the routed prefix $routed_prefix (one /64 each)..."
+    if ! routed_ipv6_addresses "$routed_prefix" "$proxy_count" "$proxy_dir" "$random_ipv6_list_file" \
+        > "${random_ipv6_list_file}.tmp"; then
+      rm -f "${random_ipv6_list_file}.tmp"
+      log_err_and_exit "Error: could not take $proxy_count /64s of the routed prefix $routed_prefix"
+    fi
+    mv -f "${random_ipv6_list_file}.tmp" "$random_ipv6_list_file"
     return
   fi
 
@@ -703,6 +777,12 @@ function create_startup_script() {
   local anchor_lft=" preferred_lft 0" anchor_dep
   anchor_dep="$(netrun_setting NETRUN_ANCHOR_DEPRECATE 1 | tr '[:upper:]' '[:lower:]')"
   case "$anchor_dep" in 0|off|false|no) anchor_lft="" ;; esac
+  # Decided by the batch's own list, not the setting alone: a list made before
+  # the prefix was configured keeps its anchors on the NIC.
+  local anchors_on_nic=true
+  if [ -n "$routed_prefix" ] && routed_list_inside "$routed_prefix" "$random_ipv6_list_file"; then
+    anchors_on_nic=false
+  fi
 
   # Wave CAPACITY-18K — the batch header no longer carries
   # `nscache 65536` / `nscache6 65536`. In the bundled 3proxy 0.9.3 they make
@@ -819,10 +899,15 @@ $dns_nserver_lines
 	# Audit FP-01: /128 and preferred_lft 0 — a deprecated anchor is never the
 	# kernel's choice of source for the node's OWN traffic (RFC 6724 rule 3),
 	# while 3proxy's explicit -e bind still uses it (NETRUN_ANCHOR_DEPRECATE=0: off).
+	# A batch of a routed prefix (NETRUN_IPV6_ROUTED_PREFIX) adds nothing: the
+	# prefix is routed to lo (local route), every address of it is a valid -e
+	# source without being on the NIC.
+	if [ "$anchors_on_nic" = true ]; then
 	ipv6_batch_file=\$(mktemp 2>/dev/null || echo "${random_ipv6_list_file}.ipbatch")
 	awk 'NF { print "address add " \$1 "/128 dev $interface_name nodad$anchor_lft" }' ${random_ipv6_list_file} > "\$ipv6_batch_file"
 	ip -6 -force -batch "\$ipv6_batch_file" >/dev/null 2>&1 || true
 	rm -f "\$ipv6_batch_file"
+	fi
 
 	# NOTE: We do NOT kill old proxy processes - each instance is independent!
 
