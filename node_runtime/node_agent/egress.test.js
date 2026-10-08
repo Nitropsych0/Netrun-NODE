@@ -603,6 +603,63 @@ test("nftRebuildScript: the exact table from the plan, one transaction", () => {
   }
 });
 
+test("canonicalRoutedPrefix: /16../64 only, host bits cleared, canonical text", () => {
+  assert.strictEqual(eg.canonicalRoutedPrefix("2602:F2DC:A9:0::5/48"), "2602:f2dc:a9::/48");
+  assert.strictEqual(eg.canonicalRoutedPrefix("2602:f2dc:a900::/40"), "2602:f2dc:a900::/40");
+  assert.strictEqual(eg.canonicalRoutedPrefix("2001:db8:1:2:ffff::/64"), "2001:db8:1:2::/64");
+  for (const bad of ["2602:f2dc:a9::/8", "::1/128", "2602:f2dc:a9::1/128", "2602:f2dc:a9::", "nope/48", "", null]) {
+    assert.strictEqual(eg.canonicalRoutedPrefix(bad), null, String(bad));
+  }
+});
+
+test("parseRoutedPrefixes: the BGP prefixes routed to lo, never ::1, host routes or the node's /64", () => {
+  const nic = eg.parsePrefix("2001:19f0:5c01:cdf::/64");
+  const out = [
+    "local ::1 proto kernel metric 0 pref medium",
+    "local 2602:f2dc:a9::/48 metric 1024 pref medium",
+    "local 2602:f2dc:a9:1200::/56 metric 1024 pref medium", // inside the /48: already covered
+    "local 2602:f2dc:b0::/48 metric 1024 pref medium",
+    "local 2602:f2dc:a9:dc9b:7109:664b:5fa0:46fb proto kernel metric 0 pref medium", // a host route
+    "local 2001:19f0:5c01:cdf::/64 metric 1024 pref medium", // the node's own /64
+    "local 2001:19f0::/32 metric 1024 pref medium", // covers the node's /64: never listed
+    "local 2602:f2dc:a9::/48 metric 1024 pref medium", // a duplicate
+    "broadcast 2602:f2dc:a9::/48", // not a local route
+  ].join("\n");
+  assert.deepStrictEqual(eg.parseRoutedPrefixes(out, nic), ["2602:f2dc:a9::/48", "2602:f2dc:b0::/48"]);
+  assert.deepStrictEqual(eg.parseRoutedPrefixes("local ::1 proto kernel metric 0 pref medium\n", nic), []);
+  assert.deepStrictEqual(eg.parseRoutedPrefixes("", nic), []);
+  // without the node's /64 nothing is dropped for overlapping it
+  assert.deepStrictEqual(eg.parseRoutedPrefixes("local 2001:19f0::/32 metric 1024\n"), ["2001:19f0::/32"]);
+});
+
+test("nftRebuildScript: routed prefixes are guarded with the /64 in one set", () => {
+  const routed = ["2602:f2dc:a9::/48", "2602:f2dc:b0::/48"];
+  const text = eg.nftRebuildScript(eg.emptyState(), "2001:db8:aaaa:5::/64", { primary: ["2001:db8:aaaa:5::1"], routed });
+  assert.ok(text.endsWith([
+    "\tchain exit_guard {",
+    "\t\ttype filter hook input priority filter - 10; policy accept;",
+    "\t\tiif \"lo\" accept",
+    "\t\tip6 daddr != { 2001:db8:aaaa:5::/64, 2602:f2dc:a9::/48, 2602:f2dc:b0::/48 } accept",
+    "\t\tip6 daddr 2001:db8:aaaa:5::1 accept",
+    "\t\tct state established,related accept",
+    "\t\ticmpv6 type echo-request drop",
+    "\t\tmeta l4proto ipv6-icmp accept",
+    "\t\tdrop",
+    "\t}",
+    "}",
+    "",
+  ].join("\n")));
+  // the forward guard stays on the /64 only: a routed prefix is local, never forwarded
+  assert.ok(text.includes("\t\tip6 daddr 2001:db8:aaaa:5::/64 drop\n"));
+  // guard off: no chain, routed prefixes or not
+  const off = eg.nftRebuildScript(eg.emptyState(), "2001:db8:aaaa:5::/64", { exitGuard: false, routed });
+  assert.ok(!off.includes("exit_guard") && !off.includes("2602:"));
+  // never a non-canonical prefix in the text
+  for (const bad of ["2602:F2DC:A9::/48", "2602:f2dc:a9::5/48", "2602:f2dc:a9::/8", "x/48; drop", "nope"]) {
+    assert.throws(() => eg.nftRebuildScript(eg.emptyState(), "2001:db8:aaaa:5::/64", { routed: [bad] }), TypeError, bad);
+  }
+});
+
 test("parsePrimaryAddrs: the node's own /64 address, never an anchor, /128 or nodad; capped", () => {
   const prefix = eg.parsePrefix("2001:db8:1:2::/64");
   const line = (a, rest) => `2: eth0    inet6 ${a} ${rest} \\       valid_lft forever preferred_lft forever`;

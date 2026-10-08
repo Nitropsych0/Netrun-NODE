@@ -44,14 +44,17 @@
 // node forwards for nobody).
 //
 // Exit guard (chain exit_guard, input hook). Every anchor is a local address
-// of the node's /64, so without a filter a port scan of a customer's exit
-// IPv6 finds sshd on :22 and the agent on :8085 — a server, not a home line —
-// and every closed port answers RST. A home router drops what nobody asked
-// for; so does this chain, for every address of the /64 except the node's
-// own (primary) address(es), which keep admin access over IPv6:
+// of the node's /64 — or of a BGP-routed prefix (`local <prefix> dev lo`,
+// NETRUN_IPV6_ROUTED_PREFIX: one /64 of a leased /48 per proxy) — so without
+// a filter a port scan of a customer's exit IPv6 finds sshd on :22, BIRD on
+// :179 and the agent on :8085 — a server, not a home line — and every closed
+// port answers RST. A home router drops what nobody asked for; so does this
+// chain, for every address of the /64 and of every routed prefix except the
+// node's own (primary) address(es), which keep admin access over IPv6:
 //   iif lo accept                  local traffic (a local connection to an
 //                                  anchor travels over lo with that daddr)
-//   ip6 daddr != <the /64> accept  link-local, multicast (router NS/RA, and
+//   ip6 daddr != { <the /64>, <routed prefixes> } accept
+//                                  link-local, multicast (router NS/RA, and
 //                                  DHCPv6 replies, which go to link-local),
 //                                  other prefixes
 //   ip6 daddr <primary> accept     the host's own address (parsePrimaryAddrs)
@@ -67,8 +70,11 @@
 // Priority filter - 10: before the proxy_accounting input chain (priority 0),
 // whose per-port meter matches `tcp dport` only (IPv6 too), so a scan of
 // [exit]:<a customer's port> is dropped before it is metered as theirs.
-// The primary set is recomputed at init and on every GC tick (a change →
-// one full rebuild); element deltas never touch chains.
+// The routed prefixes are read from the kernel (`ip -6 route show table local
+// dev lo`, parseRoutedPrefixes), so a new /48 is guarded as soon as its route
+// exists. The primary set and the routed prefixes are recomputed at init and
+// on every GC tick (a change → one full rebuild); element deltas never touch
+// chains.
 //
 // Owned here: the table, $PROXY_ROOT/egress_state.json, the proxy entries
 // for the addresses above, the egress interface's proxy-NDP sysctls (also
@@ -219,6 +225,61 @@ function parsePrefix(text) {
 function inPrefix(addr, prefix) {
   const groups = ipv6Groups(addr);
   return Boolean(groups) && prefix.groups.every((g, i) => groups[i] === g);
+}
+
+// A routed prefix the exit guard may list: /16../64. Shorter is a mistake (it
+// would hide a whole network behind the guard), longer is a host route.
+const ROUTED_PLEN_MIN = 16;
+const ROUTED_PLEN_MAX = 64;
+
+function groupsToBig(groups) {
+  return groups.reduce((acc, g) => (acc << 16n) | BigInt(g), 0n);
+}
+
+function bigToGroups(big) {
+  const out = [];
+  for (let i = 7; i >= 0; i -= 1) out.push(Number((big >> BigInt(i * 16)) & 0xffffn));
+  return out;
+}
+
+// "2602:F2DC:A9:0::5/48" -> "2602:f2dc:a9::/48" (host bits cleared), or null.
+function canonicalRoutedPrefix(text) {
+  const m = /^([^/\s]+)\/(\d{1,3})$/.exec(String(text || "").trim());
+  if (!m) return null;
+  const plen = Number(m[2]);
+  if (plen < ROUTED_PLEN_MIN || plen > ROUTED_PLEN_MAX) return null;
+  const groups = ipv6Groups(m[1]);
+  if (!groups) return null;
+  const mask = ((1n << BigInt(plen)) - 1n) << BigInt(128 - plen);
+  return `${formatIpv6(bigToGroups(groupsToBig(groups) & mask))}/${plen}`;
+}
+
+function prefixesOverlap(a, b) {
+  const [aAddr, aLen] = a.split("/");
+  const [bAddr, bLen] = b.split("/");
+  const shift = BigInt(128 - Math.min(Number(aLen), Number(bLen)));
+  return (groupsToBig(ipv6Groups(aAddr)) >> shift) === (groupsToBig(ipv6Groups(bAddr)) >> shift);
+}
+
+// `ip -6 route show table local dev lo` -> the prefixes routed to this host,
+// canonical, widest first. Host routes (::1, /128) and prefixes outside
+// /16../64 are skipped. A prefix overlapping the node's /64 (`nicPrefix`,
+// from parsePrefix) or a wider listed one is dropped: nft refuses
+// overlapping intervals in one set, and the wider entry already covers it.
+function parseRoutedPrefixes(text, nicPrefix = null) {
+  const found = new Set();
+  for (const m of String(text || "").matchAll(/^local\s+([0-9a-fA-F:]+\/\d+)\b/gm)) {
+    const canon = canonicalRoutedPrefix(m[1]);
+    if (canon) found.add(canon);
+  }
+  const ordered = [...found].sort((a, b) => Number(a.split("/")[1]) - Number(b.split("/")[1]) || a.localeCompare(b));
+  const out = [];
+  for (const p of ordered) {
+    if (nicPrefix && prefixesOverlap(p, nicPrefix.text)) continue;
+    if (out.some((q) => prefixesOverlap(p, q))) continue;
+    out.push(p);
+  }
+  return out;
 }
 
 // `count` fresh addresses: the prefix + 64 bits from crypto.randomBytes, none
@@ -740,13 +801,15 @@ function elementsBlock(list) {
 }
 
 // chain exit_guard (see the header). `primary`: canonical addresses inside
-// the /64 that keep inbound access (none → no such rule).
-function exitGuardLines(prefix, primary) {
+// the /64 that keep inbound access (none → no such rule). `routed`: the
+// routed prefixes (parseRoutedPrefixes) guarded with the /64.
+function exitGuardLines(prefix, primary, routed = []) {
+  const guarded = routed.length ? `{ ${[prefix, ...routed].join(", ")} }` : prefix;
   const lines = [
     "\tchain exit_guard {",
     "\t\ttype filter hook input priority filter - 10; policy accept;",
     "\t\tiif \"lo\" accept",
-    `\t\tip6 daddr != ${prefix} accept`,
+    `\t\tip6 daddr != ${guarded} accept`,
   ];
   if (primary.length === 1) lines.push(`\t\tip6 daddr ${primary[0]} accept`);
   else if (primary.length > 1) lines.push(`\t\tip6 daddr { ${primary.join(", ")} } accept`);
@@ -764,11 +827,14 @@ function exitGuardLines(prefix, primary) {
 // a node that has none yet. `prefix`: the node's /64 text ("2001:db8::/64"),
 // for the forward guard (chain forward_guard; see the header) and the exit
 // guard (chain exit_guard, unless `exitGuard` is false; `primary`: the
-// node's own addresses it lets in).
-function nftRebuildScript(state, prefix, { exitGuard = true, primary = [] } = {}) {
+// node's own addresses it lets in; `routed`: routed prefixes it guards too).
+function nftRebuildScript(state, prefix, { exitGuard = true, primary = [], routed = [] } = {}) {
   if (!parsePrefix(prefix)) throw new TypeError(`nftRebuildScript: bad /64 prefix ${prefix}`);
   for (const a of primary) {
     if (normalizeIpv6(a) !== a) throw new TypeError(`nftRebuildScript: bad primary address ${a}`);
+  }
+  for (const r of routed) {
+    if (canonicalRoutedPrefix(r) !== r) throw new TypeError(`nftRebuildScript: bad routed prefix ${r}`);
   }
   const d = desiredNft(state);
   return [
@@ -795,7 +861,7 @@ function nftRebuildScript(state, prefix, { exitGuard = true, primary = [] } = {}
     "\t\ttype filter hook forward priority filter; policy accept;",
     `\t\tip6 daddr ${prefix} drop`,
     "\t}",
-    ...(exitGuard ? exitGuardLines(prefix, primary) : []),
+    ...(exitGuard ? exitGuardLines(prefix, primary, routed) : []),
     "}",
     "",
   ].join("\n");
@@ -1067,9 +1133,22 @@ function createEgressService({
   // table written holds them; recomputed by init and every GC tick.
   let primary = [];
   let primaryNote = null; // the last detection result logged
+  // The routed prefixes the exit guard covers with the /64
+  // (parseRoutedPrefixes), as the last table written holds them.
+  let routed = [];
 
   function rebuildScript(s) {
-    return nftRebuildScript(s, prefix.text, { exitGuard: cfg.exitGuard, primary });
+    return nftRebuildScript(s, prefix.text, { exitGuard: cfg.exitGuard, primary, routed });
+  }
+
+  // The routed prefixes now (null: the listing failed — keep what we have).
+  async function detectRouted() {
+    const res = await run("ip", ["-6", "route", "show", "table", "local", "dev", "lo"], { timeoutMs: 30000 });
+    if (res.code !== 0) {
+      log.error(`[egress] exit guard: ip_route_show_failed: ${stderrOf(res)}; keeping ${routed.join(",") || "no"} routed prefix(es)`);
+      return null;
+    }
+    return parseRoutedPrefixes(res.stdout, prefix);
   }
 
   function markUnavailable(why) {
@@ -1413,6 +1492,8 @@ function createEgressService({
       if (cfg.exitGuard) {
         const found = await detectPrimary(notPrimary(index.all, s), net0.listing);
         if (found) primary = found;
+        const r = await detectRouted();
+        if (r) routed = r;
       }
       const res = await applyNft(rebuildScript(s));
       if (!res.ok) return markUnavailable(`nft_failed: ${res.detail}`);
@@ -1429,7 +1510,7 @@ function createEgressService({
       log.log(
         `[egress] ready: iface=${iface} prefix=${prefix.text} ports=${Object.keys(s.ports).length} `
         + `pool=${s.pool.length} draining=${s.draining.length} `
-        + `exit_guard=${cfg.exitGuard ? `on primary=${primary.join(",") || "none"}` : "off"}`
+        + `exit_guard=${cfg.exitGuard ? `on primary=${primary.join(",") || "none"} routed=${routed.join(",") || "none"}` : "off"}`
       );
       return true;
     }).finally(() => {
@@ -1609,6 +1690,7 @@ function createEgressService({
   // so the old primary is kept and the next tick tries again.
   async function ensureTable() {
     const was = primary;
+    const wasRouted = routed;
     let changed = false;
     if (cfg.exitGuard) {
       // without the cfg anchors an unflagged /64 anchor could pass for the
@@ -1622,6 +1704,12 @@ function createEgressService({
       const found = anchorsAll ? await detectPrimary(notPrimary(anchorsAll, state)) : null;
       changed = Boolean(found) && found.join(",") !== primary.join(",");
       if (changed) primary = found;
+      const r = await detectRouted();
+      if (r && r.join(",") !== routed.join(",")) {
+        log.log(`[egress] exit guard routed ${routed.join(",") || "none"} -> ${r.join(",") || "none"}`);
+        routed = r;
+        changed = true;
+      }
     }
     if (changed) {
       log.log(`[egress] exit guard primary ${was.join(",") || "none"} -> ${primary.join(",") || "none"}; rebuilding the table`);
@@ -1637,6 +1725,7 @@ function createEgressService({
     if (!rb.ok) {
       log.error(`[egress] nft rebuild failed: ${rb.detail}`);
       primary = was;
+      routed = wasRouted;
     }
   }
 
@@ -1895,6 +1984,7 @@ function createEgressService({
     // exit_guard: EGRESS_EXIT_GUARD; primary: what chain exit_guard lets in
     status: () => ({
       available: ready, reason, iface, prefix: prefix ? prefix.text : null, exit_guard: cfg.exitGuard, primary: primary.slice(),
+      routed: routed.slice(),
     }),
     snapshot: () => cloneState(state),
     config: () => ({ ...cfg }),
@@ -1922,6 +2012,8 @@ module.exports = {
   formatIpv6,
   parsePrefix,
   inPrefix,
+  canonicalRoutedPrefix,
+  parseRoutedPrefixes,
   generateAddresses,
   parseCfgAnchors,
   parseDefaultRouteDev,

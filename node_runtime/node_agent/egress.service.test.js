@@ -20,6 +20,8 @@ const path = require("path");
 const eg = require(path.resolve(__dirname, "egress.js"));
 
 const T = "ip6 netrun_egress";
+// The exit guard re-reads the routed prefixes on every GC tick.
+const ROUTES = "ip -6 route show table local dev lo";
 const PRIMARY = "2001:db8:1:2::1";
 const PREFIX = "2001:db8:1:2::/64";
 // chain exit_guard of a node whose only own address is PRIMARY
@@ -103,9 +105,13 @@ function parseTableBlock(lines) {
     i += 1;
     expect(i++, "\t\ttype filter hook input priority filter - 10; policy accept;");
     expect(i++, "\t\tiif \"lo\" accept");
-    const pfx = /^\t\tip6 daddr != (\S+\/64) accept$/.exec(lines[i++] || "");
-    if (!pfx) throw new Error(`syntax error at "${lines[i - 1]}" (want the exit guard's /64)`);
-    t.guard = { prefix: pfx[1], primary: [] };
+    const line = lines[i++] || "";
+    const pfx = /^\t\tip6 daddr != (\S+\/64) accept$/.exec(line);
+    const many = /^\t\tip6 daddr != \{ (\S+\/64), ([0-9a-f:/, ]+) \} accept$/.exec(line);
+    if (!pfx && !many) throw new Error(`syntax error at "${line}" (want the exit guard's /64)`);
+    t.guard = { prefix: (pfx || many)[1], primary: [] };
+    // routed prefixes guarded with the /64 (only present when there are some)
+    if (many) t.guard.routed = many[2].split(", ");
     const one = /^\t\tip6 daddr ([0-9a-f:]+) accept$/.exec(lines[i] || "");
     const set = /^\t\tip6 daddr \{ ([0-9a-f:, ]+) \} accept$/.exec(lines[i] || "");
     if (one) t.guard.primary = [one[1]];
@@ -213,6 +219,9 @@ function fakeHost({ iface = "eth0", route = true, nftMissing = false, sysctls = 
     // added with it). The host's own address: SLAAC, as on a Vultr node.
     flags: new Map([[PRIMARY, "dynamic mngtmpaddr noprefixroute"]]),
     proxies: new Set(), // `ip -6 neigh show proxy dev <iface>`
+    // `ip -6 route show table local dev lo`: BGP-routed prefixes (with ::1)
+    localRoutes: [],
+    refuseRouteShow: false,
     procSys: fakeProcSys(iface, sysctls),
     table: null,
     log: [], // every command, in order
@@ -233,6 +242,11 @@ function fakeHost({ iface = "eth0", route = true, nftMissing = false, sysctls = 
       if (host.refuseAddrShow) return { code: 1, stdout: "", stderr: "Cannot send dump request" };
       const lines = [...host.addrs].map(([ad, p]) => `2: ${host.iface}    inet6 ${ad}/${p} scope global ${host.flags.get(ad) ?? "nodad"} \\       valid_lft forever preferred_lft forever`);
       if (!a.endsWith("scope global")) lines.push(`2: ${host.iface}    inet6 fe80::1/64 scope link \\       valid_lft forever preferred_lft forever`);
+      return { code: 0, stdout: `${lines.join("\n")}\n`, stderr: "" };
+    }
+    if (a === "-6 route show table local dev lo") {
+      if (host.refuseRouteShow) return { code: 1, stdout: "", stderr: "Cannot send dump request" };
+      const lines = ["local ::1 proto kernel metric 0 pref medium", ...host.localRoutes.map((r) => `local ${r} metric 1024 pref medium`)];
       return { code: 0, stdout: `${lines.join("\n")}\n`, stderr: "" };
     }
     if (a === `-6 neigh show proxy dev ${host.iface}`) {
@@ -407,8 +421,10 @@ function assertConsistent(host, svc, root, msg = "", { foreign = new Set() } = {
   assert.deepStrictEqual(host.table.pool, want.pool, `${msg}: dyn pool`);
   assert.strictEqual(host.table.fwd, svc.status().prefix, `${msg}: forward guard for the node's /64`);
   const st = svc.status();
-  assert.deepStrictEqual(host.table.guard, st.exit_guard ? { prefix: st.prefix, primary: st.primary } : null,
-    `${msg}: exit guard for the node's /64 and its primary address(es)`);
+  const wantGuard = st.exit_guard ? { prefix: st.prefix, primary: st.primary } : null;
+  if (wantGuard && st.routed.length) wantGuard.routed = st.routed;
+  assert.deepStrictEqual(host.table.guard, wantGuard,
+    `${msg}: exit guard for the node's /64, its primary address(es) and the routed prefixes`);
   for (const a of [...want.staticMap.values(), ...want.pool]) assert.ok(host.proxies.has(a), `${msg}: ${a} has a proxy entry`);
   const ours = ourAddresses(s);
   for (const a of host.proxies) assert.ok(ours.has(a) || foreign.has(a), `${msg}: proxy entry ${a} leaked`);
@@ -431,7 +447,7 @@ test("init on a clean node: empty table, no addresses, ready", async () => {
   assert.strictEqual(svc.isAvailable(), false);
   assert.strictEqual(await svc.init(), true);
   assert.deepStrictEqual(svc.status(), {
-    available: true, reason: null, iface: "eth0", prefix: "2001:db8:1:2::/64", exit_guard: true, primary: [PRIMARY],
+    available: true, reason: null, iface: "eth0", prefix: "2001:db8:1:2::/64", exit_guard: true, primary: [PRIMARY], routed: [],
   });
   assert.strictEqual(host.nftScripts.length, 1);
   assert.ok(host.nftScripts[0].startsWith(`add table ${T}\ndelete table ${T}\ntable ${T} {`));
@@ -574,7 +590,7 @@ test("GC: due proxy entries deleted in one batch, no-op when nothing is due", as
   const calls = host.log.length;
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 0 });
   assert.deepStrictEqual(host.log.slice(calls), [
-    "ip -6 -o addr show dev eth0 scope global", `nft list chain ${T} exit_guard`, "ip -6 neigh show proxy dev eth0",
+    "ip -6 -o addr show dev eth0 scope global", ROUTES, `nft list chain ${T} exit_guard`, "ip -6 neigh show proxy dev eth0",
   ], "nothing due → only the primary, table and proxy-entry checks");
 
   clock.t += 600 * 1000;
@@ -1048,7 +1064,7 @@ test("the GC tick rebuilds a table that vanished (nft flush ruleset / systemctl 
   await svc.init();
   const idle = host.log.length;
   await svc.gcTick();
-  assert.deepStrictEqual(host.log.slice(idle), ["ip -6 -o addr show dev eth0 scope global", `nft list chain ${T} exit_guard`],
+  assert.deepStrictEqual(host.log.slice(idle), ["ip -6 -o addr show dev eth0 scope global", ROUTES, `nft list chain ${T} exit_guard`],
     "nothing mapped → still the exit guard's checks");
   // nothing mapped, but the exit guard is gone with the table: rebuilt
   host.table = null;
@@ -1068,7 +1084,7 @@ test("the GC tick rebuilds a table that vanished (nft flush ruleset / systemctl 
   const m = host.log.length;
   await svc.gcTick();
   assert.deepStrictEqual(host.log.slice(m), [
-    "ip -6 -o addr show dev eth0 scope global", `nft list chain ${T} exit_guard`, "ip -6 neigh show proxy dev eth0",
+    "ip -6 -o addr show dev eth0 scope global", ROUTES, `nft list chain ${T} exit_guard`, "ip -6 neigh show proxy dev eth0",
   ], "present → only the checks");
 });
 
@@ -1203,6 +1219,42 @@ test("exit guard: the GC tick follows the primary — a change is one full rebui
     await svc.gcTick();
     assert.deepStrictEqual(svc.status().primary, [PRIMARY], "readable again: still a cfg anchor, never primary");
   }
+});
+
+test("exit guard: routed prefixes on lo are guarded too; a new one is one rebuild; a failed listing keeps the old set", async () => {
+  const host = fakeHost();
+  host.localRoutes = ["2602:f2dc:a9::/48"];
+  const root = makeRoot();
+  const { svc } = makeService(host, root);
+  await svc.init();
+  assert.deepStrictEqual(host.table.guard, { ...GUARD, routed: ["2602:f2dc:a9::/48"] });
+  assert.deepStrictEqual(svc.status().routed, ["2602:f2dc:a9::/48"]);
+  assertConsistent(host, svc, root, "routed at init");
+
+  // a second /48 is routed here: the next tick guards it (one full rebuild)
+  host.localRoutes.push("2602:f2dc:b0::/48");
+  let n = host.nftScripts.length;
+  await svc.gcTick();
+  assert.strictEqual(host.nftScripts.length, n + 1, "one rebuild");
+  assert.ok(host.nftScripts.at(-1).startsWith(`add table ${T}\ndelete table ${T}`));
+  assert.deepStrictEqual(host.table.guard.routed, ["2602:f2dc:a9::/48", "2602:f2dc:b0::/48"]);
+
+  // nothing changed: no rebuild
+  n = host.nftScripts.length;
+  await svc.gcTick();
+  assert.strictEqual(host.nftScripts.length, n, "no change → no rebuild");
+
+  // the listing fails: the guard keeps both prefixes
+  host.refuseRouteShow = true;
+  await svc.gcTick();
+  assert.deepStrictEqual(svc.status().routed, ["2602:f2dc:a9::/48", "2602:f2dc:b0::/48"]);
+  host.refuseRouteShow = false;
+
+  // the routes go (BGP prefix withdrawn from lo): back to the /64 alone
+  host.localRoutes = [];
+  await svc.gcTick();
+  assert.deepStrictEqual(host.table.guard, GUARD);
+  assertConsistent(host, svc, root, "routes gone");
 });
 
 test("exit guard: more than MAX_PRIMARY_ADDRS unflagged /64 addresses → none is let in", async () => {

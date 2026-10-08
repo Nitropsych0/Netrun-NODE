@@ -732,14 +732,17 @@ local address of the node, so without a filter a port scan of a customer's exit 
 which anti-fraud services run against a visitor's IP — finds the node's sshd on `:22`
 and the agent on `:8085` (anything listening on `[::]`), and every closed port answers
 with a RST: an obvious server, not a home line. A home router silently drops what nobody asked for;
-`chain exit_guard` does the same for every address of the node's /64 except the node's
-own:
+`chain exit_guard` does the same for every address of the node's /64, and of every
+BGP-routed prefix (`local <prefix> dev lo`, e.g. a leased /48 behind
+`NETRUN_IPV6_ROUTED_PREFIX`), except the node's own address. The routed prefixes are read
+from the kernel at start and on every GC tick, so a new /48 is guarded as soon as its
+route exists (a change → one full rebuild); `/health` → `egress.routed` lists them:
 
 ```text
 chain exit_guard {
     type filter hook input priority filter - 10; policy accept;
     iif "lo" accept                          # local traffic, also to a local anchor
-    ip6 daddr != <the node's /64> accept     # link-local, multicast, other prefixes
+    ip6 daddr != { <the node's /64>, <routed prefixes> } accept   # link-local, multicast, other prefixes
     ip6 daddr <primary> accept               # the node's own address (none known: no rule)
     ct state established,related accept      # replies to connections the node opened
     icmpv6 type echo-request drop            # no ping answers on exit addresses
