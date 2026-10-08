@@ -389,6 +389,7 @@ function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07
       EGRESS_NFT_DROPIN: "off",
       EGRESS_SYSCTL_CONF: "off",
       EGRESS_PROC_SYS: host.procSys,
+      NETRUN_ENV_FILE: path.join(root, "no-such-netrun.env"),
       ...env,
     },
     run: host.run,
@@ -414,18 +415,22 @@ const ourAddresses = (s) => new Set([
 // there itself), none of ours is on the NIC, and proxy NDP is on.
 function assertConsistent(host, svc, root, msg = "", { foreign = new Set() } = {}) {
   const s = svc.snapshot();
+  const st = svc.status();
   const want = eg.desiredNft(s);
   assert.ok(host.table, `${msg}: table exists`);
   assert.deepStrictEqual(sorted(host.table.map), sorted(want.staticMap), `${msg}: static_egress`);
   assert.deepStrictEqual(sorted(host.table.dyn), sorted(want.dyn), `${msg}: dyn_anchors`);
   assert.deepStrictEqual(host.table.pool, want.pool, `${msg}: dyn pool`);
   assert.strictEqual(host.table.fwd, svc.status().prefix, `${msg}: forward guard for the node's /64`);
-  const st = svc.status();
   const wantGuard = st.exit_guard ? { prefix: st.prefix, primary: st.primary } : null;
   if (wantGuard && st.routed.length) wantGuard.routed = st.routed;
   assert.deepStrictEqual(host.table.guard, wantGuard,
     `${msg}: exit guard for the node's /64, its primary address(es) and the routed prefixes`);
-  for (const a of [...want.staticMap.values(), ...want.pool]) assert.ok(host.proxies.has(a), `${msg}: ${a} has a proxy entry`);
+  // an address of a routed prefix is local already (`local … dev lo`): never a proxy entry
+  for (const a of [...want.staticMap.values(), ...want.pool]) {
+    if (eg.inRoutedPrefix(a, st.routed)) assert.ok(!host.proxies.has(a), `${msg}: routed ${a} has no proxy entry`);
+    else assert.ok(host.proxies.has(a), `${msg}: ${a} has a proxy entry`);
+  }
   const ours = ourAddresses(s);
   for (const a of host.proxies) assert.ok(ours.has(a) || foreign.has(a), `${msg}: proxy entry ${a} leaked`);
   for (const a of ours) assert.ok(!host.addrs.has(a), `${msg}: ${a} is on the NIC`);
@@ -448,6 +453,7 @@ test("init on a clean node: empty table, no addresses, ready", async () => {
   assert.strictEqual(await svc.init(), true);
   assert.deepStrictEqual(svc.status(), {
     available: true, reason: null, iface: "eth0", prefix: "2001:db8:1:2::/64", exit_guard: true, primary: [PRIMARY], routed: [],
+    rotate_prefix: "2001:db8:1:2::/64",
   });
   assert.strictEqual(host.nftScripts.length, 1);
   assert.ok(host.nftScripts[0].startsWith(`add table ${T}\ndelete table ${T}\ntable ${T} {`));
@@ -458,7 +464,7 @@ test("init on a clean node: empty table, no addresses, ready", async () => {
   assert.strictEqual(sysctl(host, "net/ipv6/conf/eth0/accept_ra"), "0", "forwarding was on: accept_ra untouched");
   assertConsistent(host, svc, root, "init");
   assert.deepStrictEqual(svc.view(), {
-    items: [], pool: { size: 0, refreshed_at: null, idle_since: null }, draining: 0, prefix: "2001:db8:1:2::/64", iface: "eth0",
+    items: [], pool: { size: 0, refreshed_at: null, idle_since: null }, draining: 0, prefix: "2001:db8:1:2::/64", rotate_prefix: "2001:db8:1:2::/64", iface: "eth0",
   });
 });
 
@@ -1257,6 +1263,135 @@ test("exit guard: routed prefixes on lo are guarded too; a new one is one rebuil
   assertConsistent(host, svc, root, "routes gone");
 });
 
+// ── rotation inside the routed /48 (doctrine 2026-10-08) ─────────────────
+
+const R48 = "2602:f2dc:a9::/48";
+const inR48 = (a) => eg.inRoutedPrefix(a, [R48]);
+
+test("routed /48: rotate and the pool take one free /64 each — no proxy NDP, no ip listing, the generator's lists respected", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  const { svc, clock } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48 } });
+  await svc.init();
+  assert.strictEqual(svc.status().rotate_prefix, R48);
+  assert.strictEqual(svc.view().rotate_prefix, R48);
+  // a batch being generated has its list before its cfg: the /64 the next draw lands in is in it
+  const listedNet = `2602:f2dc:a9:${((rngCounter + 1) & 0xffff).toString(16)}::`;
+  fs.writeFileSync(path.join(root, "ipv6_50000.list"), `${listedNet}1\n`);
+  const logAt = host.log.length;
+  const batches = host.ipBatches.length;
+
+  const r = await svc.rotate([30000, 30001]);
+  assert.strictEqual(r.ok, true);
+  const got = r.items.map((it) => it.new_ipv6);
+  assert.ok(got.every(inR48), got.join());
+  assert.strictEqual(new Set(got.map(eg.net64Of)).size, 2, "each in its own /64");
+  assert.ok(got.every((a) => eg.net64Of(a) !== eg.net64Of(listedNet)), "never a /64 of the generator's list");
+  assert.strictEqual(host.ipBatches.length, batches, "no proxy entry");
+  assert.deepStrictEqual(host.log.slice(logAt).filter((l) => !l.startsWith("nft ")), [], "no NIC / neigh listing: only nft");
+  assertConsistent(host, svc, root, "routed rotate");
+
+  await svc.setMode([30002], "per_connection");
+  const pool = svc.snapshot().pool;
+  assert.strictEqual(pool.length, 4);
+  assert.ok(pool.every(inR48));
+  assert.strictEqual(new Set([...pool, ...got].map(eg.net64Of)).size, 6, "no /64 shared with a current");
+  assert.strictEqual(host.ipBatches.length, batches);
+  assertConsistent(host, svc, root, "routed pool");
+
+  // the old address drains; when due the GC only forgets it — nothing to delete
+  await svc.rotate([30000], { drainSec: 0 });
+  clock.t += 1000;
+  await svc.gcTick();
+  assert.ok(!svc.snapshot().draining.some((d) => d.addr === got[0]), "forgotten");
+  assert.strictEqual(host.ipBatches.length, batches, "no delete batch");
+  assertConsistent(host, svc, root, "routed gc");
+});
+
+test("routed /48: a restart re-adds proxy entries for NIC addresses only; the route gone → the /64 again, and a start forgets routed addresses", async () => {
+  const host = fakeHost();
+  const root = makeRoot();
+  const { svc: before, clock } = makeService(host, root);
+  await before.init();
+  const nicAddr = (await before.rotate([30000])).items[0].new_ipv6;
+  assert.ok(host.proxies.has(nicAddr));
+
+  // the /48 arrives (netrun-bgp apply, NETRUN_IPV6_ROUTED_PREFIX); agent restart
+  host.localRoutes = [R48];
+  const env = { NETRUN_IPV6_ROUTED_PREFIX: R48 };
+  const { svc } = makeService(host, root, { env, clock });
+  await svc.init();
+  assert.strictEqual(svc.snapshot().ports[30000].current, nicAddr, "a NIC address in use stays");
+  const routedAddr = (await svc.rotate([30001])).items[0].new_ipv6;
+  assert.ok(inR48(routedAddr));
+  assertConsistent(host, svc, root, "mixed");
+
+  // reboot: the proxy entries and the table are gone; the re-add holds the NIC address only
+  host.proxies = new Set();
+  host.table = null;
+  const batches = host.ipBatches.length;
+  const { svc: boot } = makeService(host, root, { env, clock });
+  await boot.init();
+  assert.strictEqual(host.ipBatches.length, batches + 1);
+  assert.strictEqual(host.ipBatches.at(-1), `neigh add proxy ${nicAddr} dev eth0\n`);
+  assert.strictEqual(boot.snapshot().ports[30001].current, routedAddr, "a routed address needs nothing to come back");
+  assertConsistent(host, boot, root, "after reboot");
+
+  // a start whose route listing fails keeps the routed address (a transient error)
+  host.refuseRouteShow = true;
+  const { svc: blind } = makeService(host, root, { env, clock });
+  await blind.init();
+  assert.strictEqual(blind.snapshot().ports[30001].current, routedAddr);
+  host.refuseRouteShow = false;
+
+  // the route goes: the next tick rotates inside the NIC /64 (proxy NDP) again
+  host.localRoutes = [];
+  await boot.gcTick();
+  assert.strictEqual(boot.status().rotate_prefix, PREFIX);
+  const back = (await boot.rotate([30002])).items[0].new_ipv6;
+  assert.ok(eg.inPrefix(back, eg.parsePrefix(PREFIX)) && host.proxies.has(back));
+  // a start without the route forgets the routed address: nothing answers for it
+  const { svc: noRoute } = makeService(host, root, { env, clock });
+  await noRoute.init();
+  assert.strictEqual(noRoute.snapshot().ports[30001].current, null);
+  assertConsistent(host, noRoute, root, "route gone");
+});
+
+test("routed /48: EGRESS_ROTATE_PREFIX=off keeps the /64; guard off still lists the routes; netrun.env is re-read every tick", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  const { svc } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48, EGRESS_ROTATE_PREFIX: "off" } });
+  await svc.init();
+  assert.strictEqual(svc.status().rotate_prefix, PREFIX);
+  const a = (await svc.rotate([30000])).items[0].new_ipv6;
+  assert.ok(host.proxies.has(a) && !inR48(a));
+
+  const host2 = fakeHost();
+  host2.localRoutes = [R48];
+  const root2 = makeRoot();
+  const { svc: noGuard } = makeService(host2, root2, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48, EGRESS_EXIT_GUARD: "off" } });
+  await noGuard.init();
+  assert.ok(host2.log.includes(ROUTES), "routes listed for the rotation");
+  assert.strictEqual(noGuard.status().rotate_prefix, R48);
+  const b = (await noGuard.rotate([30000])).items[0].new_ipv6;
+  assert.ok(inR48(b) && !host2.proxies.has(b));
+  assertConsistent(host2, noGuard, root2, "guard off, routed rotation");
+
+  const host3 = fakeHost();
+  host3.localRoutes = [R48];
+  const root3 = makeRoot();
+  const envFile = path.join(root3, "netrun.env");
+  fs.writeFileSync(envFile, "NETRUN_ANCHOR_DEPRECATE=0\n");
+  const { svc: fromFile } = makeService(host3, root3, { env: { NETRUN_ENV_FILE: envFile } });
+  await fromFile.init();
+  assert.strictEqual(fromFile.status().rotate_prefix, PREFIX);
+  fs.writeFileSync(envFile, `NETRUN_ANCHOR_DEPRECATE=0\nNETRUN_IPV6_ROUTED_PREFIX="${R48}"\n`);
+  await fromFile.gcTick();
+  assert.strictEqual(fromFile.status().rotate_prefix, R48, "no agent restart needed");
+});
+
 test("exit guard: more than MAX_PRIMARY_ADDRS unflagged /64 addresses → none is let in", async () => {
   const host = fakeHost();
   const root = makeRoot();
@@ -1269,6 +1404,7 @@ test("exit guard: more than MAX_PRIMARY_ADDRS unflagged /64 addresses → none i
   const svc = eg.createEgressService({
     env: {
       NODE_AGENT_PROXY_ROOT: root, EGRESS_NFT_DROPIN: "off", EGRESS_SYSCTL_CONF: "off", EGRESS_PROC_SYS: host.procSys,
+      NETRUN_ENV_FILE: path.join(root, "no-such-netrun.env"),
     },
     run: host.run,
     log: { log() {}, error: (m) => errors.push(m) },

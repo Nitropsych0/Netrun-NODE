@@ -51,6 +51,23 @@ dup="$(cat <(nets_of "$DIR/ipv6_18100.list") <(nets_of "$DIR/ipv6_19100.list") |
 printf '2001:19f0:5c01:cdf::1\nnot-an-address\n' > "$DIR/ipv6_20100.list"
 ok "batches take disjoint /64s; foreign lines ignored"
 
+# ── 2b. the agent's rotated / pool / draining addresses keep their /64 ──
+D3="$TMP/rot"; mkdir -p "$D3"
+cat > "$D3/egress_state.json" <<'JSON'
+{"version":1,"ports":{"30000":{"anchor":"2001:db8:d::1","current":"2001:db8:d:0:aaaa::1","mode":"static"},"30001":{"anchor":"2001:db8:d:1::1","current":null,"mode":"per_connection"}},
+ "pool":["2001:db8:d:2::5","bogus",7],"pool_refreshed_at":null,"pool_idle_since":null,
+ "draining":[{"addr":"2001:db8:d:3::9","until":"2026-10-08T00:00:00.000Z"},{"addr":"2001:19f0::1","until":"x"}]}
+JSON
+routed_ipv6_addresses 2001:db8:d::/62 1 "$D3" "$D3/ipv6_1.list" > "$D3/ipv6_1.list" || fail "one /64 is still free"
+[ "$(nets_of "$D3/ipv6_1.list")" = "$(python3 -c 'import ipaddress; print(int(ipaddress.IPv6Address("2001:db8:d:1::")) >> 64)')" ] \
+  || fail "took a /64 the agent uses: $(cat "$D3/ipv6_1.list")"
+if routed_ipv6_addresses 2001:db8:d::/62 2 "$D3" "$D3/ipv6_2.list" > /dev/null 2>&1; then
+  fail "allocated a /64 of the egress state"
+fi
+echo 'not json' > "$D3/egress_state.json"
+routed_ipv6_addresses 2001:db8:d::/62 3 "$D3" "$D3/ipv6_3.list" > /dev/null || fail "an unreadable state blocks nothing"
+ok "egress_state.json: currents, pool and draining /64s are taken; junk entries and an unreadable file ignored"
+
 # ── 3. exhaustion fails closed ────────────────────────────────────
 D2="$TMP/small"; mkdir -p "$D2"
 routed_ipv6_addresses 2001:db8:b::/60 16 "$D2" "$D2/ipv6_1.list" > "$D2/ipv6_1.list" || fail "/60 has 16 /64s"

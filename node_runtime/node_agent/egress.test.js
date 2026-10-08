@@ -800,3 +800,84 @@ test("findExecutable: absolute PATH entries first, then the sbin dirs; null when
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── rotation inside a routed prefix (doctrine 2026-10-08) ─────────────────
+
+test("rotationPrefix: the configured prefix while a routed prefix covers it; off / bad / not routed → the NIC /64", () => {
+  const routed = ["2602:f2dc:a9::/48"];
+  assert.deepStrictEqual(eg.rotationPrefix("", routed), { prefix: null, problem: null });
+  assert.deepStrictEqual(eg.rotationPrefix("off", routed), { prefix: null, problem: null });
+  assert.deepStrictEqual(eg.rotationPrefix("2602:F2DC:A9:0::5/48", routed), { prefix: "2602:f2dc:a9::/48", problem: null },
+    "canonical, host bits cleared");
+  assert.deepStrictEqual(eg.rotationPrefix("2602:f2dc:a9:100::/56", routed).prefix, "2602:f2dc:a9:100::/56",
+    "a part of a routed /48");
+  assert.deepStrictEqual(eg.rotationPrefix("2602:f2dc:a9::/48", ["2602:f2dc::/40"]).prefix, "2602:f2dc:a9::/48",
+    "covered by a wider routed prefix");
+  assert.match(eg.rotationPrefix("2602:f2dc:b0::/48", routed).problem, /not routed/);
+  assert.match(eg.rotationPrefix("2602:f2dc::/40", routed).problem, /not routed/, "wider than what is routed");
+  assert.match(eg.rotationPrefix("2602:f2dc:a9::/80", routed).problem, /bad rotation prefix/);
+  assert.match(eg.rotationPrefix("nonsense", routed).problem, /bad rotation prefix/);
+});
+
+test("inRoutedPrefix / net64Of", () => {
+  const routed = ["2602:f2dc:a9::/48", "2a0e::/32"];
+  assert.strictEqual(eg.inRoutedPrefix("2602:f2dc:a9:ffff::1", routed), true);
+  assert.strictEqual(eg.inRoutedPrefix("2602:f2dc:aa::1", routed), false);
+  assert.strictEqual(eg.inRoutedPrefix("2a0e:0:2:3::4", routed), true);
+  assert.strictEqual(eg.inRoutedPrefix("2a0e:1:2:3::4", routed), false, "outside the /32");
+  assert.strictEqual(eg.inRoutedPrefix("2001:db8::1", []), false);
+  assert.strictEqual(eg.inRoutedPrefix("not an address", routed), false);
+  assert.strictEqual(eg.net64Of("2602:f2dc:a9:12:aaaa::1"), 0x2602f2dc00a90012n);
+  assert.strictEqual(eg.net64Of("2602:f2dc:a9:12::"), eg.net64Of("2602:f2dc:a9:12:ffff:ffff:ffff:ffff"));
+  assert.strictEqual(eg.net64Of("bogus"), null);
+});
+
+// randomBytes(8) whose value is (high << 32) | low for consecutive calls
+function seqRandom(values) {
+  let i = 0;
+  return () => {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64BE(BigInt.asUintN(64, values[i % values.length]));
+    i += 1;
+    return b;
+  };
+}
+
+test("generateRoutedAddresses: one free /64 each, inside the prefix, never a used /64, suffix >= 2^32", () => {
+  const prefix = "2602:f2dc:a9::/48";
+  const used = new Set([eg.net64Of("2602:f2dc:a9:1::1"), eg.net64Of("2001:db8:1:2::1")]);
+  // draws: net 1 (used → redrawn), net 2, a host below 2^32 (redrawn), a host, net 2 again (taken now), net 3, a host
+  const rnd = seqRandom([1n, 2n, 5n, 0xabcdef0000000001n, 2n, 3n, 0x1234567800000009n]);
+  const { addrs, shared } = eg.generateRoutedAddresses(prefix, 2, used, rnd);
+  assert.deepStrictEqual(addrs, ["2602:f2dc:a9:2:abcd:ef00:0:1", "2602:f2dc:a9:3:1234:5678:0:9"]);
+  assert.strictEqual(shared, 0);
+
+  const real = eg.generateRoutedAddresses(prefix, 500, used);
+  const nets = new Set(real.addrs.map(eg.net64Of));
+  assert.strictEqual(nets.size, 500, "every address in its own /64");
+  for (const a of real.addrs) {
+    assert.ok(eg.inRoutedPrefix(a, [prefix]), a);
+    assert.ok(!used.has(eg.net64Of(a)), `${a}: a used /64`);
+    assert.ok(eg.ipv6Groups(a)[4] !== 0 || eg.ipv6Groups(a)[5] !== 0, `${a}: suffix below 2^32`);
+  }
+});
+
+test("generateRoutedAddresses: a dense prefix is drawn from its free /64s; none left → shared, never a failure", () => {
+  const prefix = "2602:f2dc:a9:100::/56"; // 256 /64s
+  const base = eg.net64Of("2602:f2dc:a9:100::");
+  const used = new Set();
+  for (let i = 0n; i < 250n; i += 1n) used.add(base + i); // 6 free: :1fa..:1ff
+  const { addrs, shared } = eg.generateRoutedAddresses(prefix, 6, used);
+  assert.strictEqual(shared, 0);
+  assert.deepStrictEqual(addrs.map((a) => Number(eg.net64Of(a) - base)).sort((x, y) => x - y), [250, 251, 252, 253, 254, 255]);
+
+  const more = eg.generateRoutedAddresses(prefix, 8, used);
+  assert.strictEqual(more.shared, 2, "6 free /64s for 8 addresses: 2 share");
+  assert.strictEqual(new Set(more.addrs).size, 8, "still 8 distinct addresses");
+  for (const a of more.addrs) assert.ok(eg.inRoutedPrefix(a, [prefix]));
+
+  // a routed /64: one /64 only, every address shares it
+  const one = eg.generateRoutedAddresses("2602:f2dc:a9:7::/64", 3, new Set());
+  assert.deepStrictEqual([one.addrs.length, one.shared], [3, 2]);
+  assert.ok(one.addrs.every((a) => eg.net64Of(a) === eg.net64Of("2602:f2dc:a9:7::")));
+});

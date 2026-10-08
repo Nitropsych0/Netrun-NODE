@@ -122,6 +122,8 @@ test("GET /health: additive supervisor / firewall / static cfg checks / nodeTuni
   assert.strictEqual(json.firewall.accountToggles, 0);
   assert.strictEqual(json.firewall.ephemeralGuard, false, "off in this test (env)");
   for (const key of ["orphanAnchorsDeprecated", "preferredNodad", "preferredNonNodad", "respawnHistory"]) assert.ok(key in json.supervisor, key);
+  // doctrine 2026-10-08: the rotation status (where new addresses come from)
+  for (const key of ["available", "prefix", "routed", "rotate_prefix", "exit_guard"]) assert.ok(key in json.egress, `egress.${key}`);
 });
 
 test("POST /firewall/desired: 400 on a bad body, 200 applied (ghost 40000 blocked), GET shows the persisted state", { timeout: 30_000 }, async () => {

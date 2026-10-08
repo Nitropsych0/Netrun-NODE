@@ -4163,6 +4163,10 @@ async function handleHealth(req, res) {
     // "not_served" when the file is fine), whether `netrun-https certs` runs
     // or one more run is pending (cached 5 s).
     httpsHostnames: httpsHostnamesStatus,
+    // Doctrine 2026-10-08 — additive. IPv6 rotation (egress.js): available /
+    // reason, the NIC /64, the routed prefixes the exit guard covers, and
+    // rotate_prefix — where new addresses come from (the routed /48 or the /64).
+    egress: egress.status(),
   });
 }
 

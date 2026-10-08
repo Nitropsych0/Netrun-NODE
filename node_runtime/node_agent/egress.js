@@ -43,6 +43,17 @@
 // and the /64 is on-link — back out to the router; chain forward_guard drops them (the
 // node forwards for nobody).
 //
+// Rotation inside a routed prefix (doctrine 2026-10-08). With
+// NETRUN_IPV6_ROUTED_PREFIX (EGRESS_ROTATE_PREFIX overrides; "off" = the NIC
+// /64) routed to this host (`local <prefix> dev lo`, netrun-bgp), new
+// addresses come from that prefix, each in a /64 nothing else uses (anchors,
+// the generator's ipv6_*.list, the state; the generator skips the state's
+// /64s in turn). Every address of the prefix is local already: no proxy entry,
+// no NIC address, no `ip` call at all — a rotate is one nft delta, and the GC
+// just forgets a due address. Proxy NDP remains for addresses of the NIC /64.
+// The setting and the routes are re-read on every GC tick; while the prefix is
+// not routed, new addresses come from the /64 again.
+//
 // Exit guard (chain exit_guard, input hook). Every anchor is a local address
 // of the node's /64 — or of a BGP-routed prefix (`local <prefix> dev lo`,
 // NETRUN_IPV6_ROUTED_PREFIX: one /64 of a leased /48 per proxy) — so without
@@ -114,6 +125,7 @@ const path = require("path");
 const net = require("net");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { nodeSetting } = require("./node_settings.js");
 
 const DEFAULT_PROXY_ROOT = "/opt/netrun/proxyserver";
 const STATE_FILENAME = "egress_state.json";
@@ -127,6 +139,7 @@ const NFT_CHUNK = 256;
 // Live cfgs and pay-per-GB single-port cfgs parked as `.disabled` (their
 // addresses stay on the NIC and the port may come back).
 const CFG_FILE_RE = /^3proxy_(\d+)\.cfg(\.disabled)?$/;
+const LIST_FILE_RE = /^ipv6_\d+\.list$/;
 const IFACE_RE = /^[A-Za-z0-9_.-]{1,32}$/;
 const MODES = new Set(["static", "per_connection"]);
 const DEFAULT_MAX_EXTRA_ADDRS = 40000;
@@ -301,6 +314,92 @@ function generateAddresses(prefix, count, taken, randomBytes = crypto.randomByte
     out.push(addr);
   }
   return out;
+}
+
+// The /64 an address is in, as a BigInt (its first 64 bits), or null.
+function net64Of(addr) {
+  const groups = ipv6Groups(addr);
+  return groups ? groupsToBig(groups) >> 64n : null;
+}
+
+// The routed prefix new addresses come from (doctrine 2026-10-08: rotation
+// inside the node's /48), or null = the NIC /64 with proxy NDP as before.
+// `configured`: EGRESS_ROTATE_PREFIX, else NETRUN_IPV6_ROUTED_PREFIX ("" /
+// "off" = none). Used only while some routed prefix (parseRoutedPrefixes)
+// covers it — an address outside every `local … dev lo` route would be
+// answered by nobody. Returns { prefix, problem }: problem is set when one is
+// configured but cannot be used.
+function rotationPrefix(configured, routed) {
+  const raw = String(configured || "").trim();
+  if (!raw || raw.toLowerCase() === "off") return { prefix: null, problem: null };
+  const canon = canonicalRoutedPrefix(raw);
+  if (!canon) return { prefix: null, problem: `bad rotation prefix ${raw} (want /${ROUTED_PLEN_MIN}../${ROUTED_PLEN_MAX})` };
+  const plen = Number(canon.split("/")[1]);
+  const covered = routed.some((r) => Number(r.split("/")[1]) <= plen && prefixesOverlap(r, canon));
+  return covered ? { prefix: canon, problem: null } : { prefix: null, problem: `${canon} is not routed to this host (no local route on lo)` };
+}
+
+// Whether `addr` is inside one of the routed prefixes: such an address is
+// local already (the `local … dev lo` route) and needs no proxy entry.
+function inRoutedPrefix(addr, routed) {
+  const groups = ipv6Groups(addr);
+  if (!groups) return false;
+  const big = groupsToBig(groups);
+  return routed.some((r) => {
+    const [a, l] = r.split("/");
+    const shift = BigInt(128 - Number(l));
+    return (big >> shift) === (groupsToBig(ipv6Groups(a)) >> shift);
+  });
+}
+
+// `count` fresh addresses of a routed prefix (/16../64), each in its OWN /64:
+// none of `usedNets` (BigInt /64s: anchors, the generator's lists, this
+// module's addresses — anti-fraud groups by /64, so two exits in one /64 look
+// like one client) and none taken twice; the low 64 bits random, never below
+// 2^32 (like generateAddresses). A sparse prefix is sampled at random; a dense
+// one (under half free, up to 2^20 /64s) from the list of its free /64s. With
+// no free /64 left an address shares one (counted in `shared`) rather than
+// failing the call. Returns { addrs, shared }.
+function generateRoutedAddresses(prefixText, count, usedNets, randomBytes = crypto.randomBytes) {
+  const [addrText, lenText] = String(prefixText).split("/");
+  const nets = 1n << BigInt(64 - Number(lenText));
+  const base = (groupsToBig(ipv6Groups(addrText)) >> 64n) & ~(nets - 1n);
+  const rand64 = () => randomBytes(8).readBigUInt64BE(0);
+  const anyNet = () => base + (rand64() & (nets - 1n));
+  const used = new Set();
+  for (const k of usedNets) if (k >= base && k < base + nets) used.add(k);
+  let free = null;
+  if (nets <= 1n << 20n && (nets - BigInt(used.size)) * 2n < nets) {
+    free = [];
+    for (let k = base; k < base + nets; k += 1n) if (!used.has(k)) free.push(k);
+  }
+  const addrs = [];
+  let shared = 0;
+  while (addrs.length < count) {
+    let net = null;
+    if (free) {
+      if (free.length) {
+        const j = Number(rand64() % BigInt(free.length));
+        net = free[j];
+        free[j] = free[free.length - 1];
+        free.pop();
+      }
+    } else {
+      for (let i = 0; i < 64 && net === null; i += 1) {
+        const k = anyNet();
+        if (!used.has(k)) net = k;
+      }
+    }
+    if (net === null) {
+      net = anyNet();
+      shared += 1;
+    }
+    used.add(net);
+    let host = rand64();
+    while (host >> 32n === 0n) host = rand64();
+    addrs.push(formatIpv6(bigToGroups((net << 64n) | host)));
+  }
+  return { addrs, shared };
 }
 
 // ── cfg anchors and `ip` output ──────────────────────────────────────────
@@ -1136,6 +1235,88 @@ function createEgressService({
   // The routed prefixes the exit guard covers with the /64
   // (parseRoutedPrefixes), as the last table written holds them.
   let routed = [];
+  // The routed prefix new addresses come from (rotationPrefix), null = the
+  // NIC /64. Recomputed by init and every GC tick.
+  let rotation = null;
+  let rotationNote = null; // the last result logged
+  const listCache = new Map(); // ipv6_*.list path -> { sig, nets }
+
+  // EGRESS_ROTATE_PREFIX, else NETRUN_IPV6_ROUTED_PREFIX (the generator's
+  // prefix): the environment, then netrun.env — re-read on every tick, so a
+  // new /48 needs no agent restart.
+  function configuredRotation() {
+    return nodeSetting("EGRESS_ROTATE_PREFIX", nodeSetting("NETRUN_IPV6_ROUTED_PREFIX", "", { env }), { env });
+  }
+
+  // The routed prefixes are listed for the exit guard and for the rotation.
+  function wantsRouted() {
+    const raw = String(configuredRotation() || "").trim().toLowerCase();
+    return cfg.exitGuard || (raw !== "" && raw !== "off");
+  }
+
+  function updateRotation() {
+    const r = rotationPrefix(configuredRotation(), routed);
+    rotation = r.prefix;
+    const note = r.prefix || r.problem || "";
+    if (note === rotationNote) return;
+    rotationNote = note;
+    if (r.problem) log.error(`[egress] rotation: ${r.problem}; new addresses come from ${prefix ? prefix.text : "the NIC /64"}`);
+    else if (r.prefix) log.log(`[egress] rotation inside ${r.prefix}: one /64 per address, no proxy NDP`);
+    else log.log(`[egress] rotation inside ${prefix ? prefix.text : "the NIC /64"} (proxy NDP)`);
+  }
+
+  // Proxy NDP answers for the NIC's on-link /64 only. An address of a routed
+  // prefix is local already (no entry); one outside both is answered by nobody.
+  function needsProxy(addr) {
+    return inPrefix(addr, prefix);
+  }
+
+  // /64s of the generator's ipv6_*.list files (a batch being generated has its
+  // list before its cfg), each file parsed once per version.
+  function readListNets() {
+    let files;
+    try {
+      files = fs.readdirSync(cfg.proxyRoot).filter((f) => LIST_FILE_RE.test(f));
+    } catch {
+      files = [];
+    }
+    const out = new Set();
+    const seen = new Set();
+    for (const f of files) {
+      const p = path.join(cfg.proxyRoot, f);
+      let st;
+      try { st = fs.statSync(p); } catch { continue; }
+      const sig = `${st.ino}:${st.size}:${st.mtimeMs}`;
+      let parsed = listCache.get(p);
+      if (!parsed || parsed.sig !== sig) {
+        let text;
+        try { text = fs.readFileSync(p, "utf-8"); } catch { continue; }
+        parsed = { sig, nets: new Set() };
+        for (const line of text.split("\n")) {
+          const k = net64Of(line);
+          if (k !== null) parsed.nets.add(k);
+        }
+        listCache.set(p, parsed);
+      }
+      seen.add(p);
+      for (const k of parsed.nets) out.add(k);
+    }
+    for (const k of [...listCache.keys()]) if (!seen.has(k)) listCache.delete(k);
+    return out;
+  }
+
+  // Every /64 in use: cfg anchors, the generator's lists, this module's addresses.
+  function usedNets(cfgAnchors, s) {
+    const out = readListNets();
+    const add = (a) => {
+      const k = net64Of(a);
+      if (k !== null) out.add(k);
+    };
+    for (const a of cfgAnchors) add(a);
+    for (const e of Object.values(s.ports)) add(e.anchor);
+    for (const a of addressesOf(s)) add(a);
+    return out;
+  }
 
   function rebuildScript(s) {
     return nftRebuildScript(s, prefix.text, { exitGuard: cfg.exitGuard, primary, routed });
@@ -1468,21 +1649,35 @@ function createEgressService({
       if (rec.dropped.length) log.log(`[egress] dropped ${rec.dropped.length} port(s) whose cfg/anchor is gone`);
       // A damaged file listing an anchor must not make us add (or later own) it.
       s.draining = s.draining.filter((d) => !index.all.has(d.addr));
+      // before the re-add: an address of a routed prefix needs no proxy entry
+      let routedKnown = true;
+      if (wantsRouted()) {
+        const r = await detectRouted();
+        if (r) routed = r;
+        else routedKnown = false;
+      }
+      updateRotation();
       const addrs = addressesOf(s);
+      const proxied = addrs.filter(needsProxy);
       nicLeftovers = new Map();
       if (addrs.length) {
-        let nic;
-        let proxies;
-        try {
-          nic = await listIface();
-          await ipBatch(proxyAddLines(addrs));
-          proxies = await listProxies();
-        } catch (err) {
-          return markUnavailable(errText(err));
+        let nic = new Map();
+        let proxies = new Set();
+        if (proxied.length) {
+          try {
+            nic = await listIface();
+            await ipBatch(proxyAddLines(proxied));
+            proxies = await listProxies();
+          } catch (err) {
+            return markUnavailable(errText(err));
+          }
+          await moveOffNic(proxied, nic, proxies, index.all);
         }
-        await moveOffNic(addrs, nic, proxies, index.all);
-        // answered for: a proxy entry, or (not moved) still on the NIC
-        const present = new Set([...proxies, ...addrs.filter((a) => nic.has(a))]);
+        // answered for: a proxy entry, (not moved) still on the NIC, or a routed
+        // prefix — every non-NIC address while the route listing failed (a
+        // transient error must not forget the node's whole rotation state)
+        const routedNow = (a) => !needsProxy(a) && (!routedKnown || inRoutedPrefix(a, routed));
+        const present = new Set([...proxies, ...proxied.filter((a) => nic.has(a)), ...addrs.filter(routedNow)]);
         const kept = dropMissing(s, present);
         if (kept.lost.length) {
           log.error(`[egress] ${kept.lost.length} address(es) not re-added; their ports leave from the anchor`);
@@ -1492,8 +1687,6 @@ function createEgressService({
       if (cfg.exitGuard) {
         const found = await detectPrimary(notPrimary(index.all, s), net0.listing);
         if (found) primary = found;
-        const r = await detectRouted();
-        if (r) routed = r;
       }
       const res = await applyNft(rebuildScript(s));
       if (!res.ok) return markUnavailable(`nft_failed: ${res.detail}`);
@@ -1508,7 +1701,7 @@ function createEgressService({
       ready = true;
       reason = null;
       log.log(
-        `[egress] ready: iface=${iface} prefix=${prefix.text} ports=${Object.keys(s.ports).length} `
+        `[egress] ready: iface=${iface} prefix=${prefix.text} rotate=${rotation || prefix.text} ports=${Object.keys(s.ports).length} `
         + `pool=${s.pool.length} draining=${s.draining.length} `
         + `exit_guard=${cfg.exitGuard ? `on primary=${primary.join(",") || "none"} routed=${routed.join(",") || "none"}` : "off"}`
       );
@@ -1525,6 +1718,7 @@ function createEgressService({
   // after the add leaves them for the GC instead of leaking them), then
   // provisioned as proxy entries.
   async function provision(before, count, cfgAnchors, nowMs) {
+    if (rotation) return provisionRouted(before, count, cfgAnchors, nowMs);
     let nic;
     let proxies;
     try {
@@ -1545,6 +1739,22 @@ function createEgressService({
       throw new EgressUnavailableError(`state_write_failed: ${errText(err)}`);
     }
     return { journal, fresh, present: await addProxies(fresh) };
+  }
+
+  // Rotation inside a routed prefix: every address of it is local (its `local
+  // … dev lo` route), so nothing is provisioned — the address is journaled and
+  // usable at once. Each one gets a /64 nothing else uses.
+  function provisionRouted(before, count, cfgAnchors, nowMs) {
+    const { addrs, shared } = generateRoutedAddresses(rotation, count, usedNets(cfgAnchors, before), randomBytes);
+    if (shared) log.error(`[egress] ${rotation}: no free /64 left; ${shared} address(es) share a /64`);
+    const journal = cloneState(before);
+    for (const a of addrs) addDraining(journal, a, nowMs);
+    try {
+      persist(journal);
+    } catch (err) {
+      throw new EgressUnavailableError(`state_write_failed: ${errText(err)}`);
+    }
+    return { journal, fresh: addrs, present: new Set(addrs) };
   }
 
   // nft first, then the file. A failed nft leaves the kernel as it was (each
@@ -1704,13 +1914,16 @@ function createEgressService({
       const found = anchorsAll ? await detectPrimary(notPrimary(anchorsAll, state)) : null;
       changed = Boolean(found) && found.join(",") !== primary.join(",");
       if (changed) primary = found;
+    }
+    if (wantsRouted()) {
       const r = await detectRouted();
       if (r && r.join(",") !== routed.join(",")) {
-        log.log(`[egress] exit guard routed ${routed.join(",") || "none"} -> ${r.join(",") || "none"}`);
+        log.log(`[egress] routed ${routed.join(",") || "none"} -> ${r.join(",") || "none"}`);
         routed = r;
-        changed = true;
+        if (cfg.exitGuard) changed = true;
       }
     }
+    updateRotation();
     if (changed) {
       log.log(`[egress] exit guard primary ${was.join(",") || "none"} -> ${primary.join(",") || "none"}; rebuilding the table`);
     } else {
@@ -1738,8 +1951,8 @@ function createEgressService({
   // back what is missing. Returns the listing (with what was re-added) for
   // the GC, or null.
   async function ensureProxyNdp(nowMs) {
-    const want = new Set(activeAddressesOf(state));
-    for (const d of state.draining) if (Date.parse(d.until) > nowMs) want.add(d.addr);
+    const want = new Set([...activeAddressesOf(state)].filter(needsProxy));
+    for (const d of state.draining) if (Date.parse(d.until) > nowMs && needsProxy(d.addr)) want.add(d.addr);
     if (want.size === 0) return null;
     const sys = ensureSysctls();
     if (!sys.ok) log.error(`[egress] ${sys.reason}`);
@@ -1856,6 +2069,7 @@ function createEgressService({
       pool: { size: state.pool.length, refreshed_at: state.pool_refreshed_at, idle_since: state.pool_idle_since },
       draining: state.draining.length,
       prefix: prefix ? prefix.text : null,
+      rotate_prefix: rotation || (prefix ? prefix.text : null),
       iface,
     };
   }
@@ -1985,6 +2199,8 @@ function createEgressService({
     status: () => ({
       available: ready, reason, iface, prefix: prefix ? prefix.text : null, exit_guard: cfg.exitGuard, primary: primary.slice(),
       routed: routed.slice(),
+      // where new addresses come from: a routed prefix, else the NIC /64
+      rotate_prefix: rotation || (prefix ? prefix.text : null),
     }),
     snapshot: () => cloneState(state),
     config: () => ({ ...cfg }),
@@ -2003,6 +2219,7 @@ module.exports = {
   createEgressService,
   start: () => defaultService().start(),
   isAvailable: () => defaultService().isAvailable(),
+  status: () => defaultService().status(),
   ownedAddresses: () => defaultService().ownedAddresses(),
   handleHttp: (...args) => defaultService().handleHttp(...args),
   forgetPorts: (ports) => defaultService().forgetPorts(ports),
@@ -2014,7 +2231,11 @@ module.exports = {
   inPrefix,
   canonicalRoutedPrefix,
   parseRoutedPrefixes,
+  rotationPrefix,
+  inRoutedPrefix,
+  net64Of,
   generateAddresses,
+  generateRoutedAddresses,
   parseCfgAnchors,
   parseDefaultRouteDev,
   parseIpAddrShow,

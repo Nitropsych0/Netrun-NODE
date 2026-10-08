@@ -688,6 +688,29 @@ NIC, another proxy entry, an anchor or an address of the state. The agent create
 (empty) table when it starts; with nothing rotated it changes no outgoing packet (the
 exit guard below filters inbound ones from the start).
 
+**Rotation inside a routed prefix (doctrine 2026-10-08).** With
+`NETRUN_IPV6_ROUTED_PREFIX` (the generator's /48; `EGRESS_ROTATE_PREFIX` overrides it,
+`off` = always the NIC /64) and its `local … dev lo` route present (`netrun-bgp`, "Own
+IPv6 prefix over BGP"), new addresses — rotations and the per-connection pool — come from
+that prefix instead of the NIC /64:
+
+- **one /64 per address**: a random /64 of the prefix that no anchor (cfgs), no
+  generator list (`ipv6_*.list`, a batch being generated has its list before its cfg)
+  and no current / pool / draining address uses; the generator skips the /64s of
+  `egress_state.json` in turn. A dense prefix is drawn from its list of free /64s; with
+  none left an address shares a /64 (logged) rather than failing the call;
+- **nothing to provision**: every address of the prefix is local already, so no proxy
+  entry, no NIC address, no `ip` listing — a rotate is one nft delta. The GC just forgets
+  a due address. Proxy NDP stays for addresses of the NIC /64 (older rotations, nodes
+  without a /48);
+- the setting is re-read from `netrun.env` and the routes from the kernel on every GC
+  tick: a new /48 needs no agent restart. While the configured prefix is not routed here
+  (route gone, typo) new addresses come from the NIC /64 again (logged); a start without
+  the route forgets routed currents (their ports leave from their anchors), a start whose
+  route listing fails keeps them;
+- `/health` → `egress.rotate_prefix` and `GET /egress` → `rotate_prefix` say where new
+  addresses come from.
+
 **Proxy NDP, not NIC addresses.** Rotated, pool and draining addresses are never put
 on the interface. Measured on a production node (Vultr, Ubuntu 24.04, kernel 6.8,
 ~16k anchors on `enp1s0`): every `ip address add|del` costs the kernel O(n) there —

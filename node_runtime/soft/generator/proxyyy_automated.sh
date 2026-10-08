@@ -656,13 +656,15 @@ function random_ipv6_suffixes() {
 
 # Routed prefix — COUNT addresses of PREFIX (a BGP-announced block routed to
 # this host: `ip -6 route add local PREFIX dev lo`), each in its OWN /64 that
-# no other batch's list under PROXY_DIR uses (anti-fraud groups by /64, so two
-# proxies in one /64 look like one client), the low 64 bits random. Exit 1
-# when the prefix has fewer free /64s than COUNT.
+# no other batch's list under PROXY_DIR uses and no rotated / pool / draining
+# address of the agent's PROXY_DIR/egress_state.json is in (the agent rotates
+# inside the same prefix and skips these lists in turn; anti-fraud groups by
+# /64, so two proxies in one /64 look like one client), the low 64 bits random.
+# Exit 1 when the prefix has fewer free /64s than COUNT.
 function routed_ipv6_addresses() {
   local prefix="$1" count="$2" dir="$3" own="$4"
   python3 - "$prefix" "$count" "$dir" "$own" <<'PY'
-import glob, ipaddress, os, random, sys
+import glob, ipaddress, json, os, random, sys
 
 prefix = ipaddress.IPv6Network(sys.argv[1], strict=True)
 count, own = int(sys.argv[2]), os.path.abspath(sys.argv[4])
@@ -680,6 +682,22 @@ for path in glob.glob(os.path.join(sys.argv[3], "ipv6_*.list")):
                 continue
             if addr in prefix:
                 used.add(int(addr) >> 64)
+try:
+    with open(os.path.join(sys.argv[3], "egress_state.json")) as f:
+        st = json.load(f)
+except (OSError, ValueError):
+    st = {}
+st = st if isinstance(st, dict) else {}
+taken = [e.get("current") for e in (st.get("ports") or {}).values() if isinstance(e, dict)]
+taken += list(st.get("pool") or [])
+taken += [d.get("addr") for d in (st.get("draining") or []) if isinstance(d, dict)]
+for raw in taken:
+    try:
+        addr = ipaddress.IPv6Address(str(raw))
+    except ValueError:
+        continue
+    if addr in prefix:
+        used.add(int(addr) >> 64)
 base, nets = int(prefix.network_address) >> 64, 1 << (64 - prefix.prefixlen)
 if nets - len(used) < count:
     sys.exit(f"routed prefix {prefix}: {nets - len(used)} free /64 left, {count} needed")

@@ -65,6 +65,7 @@ process.env.NODE_AGENT_NFT_PERSIST = path.join(ROOT, "nftables.conf");
 process.env.NODE_AGENT_HTTPS_SYNC_BIN = path.join(ROOT, "no-such-netrun-https");
 process.env.NODE_AGENT_API_KEY = "test-key";
 process.env.EGRESS_POOL_SIZE = "4";
+process.env.NETRUN_ENV_FILE = path.join(ROOT, "no-such-netrun.env"); // no rotation prefix from the host
 
 const ANCHOR_30000 = "2001:db8:1:2:a1b:c2:3:d4e";
 const ANCHOR_31000 = "2001:db8:1:2:3333::31";
@@ -170,6 +171,7 @@ test("after start: rotate / mode / reset / GET shapes over HTTP", async () => {
     pool: { size: 4, refreshed_at: get.body.pool.refreshed_at, idle_since: null },
     draining: 1,
     prefix: "2001:db8:1:2::/64",
+    rotate_prefix: "2001:db8:1:2::/64",
     iface: "eth0",
   });
   assert.ok(Number.isFinite(Date.parse(get.body.pool.refreshed_at)));
