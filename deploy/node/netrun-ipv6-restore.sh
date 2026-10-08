@@ -48,7 +48,9 @@ trap 'rm -f "$batch"' EXIT
 # Only NIC anchors (Vultr's on-link /64s are all in 2001:19f0::/32). Anchors of a
 # BGP-routed prefix (2602:f2dc:…, netrun-bgp) need nothing here: its `local …
 # dev lo` route makes every address of it a valid source (netrun-bgp-prefix.service).
-grep -rhoE -- '-e2001:[0-9a-f:]+' "$PROXY_ROOT/" 2>/dev/null | sed 's/^-e//' | sort -u \
+# Only live and parked cfgs: a failed attempt parked as *.cfg.failed (or any other
+# file under the root) must not bring 1500 dead anchors back at every boot.
+grep -rhoE --include='3proxy_*.cfg' --include='3proxy_*.cfg.disabled' -- '-e2001:[0-9a-f:]+' "$PROXY_ROOT/" 2>/dev/null | sed 's/^-e//' | sort -u \
   | awk -v dev="$IFACE" -v lft="$LFT" 'NF { print "address add " $1 "/128 dev " dev " nodad" lft }' > "$batch"
 count="$(wc -l < "$batch" | tr -d ' ')"
 

@@ -112,6 +112,10 @@ ok "netrun-https: 4-digit HTTP ports 8100+ are localized to 127.0.0.1 and fronte
 PR="$TMP/proxyserver"; mkdir -p "$PR/3proxy" "$TMP/stub"
 printf 'socks -6 -a -p18100 -i1.2.3.4 -e2001:db8::2\nproxy -6 -n -a -p8100 -i127.0.0.1 -e2001:db8::2\nsocks -6 -a -p18101 -i1.2.3.4 -e2001:db8::1\n' > "$PR/3proxy/3proxy_18100.cfg"
 printf 'socks -6 -a -p40000 -i1.2.3.4 -e2001:db8::1\n' > "$PR/3proxy/3proxy_40000.cfg.disabled"
+# never re-added: a parked failed attempt, a backup, a startup script
+printf 'socks -6 -a -p19600 -i1.2.3.4 -e2001:db8::dead\n' > "$PR/3proxy/3proxy_19600.cfg.failed"
+printf 'socks -6 -a -p18100 -i1.2.3.4 -e2001:db8::beef\n' > "$PR/3proxy/3proxy_18100.cfg.bak"
+printf 'ip -6 addr add x; 3proxy -e2001:db8::cafe\n' > "$PR/proxy-startup_18100.sh"
 cat > "$TMP/stub/ip" <<EOF
 #!/usr/bin/env bash
 echo "ip \$*" >> "$TMP/ip_calls"
@@ -142,7 +146,7 @@ grep -qx 'address add 2001:db8::1/128 dev enp1s0 nodad' "$TMP/ip_batch" || { cat
 printf '#!/bin/sh\nexit 0\n' > "$TMP/stub/ip"
 if PATH="$TMP/stub:$PATH" NETRUN_PROXY_ROOT="$PR" NETRUN_IPV6_IFACE="" bash "$RESTORE" 2>"$TMP/restore_err"; then fail "restore: no interface must exit non-zero"; fi
 grep -q 'ERROR: no IPv6 default route' "$TMP/restore_err" || fail "restore: no-interface message"
-ok "ipv6 restore: unique -e addresses, /128 deprecated (switchable), ONE ip -6 -force -batch with nodad, loud failure without an interface"
+ok "ipv6 restore: unique -e addresses of live/parked cfgs only (not .cfg.failed/.bak/scripts), /128 deprecated (switchable), ONE ip -6 -force -batch with nodad, loud failure without an interface"
 
 # ── 5. netrun-https sync: reload only when haproxy has not loaded the files ──
 # (a change, a stopped haproxy, or no verified reload of exactly these files:
