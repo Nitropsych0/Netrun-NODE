@@ -45,6 +45,9 @@ case "$(printf '%s' "${DEPRECATE:-1}" | tr '[:upper:]' '[:lower:]')" in 0|off|fa
 batch="$(mktemp 2>/dev/null)" || exit 1
 trap 'rm -f "$batch"' EXIT
 
+# Only NIC anchors (Vultr's on-link /64s are all in 2001:19f0::/32). Anchors of a
+# BGP-routed prefix (2602:f2dc:…, netrun-bgp) need nothing here: its `local …
+# dev lo` route makes every address of it a valid source (netrun-bgp-prefix.service).
 grep -rhoE -- '-e2001:[0-9a-f:]+' "$PROXY_ROOT/" 2>/dev/null | sed 's/^-e//' | sort -u \
   | awk -v dev="$IFACE" -v lft="$LFT" 'NF { print "address add " $1 "/128 dev " dev " nodad" lft }' > "$batch"
 count="$(wc -l < "$batch" | tr -d ' ')"

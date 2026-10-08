@@ -944,6 +944,57 @@ move off the NIC (all with the exit guard on), the GC, that unsolicited packets 
 rotated address are dropped at the forward hook, that a unicast reachability probe for
 one is answered, and that the saved ruleset (exit guard included) loads back at boot.
 
+## Own IPv6 prefix over BGP (doctrine 2026-10-08)
+
+One node carries one leased /48 (more later), announced to Vultr over BGP; the generator
+gives each proxy one random /64 of it (`NETRUN_IPV6_ROUTED_PREFIX`), the exit guard covers
+it (above). `scripts/netrun-bgp.sh` (installed as `/usr/local/sbin/netrun-bgp`) owns the
+node side; before 2026-10-08 Chicago had it by hand, with the same config.
+
+```text
+Vultr router ──BGP──► BIRD   export only: `route <P> unreachable` in a static protocol,
+                              import none, no `protocol kernel` (BIRD never touches routes)
+internet ──► <P> ──► host    `ip -6 route replace local <P> dev lo`: every address of P is
+                              local; 3proxy binds -e<addr> (net.ipv6.ip_nonlocal_bind=1)
+```
+
+Prerequisites (portal, by hand): BGP enabled for the account (Network → BGP: the ASN and
+the password), the prefix added there and approved (an LOA from the lessor; ROA for
+AS20473). Then in `/etc/netrun/netrun.env`:
+
+```bash
+NETRUN_IPV6_ROUTED_PREFIX=2602:f2dc:a9::/48
+NETRUN_BGP_LOCAL_ASN=4288000384
+NETRUN_BGP_PASSWORD=...
+```
+
+and `netrun-bgp apply --install` (or `node_followup_v2.sh`, which runs it when
+`NETRUN_BGP_LOCAL_ASN` is set). Other settings: `deploy/node/env.example`.
+
+- `apply` is idempotent, in an order that never announces a prefix without its local
+  route (without it Vultr's traffic for the prefix would bounce between the host and its
+  gateway): local routes of every prefix → `netrun-bgp-prefix.service` + a `bird.service`
+  drop-in (`Requires=`/`After=` that unit, so at boot BIRD starts only after the routes)
+  → the generated `/etc/bird/bird.conf`, checked by `bird -p` first (rejected: nothing in
+  BIRD changes), loaded by `birdc configure` → `NETRUN_BGP_WITHDRAW_WAIT` (10 s) later
+  the local routes of prefixes no longer announced. An unchanged config is not reloaded.
+  The previous file is kept as `<file>.netrun-prev`; `/etc/netrun/bgp-prefixes` lists
+  what was applied.
+- `apply --dry-run` changes nothing: the prefix delta, routes missing now, the session
+  parameters, and a diff (password redacted; "only the password changes" otherwise) of
+  bird.conf, the unit and the drop-in.
+- `status`: each prefix's local route and the BGP session; `check`: exit 1 unless every
+  route exists and the session is Established.
+- Restarting or stopping `netrun-bgp-prefix.service` restarts / stops BIRD with it
+  (`Requires=`): the prefix is withdrawn before its route goes.
+- A second prefix on the same node: add it to `NETRUN_BGP_PREFIXES` (space separated)
+  and `apply`. Moving a /48 to another node: `apply` on the new node first (after the
+  portal shows it there), then remove it from the old node's list and `apply` there.
+
+Tests: `bash scripts/test_netrun_bgp.sh` (stubs for ip/bird/birdc/systemctl; checks the
+order, idempotence, the dry run, a rejected config, and that the generated bird.conf
+equals Chicago's hand-made one).
+
 ## Smoke Generate
 
 ```bash

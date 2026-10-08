@@ -381,6 +381,21 @@ if [ "${NETRUN_HTTPS:-1}" = "1" ]; then
   fi
 fi
 
+# ── 5c) BGP: our own IPv6 prefix (a leased /48) ─────────────────
+# Only where /etc/netrun/netrun.env (or the environment) has NETRUN_BGP_LOCAL_ASN:
+# BGP enabled for the Vultr account and the prefix approved there. BIRD announces
+# the prefix, netrun-bgp-prefix.service routes it to lo at boot (README, "Own IPv6
+# prefix over BGP"). Non-fatal: the node's own /64 keeps working; rerun
+# `netrun-bgp apply --install`.
+_bgp_asn="${NETRUN_BGP_LOCAL_ASN:-$(grep -E '^NETRUN_BGP_LOCAL_ASN=' /etc/netrun/netrun.env 2>/dev/null | tail -n1 | cut -d= -f2- || true)}"
+if [ -n "$_bgp_asn" ]; then
+  _bgp_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/netrun-bgp.sh"
+  if [ -f "$_bgp_script" ]; then
+    log "Announcing our IPv6 prefix over BGP"
+    bash "$_bgp_script" apply --install || warn "WARNING: BGP setup failed — the node's /64 is unaffected; rerun: netrun-bgp apply --install"
+  fi
+fi
+
 # ── 6) Post-conditions ──────────────────────────────────────────
 log "─── Verification ───"
 printf "  restore unit  : "
@@ -399,5 +414,9 @@ printf "  threads-max   : "
 cat /proc/sys/kernel/threads-max
 printf "  nf_conntrack  : "
 cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "(module not loaded)"
+if [ -n "$_bgp_asn" ]; then
+  printf "  BGP           : "
+  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/netrun-bgp.sh" check 2>/dev/null | tr '\n' ' '; echo
+fi
 
 log "Follow-up v2 complete on $(hostname)"
