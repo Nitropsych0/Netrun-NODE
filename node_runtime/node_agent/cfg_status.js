@@ -11,8 +11,12 @@
 //   - createCfgInventory: re-parses a 3proxy_<start>.cfg only when its
 //     mtime/size changed (a batch cfg is ~1500 blocks; /health is polled);
 //   - createCoverageProbe: expected (cfg -e addresses) vs present (kernel)
-//     IPv6 addresses, recomputed at most every ttlMs (default 60 s).
+//     IPv6 addresses, recomputed at most every ttlMs (default 60 s). An
+//     address of a prefix routed to the host (`ip -6 route add local
+//     <prefix> dev lo`, a BGP-announced block) is present without being on
+//     any interface.
 
+const { execFile } = require("child_process");
 const fsp = require("fs/promises");
 const path = require("path");
 
@@ -193,6 +197,34 @@ function parseIfInet6(text, { iface = null } = {}) {
   return out;
 }
 
+// `ip -6 route show table local` text -> [{ net: BigInt, plen }] of the
+// `local` routes shorter than /128: prefixes routed to the host itself.
+function parseLocalRoutes(text) {
+  const out = [];
+  for (const m of String(text || "").matchAll(/^local\s+([0-9a-fA-F:]+)\/(\d+)\b/gm)) {
+    const hex = ipv6ToHex(m[1]);
+    const plen = Number(m[2]);
+    if (hex && plen > 0 && plen < 128) out.push({ net: BigInt(`0x${hex}`), plen });
+  }
+  return out;
+}
+
+function inRouted(hex, routed) {
+  if (!routed || routed.length === 0) return false;
+  const addr = BigInt(`0x${hex}`);
+  return routed.some(({ net, plen }) => addr >> BigInt(128 - plen) === net >> BigInt(128 - plen));
+}
+
+// The host's local routes; an error (no `ip`, a timeout) is no routed prefix,
+// never a failed probe.
+function readLocalRoutes({ timeoutMs = 5000 } = {}) {
+  return new Promise((resolve) => {
+    execFile("ip", ["-6", "route", "show", "table", "local"], { timeout: timeoutMs }, (err, stdout) =>
+      resolve(err ? [] : parseLocalRoutes(stdout))
+    );
+  });
+}
+
 // `ip -6 addr show [dev X]` / `ip -6 -o addr show` text -> Set of hex addresses.
 function parseIpAddrShow(text) {
   const out = new Set();
@@ -204,24 +236,30 @@ function parseIpAddrShow(text) {
 }
 
 // expected = iterable of IPv6 strings (cfg -e values; duplicates collapse);
-// present = Set of hex. -> { expected, present, missing, missingSample }.
-function computeAddressCoverage(expectedAddrs, presentHex, { sample = 10 } = {}) {
+// present = Set of hex; routed = parseLocalRoutes() (an address inside one is
+// present, counted in `routed` too).
+// -> { expected, present, missing, missingSample, routed }.
+function computeAddressCoverage(expectedAddrs, presentHex, { sample = 10, routed = [] } = {}) {
   const seen = new Set();
   const missingSample = [];
   let present = 0;
   let missing = 0;
+  let viaRoute = 0;
   for (const addr of expectedAddrs || []) {
     const hex = ipv6ToHex(addr);
     if (!hex || seen.has(hex)) continue;
     seen.add(hex);
     if (presentHex && presentHex.has(hex)) {
       present += 1;
+    } else if (inRouted(hex, routed)) {
+      present += 1;
+      viaRoute += 1;
     } else {
       missing += 1;
       if (missingSample.length < sample) missingSample.push(String(addr));
     }
   }
-  return { expected: seen.size, present, missing, missingSample };
+  return { expected: seen.size, present, missing, missingSample, routed: viaRoute };
 }
 
 // Fold the cfg inventory, the running 3proxy instances and the listening-port
@@ -341,6 +379,7 @@ function createCoverageProbe({
   ttlMs = 60_000,
   readCfgs,
   readPresent = async () => parseIfInet6(await fsp.readFile(IF_INET6_PATH, "utf-8")),
+  readRouted = () => readLocalRoutes(),
   now = () => Date.now(),
 } = {}) {
   let cached = null;
@@ -355,10 +394,11 @@ function createCoverageProbe({
       const expected = [];
       for (const c of inv.cfgs) for (const a of c.egress || []) expected.push(a);
       const presentHex = await readPresent();
+      const routed = await readRouted();
       return {
         ok: true,
         error: null,
-        ...computeAddressCoverage(expected, presentHex),
+        ...computeAddressCoverage(expected, presentHex, { routed }),
         source: IF_INET6_PATH,
         checkedAt: new Date(at).toISOString(),
       };
@@ -397,6 +437,8 @@ module.exports = {
   staticCfgChecks,
   parseIfInet6,
   parseIpAddrShow,
+  parseLocalRoutes,
+  readLocalRoutes,
   computeAddressCoverage,
   computeCfgStatus,
   createCfgInventory,

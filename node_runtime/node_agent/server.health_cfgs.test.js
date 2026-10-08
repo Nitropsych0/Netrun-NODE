@@ -183,6 +183,47 @@ test("coverage probe is cached for its TTL and recomputed after it", async () =>
   assert.strictEqual(c.missing, 0);
 });
 
+test("an address of a prefix routed to the host (local route on lo) is present", () => {
+  const routes = cfgStatus.parseLocalRoutes(
+    [
+      "local 2602:f2dc:a9::/48 dev lo metric 1024 pref medium",
+      "local 2001:19f0:5c01:cdf:5400:6ff:febe:b5cf dev enp1s0 proto kernel metric 0 pref medium",
+      "anycast 2001:19f0:5c01:cdf:: dev enp1s0 proto kernel metric 0 pref medium",
+      "local ::1 dev lo proto kernel metric 0 pref medium",
+      "multicast ff00::/8 dev enp1s0 proto kernel metric 256 pref medium",
+    ].join("\n")
+  );
+  assert.strictEqual(routes.length, 1, "only the /48: host addresses and non-local routes are no prefix");
+  assert.strictEqual(routes[0].plen, 48);
+  const cov = cfgStatus.computeAddressCoverage(
+    ["2602:f2dc:a9:1::1", "2602:f2dc:a9:ffff:ffff:ffff:ffff:ffff", "2602:f2dc:aa::1", "2001:db8:0:1:a:b:c:1"],
+    new Set(["20010db800000001000a000b000c0001"]),
+    { routed: routes }
+  );
+  assert.deepStrictEqual([cov.expected, cov.present, cov.missing, cov.routed], [4, 3, 1, 2]);
+  assert.deepStrictEqual(cov.missingSample, ["2602:f2dc:aa::1"]);
+  const noRoute = cfgStatus.computeAddressCoverage(["2602:f2dc:a9:1::1"], new Set());
+  assert.deepStrictEqual([noRoute.missing, noRoute.routed], [1, 0], "without the route the address is missing");
+});
+
+test("coverage probe counts routed addresses; a failed route read is no prefix", async () => {
+  const cfgs = async () => ({ ok: true, cfgs: [{ egress: ["2602:f2dc:a9:1::1", "2602:f2dc:a9:2::1"] }] });
+  const routed = cfgStatus.createCoverageProbe({
+    readCfgs: cfgs,
+    readPresent: async () => new Set(),
+    readRouted: async () => cfgStatus.parseLocalRoutes("local 2602:f2dc:a9::/48 dev lo metric 1024 pref medium"),
+  });
+  const a = await routed.get();
+  assert.deepStrictEqual([a.ok, a.present, a.missing, a.routed], [true, 2, 0, 2]);
+  const gone = cfgStatus.createCoverageProbe({
+    readCfgs: cfgs,
+    readPresent: async () => new Set(),
+    readRouted: async () => [],
+  });
+  const b = await gone.get();
+  assert.deepStrictEqual([b.ok, b.missing], [true, 2]);
+});
+
 test("coverage probe reports a read failure instead of throwing", async () => {
   const probe = cfgStatus.createCoverageProbe({
     readCfgs: async () => ({ ok: true, cfgs: [] }),
