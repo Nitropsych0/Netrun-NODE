@@ -12,3 +12,5 @@ PathChanged=/etc/netrun/tls/crt-list
 PathChanged=/etc/netrun/tls/node.pem
 PathChanged=/etc/netrun/tls/hosts
 Unit=netrun-pergb-certs.service
+# never stop watching because of a burst of writes (see netrun-pergb-certs.service)
+TriggerLimitIntervalSec=0

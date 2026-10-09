@@ -4,6 +4,11 @@
 [Unit]
 Description=NETRUN per-GB haproxy: reload after a certificate change
 After=netrun-pergb-haproxy.service
+# netrun-https writes the crt-list and several PEMs in one go: each write fires the
+# path unit, and the default start limit (5 in 10 s) failed this unit on the first
+# issuance (2026-10-09) — the path unit then stopped watching and the per-GB
+# haproxy kept serving the IP certificate. The reload script is idempotent.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

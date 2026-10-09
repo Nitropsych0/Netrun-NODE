@@ -14,7 +14,8 @@
 #
 # Settings (environment, for the tests): NETRUN_HTTPS_TLS_DIR (/etc/netrun/tls),
 # NETRUN_PERGB_HAPROXY_CFG (/opt/netrun/pergb/haproxy/haproxy.cfg),
-# NETRUN_PERGB_CERTS_STAMP (/run/netrun-pergb/certs-applied.sha).
+# NETRUN_PERGB_CERTS_STAMP (/run/netrun-pergb/certs-applied.sha),
+# NETRUN_PERGB_CERTS_SETTLE (seconds to let a burst of writes settle, 2).
 set -uo pipefail
 
 TLS_DIR="${NETRUN_HTTPS_TLS_DIR:-/etc/netrun/tls}"
@@ -41,31 +42,37 @@ write_stamp() {
 }
 
 main() {
-  local h
-  h="$(certs_hash)"
+  local h _
   if [ "${1:-}" = "--stamp" ]; then
-    write_stamp "$h"
+    write_stamp "$(certs_hash)"
     return 0
   fi
-  if ! systemctl is-active --quiet "$UNIT"; then
-    # not running: the next start loads the current files (and stamps them)
-    rm -f "$STAMP"
-    return 0
-  fi
-  if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$h" ]; then
-    return 0
-  fi
-  if ! haproxy -c -q -f "$CFG" >/dev/null 2>&1; then
-    log "haproxy rejects $CFG with the current certificates — not reloading (the running haproxy keeps the old ones)"
-    return 1
-  fi
-  if systemctl reload "$UNIT"; then
+  # netrun-https writes the crt-list and the PEMs one after another, and a write that
+  # lands while this runs does not start the unit again (it is still active): let the
+  # burst settle first, and after a reload look again (at most 5 reloads per run).
+  sleep "${NETRUN_PERGB_CERTS_SETTLE:-2}"
+  for _ in 1 2 3 4 5; do
+    if ! systemctl is-active --quiet "$UNIT"; then
+      # not running: the next start loads the current files (and stamps them)
+      rm -f "$STAMP"
+      return 0
+    fi
+    h="$(certs_hash)"
+    if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$h" ]; then
+      return 0
+    fi
+    if ! haproxy -c -q -f "$CFG" >/dev/null 2>&1; then
+      log "haproxy rejects $CFG with the current certificates — not reloading (the running haproxy keeps the old ones)"
+      return 1
+    fi
+    if ! systemctl reload "$UNIT"; then
+      log "systemctl reload $UNIT failed"
+      return 1
+    fi
     write_stamp "$h"
     log "certificates changed — $UNIT reloaded"
-    return 0
-  fi
-  log "systemctl reload $UNIT failed"
-  return 1
+  done
+  return 0
 }
 
 main "$@"

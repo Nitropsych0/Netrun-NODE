@@ -217,6 +217,10 @@ grep -qx 'CPUWeight=40' "$U/netrun-pergb.slice" && grep -qx 'MemoryMax=2048M' "$
   && grep -qx 'MemoryHigh=1740M' "$U/netrun-pergb.slice" && grep -qx 'TasksMax=8500' "$U/netrun-pergb.slice" \
   || fail "slice values: $(grep = "$U/netrun-pergb.slice")"
 grep -qx 'CPUWeight=40' "$U/netrun.slice" || fail "netrun.slice CPU weight"
+# a burst of certificate writes must never fail the reload unit (start-limit-hit left
+# haproxy on the IP certificate, 2026-10-09)
+grep -qx 'StartLimitIntervalSec=0' "$U/netrun-pergb-certs.service" || fail "certs.service start limit"
+grep -qx 'TriggerLimitIntervalSec=0' "$U/netrun-pergb-certs.path" || fail "certs.path trigger limit"
 grep -qx 'What=/var/lib/netrun-pergb/log.img' "$U/var-log-netrun\x2dpergb.mount" && grep -qx 'Where=/var/log/netrun-pergb' "$U/var-log-netrun\x2dpergb.mount" \
   && grep -qx 'RequiresMountsFor=/var/lib/netrun-pergb' "$U/var-log-netrun\x2dpergb.mount" || fail "mount unit rendered"
 grep -q '@' "$U/var-log-netrun\x2dpergb.mount" && fail "placeholders left in the mount unit"
