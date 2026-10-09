@@ -450,3 +450,24 @@ test("pool file text and parsing; /64 wire forms", () => {
   assert.deepStrictEqual(listeners[0], { ip: "203.0.113.10", port: 31000, pids: [999, 1000], procs: ["haproxy", "haproxy"] });
   assert.strictEqual(listeners[1].ip, "*");
 });
+
+test("the per-piece /64 scan (excluded): cfg variants, lists and their temps, the egress state; only the /48; complete flag", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pgx-"));
+  fs.mkdirSync(path.join(dir, "3proxy"));
+  fs.writeFileSync(path.join(dir, "3proxy", "3proxy_20000.cfg"), "socks -6 -a -p20000 -i1.2.3.4 -e2001:db8:aa:1::5\n");
+  fs.writeFileSync(path.join(dir, "3proxy", "3proxy_21000.cfg.disabled"), "socks -6 -a -p21000 -i1.2.3.4 -e2001:db8:aa:2::5\n");
+  fs.writeFileSync(path.join(dir, "3proxy", "3proxy_22000.cfg.failed"), "socks -6 -a -p22000 -i1.2.3.4 -e2001:db8:aa:3::5\n");
+  fs.writeFileSync(path.join(dir, "ipv6_23000.list"), "2001:db8:aa:4::1\n2001:db8:bb:4::1\n");
+  fs.writeFileSync(path.join(dir, "ipv6_24000.list.tmp"), "2001:db8:aa:5::1\n");
+  fs.writeFileSync(
+    path.join(dir, "egress_state.json"),
+    JSON.stringify({ ports: { 20000: { anchor: "2001:db8:aa:6::1", current: "2001:db8:aa:7::1" } }, pool: ["2001:db8:aa:8::1"], draining: [{ addr: "2001:db8:aa:9::1" }], pergb_held: [{ net: "2001:db8:aa:a::/64" }] })
+  );
+  const base = require("./pergb_tag.js").parsePrefix48(PREFIX).base;
+  const r = stateLib.scanPerPieceNets({ proxyRoot: dir, prefixBase: base });
+  assert.deepStrictEqual([...r.nets].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.strictEqual(r.complete, true);
+  fs.writeFileSync(path.join(dir, "egress_state.json"), "{broken");
+  assert.strictEqual(stateLib.scanPerPieceNets({ proxyRoot: dir, prefixBase: base }).complete, false, "an unreadable source makes the scan incomplete (add-only in RADIUS)");
+  fs.rmSync(dir, { recursive: true, force: true });
+});

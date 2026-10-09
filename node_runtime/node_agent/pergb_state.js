@@ -175,6 +175,8 @@ function scanPerPieceNets({ proxyRoot, prefixBase }) {
     }
     for (const a of Array.isArray(raw && raw.pool) ? raw.pool : []) add(a);
     for (const d of Array.isArray(raw && raw.draining) ? raw.draining : []) add(d && d.addr);
+    // per-piece rotation /64s held from the pool (lane L9's egress.js)
+    for (const h of Array.isArray(raw && raw.pergb_held) ? raw.pergb_held : []) add(h && h.net);
   } catch (e) {
     if (e && e.code !== "ENOENT") errors.push(`read ${sp}: ${e.message || e}`);
   }
@@ -1228,8 +1230,18 @@ function createPergb(deps = {}) {
     const readline = require("readline");
     const found = [];
     for (const f of files) {
-      if (!fs.existsSync(f)) continue;
-      let input = fs.createReadStream(f);
+      let input;
+      try {
+        // the log directory belongs to the proxy user: never follow a symlink
+        const fd = fs.openSync(f, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        if (!fs.fstatSync(fd).isFile()) {
+          fs.closeSync(fd);
+          continue;
+        }
+        input = fs.createReadStream(null, { fd });
+      } catch {
+        continue;
+      }
       if (f.endsWith(".gz")) input = input.pipe(zlib.createGunzip());
       const rl = readline.createInterface({ input, crlfDelay: Infinity });
       try {

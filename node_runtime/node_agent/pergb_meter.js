@@ -61,6 +61,12 @@ const UNKNOWN_SAMPLE_CAP = 1000;
 const TUPLE_TTL_MS = 30 * 60 * 1000;
 const TUPLE_CAP = 200000;
 const DEFAULT_LOGDUMP = 262144;
+// The log directory belongs to netrun-pergb (the proxy user): every log file
+// is opened without following a symlink and must be a regular file, and the
+// archive directory must be ours (not a symlink, our uid) before anything is
+// written into it — a compromised 3proxy-pergb must not steer the root agent.
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+const READ_NOFOLLOW = fs.constants.O_RDONLY | O_NOFOLLOW;
 
 // ── record parsing ───────────────────────────────────────────────────────
 
@@ -204,6 +210,8 @@ function createMeter(opts = {}) {
   let lastError = null;
   let persistFailures = 0;
   const archiving = new Set();
+  const archiveRetryAt = new Map();
+  const notRegular = new Set();
   const archivedNames = new Set();
   let lastRetentionAt = 0;
 
@@ -239,7 +247,7 @@ function createMeter(opts = {}) {
   // Position just after the last "\n" of a file (fresh-state start).
   function endOfLastLine(file, size) {
     if (size === 0) return 0;
-    const fd = fsx.openSync(file, "r");
+    const fd = fsx.openSync(file, READ_NOFOLLOW);
     try {
       const chunk = 65536;
       let pos = size;
@@ -313,10 +321,11 @@ function createMeter(opts = {}) {
       const file = path.join(logDir, f.name);
       let st;
       try {
-        st = fsx.statSync(file);
+        st = fsx.lstatSync(file);
       } catch {
         continue;
       }
+      if (!st.isFile()) continue;
       const off = endOfLastLine(file, st.size);
       s.files[f.name] = { ino: st.ino, off, size: st.size, growAt: now() };
       if (off > 0) {
@@ -427,8 +436,15 @@ function createMeter(opts = {}) {
       const file = path.join(logDir, f.name);
       let st;
       try {
-        st = fsx.statSync(file);
+        st = fsx.lstatSync(file);
       } catch {
+        continue;
+      }
+      if (!st.isFile()) {
+        if (!notRegular.has(f.name)) {
+          notRegular.add(f.name);
+          event("pergb_meter_not_a_file", { file: f.name });
+        }
         continue;
       }
       let cur = newFiles[f.name];
@@ -457,7 +473,7 @@ function createMeter(opts = {}) {
         const len = Math.min(want, budget);
         if (len < want) behind = true;
         const buf = Buffer.alloc(len);
-        const fd = fsx.openSync(file, "r");
+        const fd = fsx.openSync(file, READ_NOFOLLOW);
         let got;
         try {
           got = fsx.readSync(fd, buf, 0, len, cur.off);
@@ -614,25 +630,50 @@ function createMeter(opts = {}) {
   function scheduleArchives(files) {
     dropDeadTails(files);
     for (const name of finishedFiles(files)) {
-      if (archiving.has(name)) continue;
+      if (archiving.has(name) || (archiveRetryAt.get(name) || 0) > now()) continue;
       archiving.add(name);
       archiveOne(name)
-        .catch((e) => log.error(`[pergb-meter] archive ${name}: ${(e && e.message) || e}`))
+        .then(() => archiveRetryAt.delete(name))
+        .catch((e) => {
+          archiveRetryAt.set(name, now() + 5 * 60 * 1000);
+          log.error(`[pergb-meter] archive ${name}: ${(e && e.message) || e} (retried in 5 min)`);
+        })
         .finally(() => archiving.delete(name));
+    }
+  }
+
+  // archive/ must be a real directory of ours (install_pergb.sh: 0750 root).
+  async function safeArchiveDir() {
+    try {
+      await fsp.mkdir(archiveDir, { mode: 0o750 });
+    } catch (e) {
+      if (!e || e.code !== "EEXIST") throw e;
+    }
+    const st = await fsp.lstat(archiveDir);
+    const uid = typeof process.getuid === "function" ? process.getuid() : st.uid;
+    if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== uid) {
+      throw new Error(`${archiveDir} is not a directory owned by uid ${uid}: nothing is archived`);
     }
   }
 
   async function archiveOne(name) {
     const src = path.join(logDir, name);
-    await fsp.mkdir(archiveDir, { recursive: true });
+    await safeArchiveDir();
     const dst = path.join(archiveDir, `${name}.gz`);
     const tmp = `${dst}.tmp`;
-    await pipeline(fs.createReadStream(src), zlib.createGzip({ level: 6 }), fs.createWriteStream(tmp, { mode: 0o640 }));
-    const fh = await fsp.open(tmp, "r");
-    try {
-      await fh.sync();
-    } finally {
+    await fsp.rm(tmp, { force: true });
+    const fh = await fsp.open(src, READ_NOFOLLOW);
+    if (!(await fh.stat()).isFile()) {
       await fh.close();
+      throw new Error(`${src} is not a regular file`);
+    }
+    const input = fh.createReadStream();
+    await pipeline(input, zlib.createGzip({ level: 6 }), fs.createWriteStream(tmp, { flags: "wx", mode: 0o640 }));
+    const out = await fsp.open(tmp, "r");
+    try {
+      await out.sync();
+    } finally {
+      await out.close();
     }
     await fsp.rename(tmp, dst);
     await fsp.unlink(src);
@@ -796,7 +837,12 @@ function createMeter(opts = {}) {
     }
     items.sort((a, b) => a.hourMs - b.hourMs || a.sp - b.sp);
     for (const it of items) {
-      let input = fs.createReadStream(it.file);
+      let input;
+      try {
+        input = fs.createReadStream(null, { fd: fs.openSync(it.file, READ_NOFOLLOW) });
+      } catch {
+        continue;
+      }
       if (it.gz) input = input.pipe(zlib.createGunzip());
       const rl = readline.createInterface({ input, crlfDelay: Infinity });
       try {

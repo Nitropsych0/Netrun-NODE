@@ -481,3 +481,31 @@ test("attribution reader: records of a time window from the live logs and the ar
   for await (const r of m.recordsBetween(Date.UTC(2026, 9, 9, 13, 0), Date.UTC(2026, 9, 9, 15, 0))) late.push(r);
   assert.strictEqual(late.length, 1);
 });
+
+test("the proxy-owned log directory cannot steer the agent: symlinked logs are skipped, a symlinked archive/ gets nothing", async () => {
+  const dir = tmpdir("symlink");
+  const now = clock();
+  const events = [];
+  const m = newMeter(dir, now, { onEvent: (e) => events.push(e) });
+  m.tick();
+  const secret = path.join(dir, "secret.txt");
+  fs.writeFileSync(secret, `${rec({ i: 999999 })}\n`);
+  fs.symlinkSync(secret, logFile(dir, "p31000.log.2026.10.09-13"));
+  const f2 = logFile(dir, "p31000.log.2026.10.09-14");
+  fs.writeFileSync(f2, `${rec({ i: 10 })}\n`);
+  m.tick();
+  assert.strictEqual(m.counters()["netrun-abc12"].down, 10, "the symlink is not read");
+  assert.ok(events.some((e) => e.type === "pergb_meter_not_a_file"));
+  // archive/ replaced by a symlink to somewhere else: nothing is written there
+  const elsewhere = path.join(dir, "elsewhere");
+  fs.mkdirSync(elsewhere);
+  fs.symlinkSync(elsewhere, path.join(dir, "log", "archive"));
+  fs.writeFileSync(logFile(dir, "p31500.log.2026.10.09-13"), `${rec({ i: 1 })}\n`);
+  fs.writeFileSync(logFile(dir, "p31500.log.2026.10.09-14"), `${rec({ i: 1 })}\n`);
+  m.tick();
+  now.advance(130000);
+  m.tick();
+  await m.drainArchives();
+  assert.deepStrictEqual(fs.readdirSync(elsewhere), [], "no archive written through the symlink");
+  assert.ok(fs.existsSync(logFile(dir, "p31500.log.2026.10.09-13")), "the finished file stays until it can be archived");
+});
