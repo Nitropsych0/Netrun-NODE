@@ -132,7 +132,10 @@ class SeqAndTransitions(unittest.TestCase):
 
     def test_logins(self):
         got = {x["id"]: x for x in self.eng.dispatch({"op": "logins"})["lists"]}
-        self.assertEqual(got[10], {"id": 10, "login": "netrun-aaaaaaa", "accountId": 1, "status": "active", "pwRev": 1})
+        self.assertEqual(
+            got[10],
+            {"id": 10, "login": "netrun-aaaaaaa", "accountId": 1, "status": "active", "pwRev": 1, "mode": "static"},
+        )
         # a bare login id is normalised
         self.eng.dispatch(
             {
@@ -180,13 +183,13 @@ class StaticBindings(unittest.TestCase):
     def test_feed_add_and_release(self):
         a = ask(self.eng, "netrun-aaaaaaa", port=BASE + 1)
         ask(self.eng, "netrun-aaaaaaa", port=BASE + 1)  # same binding, no new event
-        ask(self.eng, "netrun-aaaaaaa-session-q1")
+        ask(self.eng, "netrun-aaaaaaa-session-s01000")  # a line slot (I2) follows the static list
         f = self.feed()
         self.assertEqual(
             [(i["op"], i["listId"], i["slot"], i["reason"]) for i in f["items"]],
             [
                 ("add", 10, "p1", "first_use"),
-                ("add", 10, "s:q1", "first_use"),
+                ("add", 10, "s:s01000", "first_use"),
             ],
         )
         self.assertEqual(f["items"][0]["addr"], str(a.addr))
@@ -198,26 +201,27 @@ class StaticBindings(unittest.TestCase):
             sorted((i["op"], i["slot"], i["reason"]) for i in f2["items"]),
             [
                 ("release", "p1", "list_deleted"),
-                ("release", "s:q1", "list_deleted"),
+                ("release", "s:s01000", "list_deleted"),
             ],
         )
         page = self.feed(after=0, limit=1)
         self.assertEqual(len(page["items"]), 1)
 
-    def test_released_account_drops_static_but_blocked_keeps_it(self):
+    def test_static_comes_back_after_block_and_release(self):
+        # A8: static is derived, nothing is retained or dropped; a top-up gives the same IP
         a = ask(self.eng, "netrun-ccccccc", port=BASE + 2)
-        self.eng.dispatch({"op": "apply", "baseSeq": 1, "seq": 2, "accounts": [account(2, state="blocked")]})
-        self.assertIn((20, "p2"), self.eng.alloc.bindings)
-        self.eng.dispatch({"op": "apply", "baseSeq": 2, "seq": 3, "accounts": [account(2)]})
-        self.assertEqual(ask(self.eng, "netrun-ccccccc", port=BASE + 2).addr, a.addr)  # top-up: same IP
-        self.eng.dispatch({"op": "apply", "baseSeq": 3, "seq": 4, "accounts": [account(2, state="released")]})
-        self.assertNotIn((20, "p2"), self.eng.alloc.bindings)
-        self.assertEqual(self.feed()["items"][-1]["reason"], "account_released")
+        for seq, state in ((2, "blocked"), (3, "active"), (4, "released"), (5, "active")):
+            self.eng.dispatch({"op": "apply", "baseSeq": seq - 1, "seq": seq, "accounts": [account(2, state=state)]})
+            if state == "active":
+                self.assertEqual(ask(self.eng, "netrun-ccccccc", port=BASE + 2).addr, a.addr)
+            else:
+                self.assertFalse(ask(self.eng, "netrun-ccccccc", port=BASE + 2).accepted)
+        self.assertEqual([i["op"] for i in self.feed()["items"]], ["add"])
 
     def test_snapshot_static_merge(self):
         a = ask(self.eng, "netrun-aaaaaaa", port=BASE + 1)
         tagger = self.eng.alloc.tagger
-        free_net = self.eng.alloc.free.items[0]
+        free_net = self.eng.alloc.cand.items[0]
         orch_addr = str(rtest.ipaddress.IPv6Address(self.eng.alloc.new_addr(free_net, 10)))
         wrong_tag = str(rtest.ipaddress.IPv6Address(self.eng.alloc.new_addr(free_net, 11)))
         other_prefix = "2001:db8:bb:1::" + "1234:5678"
@@ -241,7 +245,7 @@ class StaticBindings(unittest.TestCase):
     def test_prefix_change_releases_everything(self):
         ask(self.eng, "netrun-aaaaaaa", port=BASE + 1)
         self.eng.dispatch({"op": "facts", "facts": rtest.facts(prefix="2001:db8:bb::/48")})
-        self.assertEqual(len(self.eng.alloc.bindings), 0)
+        self.assertEqual(len(self.eng.alloc.static), 0)
         self.assertEqual(self.feed()["items"][-1]["reason"], "prefix_changed")
         r = ask(self.eng, "netrun-aaaaaaa", port=BASE + 1)
         self.assertIn(r.addr, rtest.ipaddress.IPv6Network("2001:db8:bb::/48"))
@@ -284,10 +288,17 @@ class ExcludedAndReserve(unittest.TestCase):
             e.dispatch({"op": "reserve_nets", "count": 1, "ref": "x", "owner": "pergb"})["error"], "bad_request"
         )
         rel = e.dispatch({"op": "release_nets", "nets": r["nets"], "ref": "dep-1"})
-        self.assertEqual(rel, {"released": 10, "coolDownUntil": self.clock() + 86400})
+        self.assertEqual(rel, {"released": 10, "coolDownUntil": None})  # A6: no cool-down
         st = e.dispatch({"op": "status"})["alloc"]
         self.assertEqual(st["reserved"], 41)
-        self.assertEqual(st["coolDown"], 10)
+        self.assertEqual(st["coolDown"], 0)
+        self.assertEqual(st["candidates"], 100 - 41)
+        # durable across a restart: reservations, the release record
+        e.flush()
+        e2 = rtest.make_engine(self, clock=self.clock, path=e._test_dir, with_facts=False)
+        self.assertEqual(len(e2.alloc.reserved), 41)
+        self.assertEqual(e2.dispatch({"op": "release_nets", "nets": r["nets"], "ref": "dep-1"})["released"], 10)
+        self.assertEqual(e2.dispatch({"op": "reserve_nets", "count": 10, "ref": "gen-1"})["nets"], r["nets"])
 
 
 class UnixSocket(unittest.TestCase):

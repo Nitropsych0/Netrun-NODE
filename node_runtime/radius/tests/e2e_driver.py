@@ -197,7 +197,6 @@ class Env:
                 "pwHash": hashlib.sha256(probe_salt + PROBE_PW.encode()).hexdigest(),
                 "canary": [[self.a.target6, TARGET_PORT], [self.a.target4, TARGET_PORT]],
             },
-            "reserves": {"staticPct": 5, "stickyPct": 15},
             "logdumpBytes": 262144,
         }
         f.update(over)
@@ -210,8 +209,6 @@ class Env:
             "state": "active",
             "expiresAt": int(time.time()) + 86400,
             "limit": {"epoch": 1, "bytes": 1 << 40, "allowance": 1 << 40, "full": True},
-            "staticCap": 100,
-            "stickyExclCap": 2000,
             "trial": False,
         }
         lists = [
@@ -222,7 +219,7 @@ class Env:
                     "accountId": 900000001,
                     "pwRev": 1,
                     "status": "active",
-                    "mode": "rotate",
+                    "mode": "per_request",
                     "ttlSec": None,
                 },
                 **pw_fields(PW),
@@ -234,7 +231,7 @@ class Env:
                     "accountId": 900000001,
                     "pwRev": 1,
                     "status": "active",
-                    "mode": "sticky",
+                    "mode": "timer",
                     "ttlSec": 600,
                 },
                 **pw_fields(PW),
@@ -258,7 +255,7 @@ class Env:
                     "accountId": 900000001,
                     "pwRev": 1,
                     "status": "blocked",
-                    "mode": "rotate",
+                    "mode": "per_request",
                     "ttlSec": None,
                 },
                 **pw_fields(PW),
@@ -333,12 +330,12 @@ def run_checks(env: Env):
             check("rotation sources carry the list tag", False, s)
     check("rotation: a distinct /64 per connection", len(nets) == 12, len(nets))
 
-    # sticky by port and by session
+    # timer lines (A10) by port, sticky sessions
     s1 = socks5(b + 1, "netrun-e2estik", PW, t6)
     s2 = socks5(b + 1, "netrun-e2estik", PW, t6)
     s3 = socks5(b + 2, "netrun-e2estik", PW, t6)
-    check("sticky: same source on the same port", s1 == s2, (s1, s2))
-    check("sticky: another port is another slot", ((int(s1) >> 64) & 0xFFFF) != ((int(s3) >> 64) & 0xFFFF), (s1, s3))
+    check("timer: same source on the same port within the window", s1 == s2, (s1, s2))
+    check("timer: another port is another slot", ((int(s1) >> 64) & 0xFFFF) != ((int(s3) >> 64) & 0xFFFF), (s1, s3))
     k1 = socks5(b, "netrun-e2erota-session-job1-ttl-30m", PW, t6)
     k2 = socks5(b + 3, "netrun-e2erota-session-job1-ttl-30m", PW, t6)
     check("sticky: session param holds across ports", k1 == k2, (k1, k2))
@@ -373,7 +370,11 @@ def run_checks(env: Env):
     # static across a RADIUS restart
     env.restart(signal.SIGHUP)
     check("static survives a graceful RADIUS restart", socks5(b + 2, "netrun-e2estat", PW, t6) == st1)
-    check("sticky survives a graceful RADIUS restart", socks5(b + 1, "netrun-e2estik", PW, t6) == s1)
+    check("a timer line survives a graceful RADIUS restart", socks5(b + 1, "netrun-e2estik", PW, t6) == s1)
+    check(
+        "a sticky session survives a graceful RADIUS restart",
+        socks5(b + 3, "netrun-e2erota-session-job1-ttl-30m", PW, t6) == k1,
+    )
     env.restart(signal.SIGUSR1)
     time.sleep(0.3)
     check("static survives a RADIUS crash (kill -9)", socks5(b + 2, "netrun-e2estat", PW, t6) == st1)

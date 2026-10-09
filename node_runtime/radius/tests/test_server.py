@@ -191,15 +191,13 @@ def build_cap_state(path: str, n_lists=50_000, n_static=40_000, n_sticky=60_000,
     conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('facts', ?)", (json.dumps(f),))
     conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('seq', '77')")
     conn.executemany(
-        "INSERT INTO accounts(id, state, expires_at, limit_json, static_cap, sticky_excl_cap, trial, local_blocked) VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO accounts(id, state, expires_at, limit_json, trial, local_blocked) VALUES (?,?,?,?,?,?)",
         [
             (
                 a,
                 "active",
                 4e9,
                 json.dumps({"epoch": 1, "bytes": 1 << 34, "allowance": 1 << 34, "full": True}),
-                100,
-                2000,
                 0,
                 0,
             )
@@ -208,8 +206,12 @@ def build_cap_state(path: str, n_lists=50_000, n_static=40_000, n_sticky=60_000,
     )
     salt = "00" * 16
     conn.executemany(
-        "INSERT INTO lists(id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec) VALUES (?,?,?,?,?,?,?,?,?)",
-        [(i, "netrun-l%07d" % i, i % n_accounts, salt, "11" * 32, 1, "active", "sticky", 3600) for i in range(n_lists)],
+        "INSERT INTO lists(id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec, timer_anchor,"
+        " link_epoch, line_epochs, sticky_pause) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (i, "netrun-l%07d" % i, i % n_accounts, salt, "11" * 32, 1, "active", "timer", 3600, 0.0, 0, None, None)
+            for i in range(n_lists)
+        ],
     )
     prefix = rtest.PREFIX_INT
     rows = []
@@ -223,8 +225,8 @@ def build_cap_state(path: str, n_lists=50_000, n_static=40_000, n_sticky=60_000,
                 "static",
                 addr.to_bytes(16, "big"),
                 net,
+                rng.getrandbits(32),
                 (i % n_lists) % n_accounts,
-                0,
                 1e9,
                 None,
                 1e9,
@@ -234,9 +236,9 @@ def build_cap_state(path: str, n_lists=50_000, n_static=40_000, n_sticky=60_000,
         net = n_static + (j // 3) % 20000
         lid = (j * 7919) % n_lists
         addr = prefix | (net << 64) | rng.randrange(1 << 32, 1 << 64)
-        rows.append((lid, "s:k%d" % j, "sticky", addr.to_bytes(16, "big"), net, lid % n_accounts, 1, 1e9, 4e9, 1e9))
+        rows.append((lid, "s:k%d" % j, "sticky", addr.to_bytes(16, "big"), net, 7, lid % n_accounts, 1e9, 4e9, 1e9))
     conn.executemany(
-        "INSERT INTO bindings(list_id, slot, kind, addr, net, account_id, shared, created_at, expires_at, last_used_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO bindings(list_id, slot, kind, addr, net, v4, account_id, created_at, expires_at, last_used_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     conn.execute("COMMIT")
@@ -256,7 +258,7 @@ class CapSizedState(Proc):
             best = elapsed if best is None else min(best, elapsed)
         self.assertEqual(st["counts"]["lists"], 50_000)
         self.assertEqual(st["counts"]["static"], 40_000)
-        self.assertGreater(st["counts"]["sticky"], 55_000)  # a few same-account /64 collisions are dropped
+        self.assertEqual(st["counts"]["sticky"], 60_000)  # A8: shared /64s, nothing is dropped
         self.assertEqual(st["seq"], 77)
         print("\n  READY with 50k lists / 100k bindings: %.0f ms" % (best * 1000), file=sys.stderr)
         self.assertLess(best, 1.0 * SLACK)
@@ -271,8 +273,9 @@ class Load(unittest.TestCase):
                 "l%06d" % i,
                 i % 50,
                 PW,
-                mode=("rotate", "sticky", "static")[i % 3],
-                ttlSec=600 if i % 3 == 1 else None,
+                mode=("per_request", "timer", "static", "link")[i % 4],
+                ttlSec=600 if i % 4 == 1 else None,
+                stickyPauseSec=5 if i % 8 == 0 else None,
             )
             for i in range(1, 601)
         ]

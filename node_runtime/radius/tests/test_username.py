@@ -24,6 +24,7 @@ class Grammar(unittest.TestCase):
             "netrun-7k2f9ab-session-a_b-static": dict(session="a_b", static=True),
             "netrun-7k2f9ab-country-us-rotate": dict(country="us", rotate=True),
             "netrun-7k2f9ab-ttl-60s": dict(ttl=60),
+            "netrun-7k2f9ab-ttl-30s": dict(ttl=30),  # A10: 30 s .. 24 h
             "netrun-7k2f9ab-ttl-1440m": dict(ttl=86400),
             "netrun-7k2f9ab-ttl-24h": dict(ttl=86400),
             "netrun-abcde": dict(),
@@ -69,7 +70,7 @@ class Grammar(unittest.TestCase):
             "netrun-7k2f9ab-session-a.b",
             "netrun-7k2f9ab-static-static",
             "netrun-7k2f9ab-session-a-session-b",
-            "netrun-7k2f9ab-ttl-59s",
+            "netrun-7k2f9ab-ttl-29s",
             "netrun-7k2f9ab-ttl-86401s",
             "netrun-7k2f9ab-ttl-25h",
             "netrun-7k2f9ab-ttl-0m",
@@ -120,21 +121,26 @@ class Grammar(unittest.TestCase):
 
 
 class ModeTable(unittest.TestCase):
-    """I1 mode resolution, first match wins."""
+    """Mode resolution after A10, first match wins."""
+
+    MODES = (
+        ("per_request", None),
+        ("timer", 1800),
+        ("link", None),
+        ("static", None),
+        ("rotate", None),
+        ("sticky", 1800),
+    )
 
     def r(self, name, port, mode, ttl=None):
         return U.resolve(p(name), port, BASE, mode, ttl)
 
     def test_explicit_params_win_everywhere(self):
-        for list_mode, list_ttl in (("rotate", None), ("sticky", 1800), ("static", None)):
+        for list_mode, list_ttl in self.MODES:
             for port in (BASE, BASE + 1, BASE + 999):
-                self.assertEqual(self.r("netrun-7k2f9ab-rotate", port, list_mode, list_ttl), ("rotate", 0, None))
-                self.assertEqual(
-                    self.r("netrun-7k2f9ab-static", port, list_mode, list_ttl), ("static", None, "p%d" % (port - BASE))
-                )
-                self.assertEqual(
-                    self.r("netrun-7k2f9ab-ttl-2h", port, list_mode, list_ttl), ("sticky", 7200, "p%d" % (port - BASE))
-                )
+                slot = "p%d" % (port - BASE)
+                self.assertEqual(self.r("netrun-7k2f9ab-rotate", port, list_mode, list_ttl), ("fresh", 0, None))
+                self.assertEqual(self.r("netrun-7k2f9ab-static", port, list_mode, list_ttl), ("static", None, slot))
                 self.assertEqual(
                     self.r("netrun-7k2f9ab-session-q-ttl-5m", port, list_mode, list_ttl), ("sticky", 300, "s:q")
                 )
@@ -142,23 +148,49 @@ class ModeTable(unittest.TestCase):
                     self.r("netrun-7k2f9ab-session-q-static", port, list_mode, list_ttl), ("static", None, "s:q")
                 )
 
-    def test_base_port_static_param_is_slot_p0(self):
-        self.assertEqual(self.r("netrun-7k2f9ab-static", BASE, "rotate"), ("static", None, "p0"))
+    def test_a_session_is_sticky_in_every_mode(self):
+        for list_mode, list_ttl in self.MODES:
+            self.assertEqual(
+                self.r("netrun-7k2f9ab-session-job1", BASE + 4, list_mode, list_ttl), ("sticky", 600, "s:job1")
+            )
+            self.assertEqual(
+                self.r("netrun-7k2f9ab-session-job1-ttl-30s", BASE, list_mode, list_ttl), ("sticky", 30, "s:job1")
+            )
 
-    def test_session_alone_follows_the_list(self):
-        self.assertEqual(self.r("netrun-7k2f9ab-session-s00042", BASE, "static"), ("static", None, "s:s00042"))
-        self.assertEqual(self.r("netrun-7k2f9ab-session-s00042", BASE, "sticky", 1800), ("sticky", 1800, "s:s00042"))
-        self.assertEqual(self.r("netrun-7k2f9ab-session-s00042", BASE + 3, "rotate"), ("sticky", 600, "s:s00042"))
+    def test_line_sessions_follow_the_list(self):
+        # I2: lines 1000+ are s<5 digits> on the base port; they are line slots
+        self.assertEqual(self.r("netrun-7k2f9ab-session-s01000", BASE, "static"), ("static", None, "s:s01000"))
+        self.assertEqual(self.r("netrun-7k2f9ab-session-s01000", BASE, "timer", 1800), ("timer", 1800, "s:s01000"))
+        self.assertEqual(
+            self.r("netrun-7k2f9ab-session-s01000", BASE, "per_request"), ("per_request", None, "s:s01000")
+        )
+        self.assertEqual(self.r("netrun-7k2f9ab-session-s01000", BASE, "link"), ("link", None, "s:s01000"))
+        self.assertEqual(
+            self.r("netrun-7k2f9ab-session-s01000-ttl-5m", BASE, "timer", 1800), ("timer", 300, "s:s01000")
+        )
 
-    def test_bare_login_rotates_on_the_base_port(self):
-        for list_mode, ttl in (("rotate", None), ("sticky", 1800), ("static", None)):
-            self.assertEqual(self.r("netrun-7k2f9ab", BASE, list_mode, ttl), ("rotate", 0, None))
+    def test_every_port_is_a_line_slot(self):
+        for port in (BASE, BASE + 7, BASE + 999):
+            slot = "p%d" % (port - BASE)
+            self.assertEqual(self.r("netrun-7k2f9ab", port, "per_request"), ("per_request", None, slot))
+            self.assertEqual(self.r("netrun-7k2f9ab", port, "timer", 1800), ("timer", 1800, slot))
+            self.assertEqual(self.r("netrun-7k2f9ab", port, "timer", None), ("timer", 600, slot))
+            self.assertEqual(self.r("netrun-7k2f9ab", port, "link"), ("link", None, slot))
+            self.assertEqual(self.r("netrun-7k2f9ab", port, "static"), ("static", None, slot))
 
-    def test_bare_login_follows_the_list_mode_elsewhere(self):
-        self.assertEqual(self.r("netrun-7k2f9ab", BASE + 7, "rotate"), ("rotate", 0, None))
-        self.assertEqual(self.r("netrun-7k2f9ab", BASE + 7, "sticky", 1800), ("sticky", 1800, "p7"))
-        self.assertEqual(self.r("netrun-7k2f9ab", BASE + 7, "sticky", None), ("sticky", 600, "p7"))
-        self.assertEqual(self.r("netrun-7k2f9ab", BASE + 999, "static"), ("static", None, "p999"))
+    def test_legacy_modes_map(self):
+        self.assertEqual(self.r("netrun-7k2f9ab", BASE + 1, "rotate"), ("per_request", None, "p1"))
+        self.assertEqual(self.r("netrun-7k2f9ab", BASE + 1, "sticky", 1800), ("timer", 1800, "p1"))
+        self.assertEqual(U.list_mode("rotate"), "per_request")
+        self.assertEqual(U.list_mode("sticky"), "timer")
+        with self.assertRaises(ValueError):
+            U.list_mode("weekly")
+
+    def test_ttl_param_without_a_session(self):
+        # on a timer list: the line's window; elsewhere: the line is sticky for ttl
+        self.assertEqual(self.r("netrun-7k2f9ab-ttl-2h", BASE + 2, "timer", 600), ("timer", 7200, "p2"))
+        for list_mode in ("per_request", "link", "static"):
+            self.assertEqual(self.r("netrun-7k2f9ab-ttl-2h", BASE + 2, list_mode), ("sticky", 7200, "p2"))
 
     def test_country_does_not_change_the_mode(self):
         self.assertEqual(self.r("netrun-7k2f9ab-country-us", BASE + 2, "static"), ("static", None, "p2"))
@@ -168,7 +200,7 @@ class ModeTable(unittest.TestCase):
         self.assertEqual(U.format_ttl(86400), "24h")
         self.assertEqual(U.format_ttl(1800), "30m")
         self.assertEqual(U.format_ttl(90), "90s")
-        for sec in (60, 61, 90, 600, 3599, 3600, 5400, 86400):
+        for sec in (30, 59, 60, 61, 90, 600, 3599, 3600, 5400, 86400):
             self.assertEqual(p("netrun-7k2f9ab-ttl-" + U.format_ttl(sec)).ttl, sec)
 
 

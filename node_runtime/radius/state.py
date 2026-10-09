@@ -3,12 +3,15 @@
 Tables
   meta(k, v)              epoch (random at creation), seq, facts, scan guard, heartbeat
   accounts                one row per account (I5 A, plus local_blocked)
-  lists                   one row per list (I5 L)
-  bindings                sticky and static bindings, PK (list_id, slot)
+  lists                   one row per list (I5 L, with the A10/A11 mode fields)
+  bindings                remembered static and sticky lines, PK (list_id, slot, kind)
   binding_events          static add/release feed (seq AUTOINCREMENT), pruned after 7 days
   rejects                 last reject per list
-  nets                    excluded sources per /64 (scan flag, reservation ref, cool-down)
+  nets                    excluded sources per /64 (scan flag, reservation ref)
   reservations            reserve_nets / release_nets idempotency records
+
+Schema 2 (amendments A6/A8/A10/A11): a schema-1 file is unknown and is moved
+aside like a corrupt one (new epoch; the orchestrator re-pushes everything).
 
 Binding changes are written in batches (every 100 ms by the writer thread); ctl
 operations commit before they reply. A DB that cannot be opened or loaded is
@@ -27,27 +30,27 @@ import sys
 import threading
 import time
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 EVENT_RETENTION_SEC = 7 * 86400
 
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY, state TEXT NOT NULL, expires_at REAL,"
-    " limit_json TEXT, static_cap INTEGER, sticky_excl_cap INTEGER, trial INTEGER NOT NULL DEFAULT 0,"
-    " local_blocked INTEGER NOT NULL DEFAULT 0)",
+    " limit_json TEXT, trial INTEGER NOT NULL DEFAULT 0, local_blocked INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS lists(id INTEGER PRIMARY KEY, login TEXT NOT NULL UNIQUE, account_id INTEGER NOT NULL,"
     " pw_salt TEXT NOT NULL, pw_hash TEXT NOT NULL, pw_rev INTEGER NOT NULL, status TEXT NOT NULL,"
-    " mode TEXT NOT NULL, ttl_sec INTEGER)",
+    " mode TEXT NOT NULL, ttl_sec INTEGER, timer_anchor REAL, link_epoch INTEGER NOT NULL DEFAULT 0,"
+    " line_epochs TEXT, sticky_pause INTEGER)",
     "CREATE TABLE IF NOT EXISTS bindings(list_id INTEGER NOT NULL, slot TEXT NOT NULL, kind TEXT NOT NULL,"
-    " addr BLOB NOT NULL, net INTEGER NOT NULL, account_id INTEGER NOT NULL, shared INTEGER NOT NULL,"
-    " created_at REAL NOT NULL, expires_at REAL, last_used_at REAL, PRIMARY KEY(list_id, slot)) WITHOUT ROWID",
+    " addr BLOB NOT NULL, net INTEGER NOT NULL, v4 INTEGER NOT NULL, account_id INTEGER NOT NULL,"
+    " created_at REAL NOT NULL, expires_at REAL, last_used_at REAL, PRIMARY KEY(list_id, slot, kind)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS binding_events(seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT NOT NULL,"
     " list_id INTEGER NOT NULL, slot TEXT NOT NULL, addr TEXT NOT NULL, reason TEXT, at REAL NOT NULL)",
     "CREATE INDEX IF NOT EXISTS binding_events_at ON binding_events(at)",
     "CREATE TABLE IF NOT EXISTS rejects(list_id INTEGER PRIMARY KEY, reason TEXT NOT NULL, at REAL NOT NULL,"
     " count INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS nets(net INTEGER PRIMARY KEY, scan INTEGER NOT NULL DEFAULT 0, reserved_ref TEXT,"
-    " reserved_at REAL, cooldown_until REAL)",
+    " reserved_at REAL)",
     "CREATE TABLE IF NOT EXISTS reservations(ref TEXT PRIMARY KEY, kind TEXT NOT NULL, nets TEXT NOT NULL,"
     " until REAL, at REAL NOT NULL)",
 )
@@ -71,10 +74,10 @@ class Batch:
         self.meta = {}  # k -> str
         self.accounts = {}  # id -> row tuple | None (delete)
         self.lists = {}  # id -> row tuple | None
-        self.bindings = {}  # (list_id, slot) -> row tuple | None
+        self.bindings = {}  # (list_id, slot, kind) -> row tuple | None
         self.events = []  # (op, list_id, slot, addr_str, reason, at)
         self.rejects = {}  # list_id -> (reason, at, count) | None
-        self.nets = {}  # net -> (scan, ref, reserved_at, cooldown_until) | None
+        self.nets = {}  # net -> (scan, ref, reserved_at) | None
         self.refs = {}  # ref -> (kind, nets_json, until, at) | None
 
     def empty(self) -> bool:
@@ -192,16 +195,17 @@ class Store:
             "epoch": int(meta["epoch"]),
             "seq": int(meta.get("seq", "0")),
             "accounts": conn.execute(
-                "SELECT id, state, expires_at, limit_json, static_cap, sticky_excl_cap, trial, local_blocked FROM accounts"
+                "SELECT id, state, expires_at, limit_json, trial, local_blocked FROM accounts"
             ).fetchall(),
             "lists": conn.execute(
-                "SELECT id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec FROM lists"
+                "SELECT id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec, timer_anchor,"
+                " link_epoch, line_epochs, sticky_pause FROM lists"
             ).fetchall(),
             "bindings": conn.execute(
-                "SELECT list_id, slot, kind, addr, net, account_id, shared, created_at, expires_at, last_used_at FROM bindings"
+                "SELECT list_id, slot, kind, addr, net, v4, account_id, created_at, expires_at, last_used_at FROM bindings"
             ).fetchall(),
             "rejects": conn.execute("SELECT list_id, reason, at, count FROM rejects").fetchall(),
-            "nets": conn.execute("SELECT net, scan, reserved_ref, reserved_at, cooldown_until FROM nets").fetchall(),
+            "nets": conn.execute("SELECT net, scan, reserved_ref, reserved_at FROM nets").fetchall(),
             "refs": conn.execute("SELECT ref, kind, nets, until, at FROM reservations").fetchall(),
         }
         for k in ("facts", "scan_guard", "heartbeat"):
@@ -221,25 +225,25 @@ class Store:
             self._upsert_delete(
                 conn,
                 batch.accounts,
-                "INSERT OR REPLACE INTO accounts(id, state, expires_at, limit_json, static_cap, sticky_excl_cap, trial,"
-                " local_blocked) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO accounts(id, state, expires_at, limit_json, trial, local_blocked)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
                 "DELETE FROM accounts WHERE id = ?",
             )
             self._upsert_delete(
                 conn,
                 batch.lists,
-                "INSERT OR REPLACE INTO lists(id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO lists(id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec,"
+                " timer_anchor, link_epoch, line_epochs, sticky_pause) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 "DELETE FROM lists WHERE id = ?",
             )
             if batch.bindings:
                 ups = [row for row in batch.bindings.values() if row is not None]
                 dels = [k for k, row in batch.bindings.items() if row is None]
                 if dels:
-                    conn.executemany("DELETE FROM bindings WHERE list_id = ? AND slot = ?", dels)
+                    conn.executemany("DELETE FROM bindings WHERE list_id = ? AND slot = ? AND kind = ?", dels)
                 if ups:
                     conn.executemany(
-                        "INSERT OR REPLACE INTO bindings(list_id, slot, kind, addr, net, account_id, shared, created_at,"
+                        "INSERT OR REPLACE INTO bindings(list_id, slot, kind, addr, net, v4, account_id, created_at,"
                         " expires_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         ups,
                     )
@@ -264,8 +268,7 @@ class Store:
                     conn.executemany("DELETE FROM nets WHERE net = ?", dels)
                 if ups:
                     conn.executemany(
-                        "INSERT OR REPLACE INTO nets(net, scan, reserved_ref, reserved_at, cooldown_until)"
-                        " VALUES (?, ?, ?, ?, ?)",
+                        "INSERT OR REPLACE INTO nets(net, scan, reserved_ref, reserved_at) VALUES (?, ?, ?, ?)",
                         ups,
                     )
             if batch.refs:

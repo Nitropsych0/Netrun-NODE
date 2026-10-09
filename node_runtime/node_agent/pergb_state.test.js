@@ -240,6 +240,17 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     assert.strictEqual(st.ipv4AdmissionOpen, true);
   });
 
+  await t.test("smart rotation: the real RADIUS takes the ctl op avoid and reports smartRotation (A12)", async () => {
+    const until = Math.floor(Date.now() / 1000) + 600;
+    await pergb.ctl.call("avoid", { full: true, entries: [{ net: 5, site: "example.com", until }], removed: [] });
+    const st = await pergb.ctl.call("status", {});
+    assert.strictEqual(st.smartRotation.avoidedPairs, 1);
+    assert.strictEqual(typeof st.smartRotation.picksAvoided1h, "number");
+    const r = await pergb.smart.push();
+    assert.ok(!r.error, JSON.stringify(r));
+    assert.strictEqual(pergb.smart.status(st.smartRotation).radiusSupport, true);
+  });
+
   await t.test("the RADIUS probe (a 3proxy-shaped Access-Request from JS) is accepted; a wrong password is not", async () => {
     await pergb.guards.probeTick();
     assert.strictEqual(pergb.guards.status().radiusAlive, true, JSON.stringify(pergb.guards.status().probe));

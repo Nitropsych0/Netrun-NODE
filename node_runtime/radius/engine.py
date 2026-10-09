@@ -6,6 +6,12 @@ Request path (plan §3.2):
   IPv4 family + IPv4 admission -> near-limit reservation -> mode/slot -> address.
 Every refusal is a plain Access-Reject; the reason is counted per node and kept
 per list (D17). Binding changes are queued for the writer thread.
+
+Amendments applied here: A6 (release_nets without a cool-down), A7/A9 (several
+egress IPv4s: Framed-IP-Address per connection or per line, the IPv4 admission
+per address), A8 (a shared pool, deterministic static, no caps), A10 (list
+modes per_request / timer / link / static, link epochs, TTL 30 s .. 24 h),
+A11 (the «липкая сессия» pause), A12 (ctl op `avoid`, smart rotation picks).
 """
 
 from __future__ import annotations
@@ -24,26 +30,26 @@ import time
 from array import array
 
 import proto
+import psl as psl_lib
 import username as uname
-from alloc import STATIC, Allocator, AllocError, Binding, CtlRefused
+from alloc import STATIC, Allocator, AllocError, CtlRefused, Line
 from state import EVENT_RETENTION_SEC, Batch, log
 
-REASONS = ("bad_login", "bad_params", "list_off", "account_off", "quota", "capacity", "static_cap")
+REASONS = ("bad_login", "bad_params", "list_off", "account_off", "quota", "capacity")
 ACCOUNT_STATES = ("active", "blocked", "released")
 LIST_STATUSES = ("active", "blocked", "deleted")
-MODES = ("rotate", "sticky", "static")
 FAMILIES = ("dualstack", "ipv6_only")
+MAX_EGRESS_V4 = 64  # A7: 1..64 per-GB IPv4s per node
+STICKY_PAUSES = (5, 10)  # A11: the two pause buttons (other values 1..60 are accepted)
+MAX_LINE_EPOCHS = 20000
 
-DEFAULT_STATIC_CAP = 100
-DEFAULT_STICKY_EXCL_CAP = 2000
-DEFAULT_STATIC_PCT = 5.0
-DEFAULT_STICKY_PCT = 15.0
 DEFAULT_LOGDUMP = 262144
 SPLICE_CHUNK = 65536
 PROBE_RATE = 2.0  # probe Accepts per second (burst 2)
 LAT_SAMPLES = 8192
 REF_RETENTION_SEC = 7 * 86400
 _LOGIN_ID_RE = re.compile(r"[a-z0-9]{5,12}\Z")
+_SLOT_RE = re.compile(r"(p[0-9]{1,5}|s:[a-z0-9_]{1,32})\Z")
 _HEX_RE = re.compile(r"(?:[0-9a-fA-F]{2})+\Z")
 
 
@@ -118,6 +124,8 @@ class Facts:
         "family",
         "egress_v4",
         "egress_v4_str",
+        "egress_v4s",
+        "egress_v4s_str",
         "prefix",
         "prefix_str",
         "lo",
@@ -126,8 +134,6 @@ class Facts:
         "probe_salt",
         "probe_hash",
         "canary",
-        "static_pct",
-        "sticky_pct",
         "logdump",
         "l_prime",
         "min_free_perpiece",
@@ -160,6 +166,26 @@ class Facts:
             f.egress_v4, f.egress_v4_str = a.packed, str(a)
         else:
             f.egress_v4, f.egress_v4_str = None, None
+        # A7: every per-GB IPv4 egresses (the first is the entry address)
+        many = d.get("egressIpv4s")
+        if many is None:
+            many = [f.egress_v4_str] if f.egress_v4_str else []
+        if not isinstance(many, list) or len(many) > MAX_EGRESS_V4:
+            raise _bad("egressIpv4s must be a list of up to %d IPv4 addresses" % MAX_EGRESS_V4)
+        v4s = []
+        for ip in many:
+            try:
+                a = ipaddress.IPv4Address(ip)
+            except (ipaddress.AddressValueError, ValueError, TypeError):
+                raise _bad("egressIpv4s") from None
+            if str(a) not in v4s:
+                v4s.append(str(a))
+        if not v4s and f.egress_v4_str:
+            v4s = [f.egress_v4_str]
+        f.egress_v4s_str = tuple(v4s)
+        f.egress_v4s = tuple(ipaddress.IPv4Address(x).packed for x in v4s)
+        if f.egress_v4 is None and f.egress_v4s:
+            f.egress_v4, f.egress_v4_str = f.egress_v4s[0], f.egress_v4s_str[0]
         try:
             net = ipaddress.IPv6Network(d.get("prefix"), strict=True)
         except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError, TypeError):
@@ -209,11 +235,7 @@ class Facts:
                 port = _int({"p": item[1]}, "p", 1, 65535)
                 canary.add((6 if ip.version == 6 else 4, ip.packed, port))
             f.canary = frozenset(canary)
-        res = d.get("reserves") or {}
-        if not isinstance(res, dict):
-            raise _bad("reserves")
-        f.static_pct = _num(res, "staticPct", DEFAULT_STATIC_PCT)
-        f.sticky_pct = _num(res, "stickyPct", DEFAULT_STICKY_PCT)
+        # "reserves" (static/sticky reserves) is accepted and ignored: A8 reserves nothing
         f.logdump = _int(d, "logdumpBytes", 0, 1 << 40, default=DEFAULT_LOGDUMP)
         f.l_prime = f.logdump + SPLICE_CHUNK
         env_min = _env_num(env, "PERGB_MIN_FREE64_FOR_PERPIECE", 5000, int)
@@ -222,7 +244,9 @@ class Facts:
 
 
 class Account:
-    __slots__ = ("id", "state", "expires_at", "limit", "static_cap", "sticky_excl_cap", "trial", "local_blocked")
+    """I5 A. staticCap / stickyExclCap are accepted and ignored (A8: no caps)."""
+
+    __slots__ = ("id", "state", "expires_at", "limit", "trial", "local_blocked")
 
     @classmethod
     def parse(cls, d) -> Account:
@@ -238,8 +262,6 @@ class Account:
         if lim is not None and not isinstance(lim, dict):
             raise _bad("account limit")
         a.limit = lim
-        a.static_cap = _int(d, "staticCap", 0, default=DEFAULT_STATIC_CAP)
-        a.sticky_excl_cap = _int(d, "stickyExclCap", 0, default=DEFAULT_STICKY_EXCL_CAP)
         a.trial = _bool(d, "trial", False)
         a.local_blocked = False
         return a
@@ -247,7 +269,7 @@ class Account:
     @classmethod
     def from_row(cls, row) -> Account:
         a = cls()
-        a.id, a.state, a.expires_at, limit_json, a.static_cap, a.sticky_excl_cap, trial, lb = row
+        a.id, a.state, a.expires_at, limit_json, trial, lb = row
         a.limit = json.loads(limit_json) if limit_json else None
         a.trial, a.local_blocked = bool(trial), bool(lb)
         return a
@@ -258,8 +280,6 @@ class Account:
             self.state,
             self.expires_at,
             json.dumps(self.limit, sort_keys=True) if self.limit is not None else None,
-            self.static_cap,
-            self.sticky_excl_cap,
             int(self.trial),
             int(self.local_blocked),
         )
@@ -271,14 +291,25 @@ class Account:
             "state": self.state,
             "expiresAt": int(exp) if exp is not None and float(exp).is_integer() else exp,
             "limit": self.limit,
-            "staticCap": self.static_cap,
-            "stickyExclCap": self.sticky_excl_cap,
             "trial": self.trial,
             "localBlocked": self.local_blocked,
         }
 
 
 class PList:
+    """I5 L, with the A10/A11 fields (all optional; the legacy modes map):
+
+    mode            per_request | timer | link | static (legacy: rotate -> per_request,
+                    sticky -> timer)
+    ttlSec          the timer window, 30..86400 (default 600 for timer lists)
+    timerAnchor     unix s the timer windows count from (list creation or the last
+                    link change; default 0)
+    linkEpoch       the list's change-IP counter (the link bumps it)
+    lineEpochs      {slot: n}: per-line change-IP counters (?line=N), slots "p<n>" / "s:s<5 digits>"
+    stickyPauseSec  the «липкая сессия» pause (5 or 10; null/0 = off); per_request and
+                    timer lists only
+    """
+
     __slots__ = (
         "id",
         "login",
@@ -291,6 +322,10 @@ class PList:
         "status",
         "mode",
         "ttl",
+        "anchor",
+        "link_epoch",
+        "line_epochs",
+        "pause",
     )
 
     @classmethod
@@ -321,18 +356,56 @@ class PList:
         p.status = d.get("status", "active")
         if p.status not in LIST_STATUSES:
             raise _bad("list status")
-        p.mode = d.get("mode", "rotate")
-        if p.mode not in MODES:
-            raise _bad("list mode")
+        try:
+            p.mode = uname.list_mode(d.get("mode") or uname.PER_REQUEST)
+        except ValueError:
+            raise _bad("list mode") from None
         p.ttl = _int(d, "ttlSec", uname.TTL_MIN, uname.TTL_MAX, required=False)
+        p.anchor = _num(d, "timerAnchor", 0.0) or 0.0
+        p.link_epoch = _int(d, "linkEpoch", 0, default=0)
+        le = d.get("lineEpochs") or {}
+        if not isinstance(le, dict) or len(le) > MAX_LINE_EPOCHS:
+            raise _bad("lineEpochs must be an object of up to %d slots" % MAX_LINE_EPOCHS)
+        epochs = {}
+        for slot, v in le.items():
+            if not isinstance(slot, str) or not _SLOT_RE.match(slot):
+                raise _bad("lineEpochs slot %r" % (slot,))
+            n = _int({"v": v}, "v", 0)
+            if n:
+                epochs[slot] = n
+        p.line_epochs = epochs
+        pause = _int(d, "stickyPauseSec", 0, 60, required=False)
+        p.pause = pause or None
+        if p.pause is not None and p.mode not in (uname.PER_REQUEST, uname.TIMER):
+            p.pause = None  # A11: the pause exists for per_request and timer lists only
         return p
 
     @classmethod
     def from_row(cls, row) -> PList:
         p = cls()
-        p.id, p.login, p.account_id, p.pw_salt_hex, p.pw_hash_hex, p.pw_rev, p.status, p.mode, p.ttl = row
+        (
+            p.id,
+            p.login,
+            p.account_id,
+            p.pw_salt_hex,
+            p.pw_hash_hex,
+            p.pw_rev,
+            p.status,
+            p.mode,
+            p.ttl,
+            anchor,
+            p.link_epoch,
+            line_epochs,
+            p.pause,
+        ) = row
+        p.mode = uname.LEGACY_MODES.get(p.mode, p.mode)
+        p.anchor = anchor or 0.0
+        p.line_epochs = json.loads(line_epochs) if line_epochs else {}
         p.pw_salt, p.pw_hash = bytes.fromhex(p.pw_salt_hex), bytes.fromhex(p.pw_hash_hex)
         return p
+
+    def epochs(self, slot: str):
+        return (self.link_epoch, self.line_epochs.get(slot, 0))
 
     def row(self):
         return (
@@ -345,6 +418,10 @@ class PList:
             self.status,
             self.mode,
             self.ttl,
+            self.anchor,
+            self.link_epoch,
+            json.dumps(self.line_epochs, sort_keys=True) if self.line_epochs else None,
+            self.pause,
         )
 
     def view(self) -> dict:
@@ -354,6 +431,7 @@ class PList:
             "accountId": self.account_id,
             "status": self.status,
             "pwRev": self.pw_rev,
+            "mode": self.mode,
         }
 
 
@@ -370,11 +448,13 @@ class Engine:
         self.lock = threading.Lock()
         self.ctl_lock = threading.Lock()
         self.alloc = Allocator(rng=rng, clock=clock)
-        self.alloc.max_bindings = _env_num(env, "PERGB_BINDINGS_MAX", self.alloc.max_bindings, int)
+        self.rng = self.alloc.rng
+        self.alloc.max_sticky = _env_num(env, "PERGB_STICKY_MAX", self.alloc.max_sticky, int)
         self.alloc.max_sticky_per_account = _env_num(
             env, "PERGB_STICKY_MAX_PER_ACCOUNT", self.alloc.max_sticky_per_account, int
         )
         self._pending_bindings = None
+        self.psl = None  # loaded on the first avoid push (A12)
         self.secret = secret
         self.facts = None
         self.accounts = {}
@@ -387,6 +467,7 @@ class Engine:
         self.adm_open = True
         self.adm_soft = frozenset()
         self.ipv4_open = True
+        self.ipv4_closed = frozenset()  # A7: packed egress IPv4s whose port guard is closed
         self.hb_at = None
         self.hb_recv = None
         self.near = {}
@@ -428,20 +509,18 @@ class Engine:
         self.db_recovered = self.store.recovered
         self.epoch, self.seq = data["epoch"], data["seq"]
         a = self.alloc
-        for net, scan, ref, rat, cd in data["nets"]:
+        for net, scan, ref, rat in data["nets"]:
             if scan:
                 a.scan.add(net)
             if ref is not None:
                 a.reserved[net] = ref
                 a.reserved_at[net] = rat or now
-            if cd is not None:
-                a.cooldown[net] = cd
-        for ref, kind, nets_json, until, at in data["refs"]:
+        for ref, kind, nets_json, _until, at in data["refs"]:
             if kind == "reserve":
                 a.reservations[ref] = json.loads(nets_json)
                 a.reservation_at[ref] = at
             elif kind == "release" and ref.startswith("rel:"):
-                a.releases[ref[4:]] = (int(json.loads(nets_json)), until)
+                a.releases[ref[4:]] = (int(json.loads(nets_json)), at)
         guard = data.get("scan_guard")
         if guard:
             a.scan_missing = {int(k): float(v) for k, v in (guard.get("missing") or {}).items()}
@@ -454,30 +533,13 @@ class Engine:
                 log("stored facts are unusable (%s); waiting for the agent" % e)
         dropped = 0
         if a.configured:
-            for list_id, slot, kind, addr, net, acct, shared, created, expires, last_used in data["bindings"]:
-                b = Binding(
-                    list_id,
-                    slot,
-                    kind,
-                    int.from_bytes(addr, "big"),
-                    net,
-                    acct,
-                    bool(shared),
-                    created,
-                    expires,
-                    last_used,
-                )
-                if not a.load_binding(b, now):
-                    dropped += 1
-                    a.dirty_bindings[(list_id, slot)] = None
-                    if kind == STATIC:
-                        a.events.append(("release", list_id, slot, b.addr, "load_conflict", now))
+            dropped = self._load_lines(data["bindings"], now)
         elif data["bindings"]:
             log("bindings kept on disk until facts arrive")
             self._pending_bindings = data["bindings"]
         a.loaded()
         if dropped:
-            log("dropped %d inconsistent bindings at load" % dropped)
+            log("dropped %d persisted lines at load (expired, excluded or inconsistent)" % dropped)
         a.dirty_nets.clear()
         a.dirty_refs.clear()
         for row in data["accounts"]:
@@ -510,31 +572,30 @@ class Engine:
             by_acct.setdefault(p.account_id, set()).add(p.id)
         return by_login, by_acct
 
+    def _load_lines(self, rows, now: float) -> int:
+        """Persisted static and sticky lines back into the allocator. A static line that
+        cannot come back (its /64 is per-piece's now, another prefix) is reported as
+        released, so the orchestrator's mirror follows its next address."""
+        a = self.alloc
+        dropped = 0
+        for list_id, slot, kind, addr, net, v4, acct, created, expires, last_used in rows:
+            ln = Line(list_id, slot, kind, int.from_bytes(addr, "big"), net, v4, acct, created, expires)
+            ln.last_seen = last_used or created
+            if not a.load_line(ln, now):
+                dropped += 1
+                a.dirty_lines[(kind, list_id, slot)] = None
+                if kind == STATIC:
+                    a.events.append(("release", list_id, slot, ln.addr, "load_conflict", now))
+        return dropped
+
     def _set_facts(self, f: Facts, now: float):
         self.alloc.configure(f.prefix, f.prefix_str, f.lo, f.hi, f.key, now)
         self.facts = f
         pend = getattr(self, "_pending_bindings", None)
         if pend:
             self._pending_bindings = None
-            a = self.alloc
-            for list_id, slot, kind, addr, net, acct, shared, created, expires, last_used in pend:
-                b = Binding(
-                    list_id,
-                    slot,
-                    kind,
-                    int.from_bytes(addr, "big"),
-                    net,
-                    acct,
-                    bool(shared),
-                    created,
-                    expires,
-                    last_used,
-                )
-                if not a.load_binding(b, now):
-                    a.dirty_bindings[(list_id, slot)] = None
-                    if kind == STATIC:
-                        a.events.append(("release", list_id, slot, b.addr, "load_conflict", now))
-            a.loaded()
+            self._load_lines(pend, now)
+            self.alloc.loaded()
 
     # ---- request path --------------------------------------------------------------
 
@@ -627,31 +688,43 @@ class Engine:
                 return self._reject("quota", lst, now)
         if not self.adm_open or aid in self.adm_soft:
             return self._reject("capacity", lst, now)
+        v4s = None
         if fam == 4:
-            if f.family == "ipv6_only" or f.egress_v4 is None:
+            if f.family == "ipv6_only" or not f.egress_v4s:
                 return self._reject("bad_params", lst, now)
-            if not self.ipv4_open:
+            v4s = self._open_v4s(f)
+            if not v4s:
                 return self._reject("capacity", lst, now)
         need = 2 * f.l_prime
         if near is not None and near - self.near_reserved.get(aid, 0) < need:
             return self._reject("quota", lst, now)
         v6 = v4 = None
-        if fam == 4:
-            v4 = f.egress_v4
-        else:
-            mode, ttl, slot = uname.resolve(login, port, f.base, lst.mode, lst.ttl)
-            a = self.alloc
-            try:
-                if mode == "rotate":
-                    addr = a.rotate_addr(lst.id, now)
-                elif mode == "sticky":
-                    cap = 0 if acct.trial else acct.sticky_excl_cap
-                    addr = a.bind_sticky(lst.id, slot, aid, ttl, now, cap, f.sticky_pct).addr
+        mode, ttl, slot = uname.resolve(login, port, f.base, lst.mode, lst.ttl)
+        a = self.alloc
+        try:
+            if mode == uname.FRESH or (mode == uname.PER_REQUEST and not lst.pause):
+                if fam == 4:
+                    v4 = v4s[self.rng.randrange(len(v4s))]
                 else:
-                    addr = a.bind_static(lst.id, slot, aid, now, acct.static_cap, f.static_pct).addr
-            except AllocError as e:
-                return self._reject(e.reason, lst, now)
-            v6 = addr.to_bytes(16, "big")
+                    v6 = a.rotate_addr(lst.id, now, self._site(req) if a.avoid else None).to_bytes(16, "big")
+            else:
+                if mode == uname.STATIC:
+                    ln = a.static_line(lst.id, slot, aid, now)
+                elif mode == uname.STICKY:
+                    ln = a.sticky_line(lst.id, slot, aid, ttl, now)
+                elif mode == uname.TIMER:
+                    ln = a.timer_line(lst.id, slot, aid, ttl, lst.anchor, lst.epochs(slot), now, lst.pause)
+                elif mode == uname.LINK:
+                    ln = a.link_line(lst.id, slot, aid, lst.epochs(slot), now)
+                else:  # per_request with the A11 pause
+                    site = self._site(req) if (a.avoid and fam != 4) else None
+                    ln = a.pause_line(lst.id, slot, aid, lst.pause, now, site)
+                if fam == 4:
+                    v4 = self._line_v4(f, v4s, ln.v4)
+                else:
+                    v6 = ln.addr.to_bytes(16, "big")
+        except AllocError as e:
+            return self._reject(e.reason, lst, now)
         if near is not None:
             self.near_reserved[aid] = self.near_reserved.get(aid, 0) + need
             if fam == 4:
@@ -674,14 +747,35 @@ class Engine:
         self.probe_tokens = tokens - 1.0
         self.counters["probeAccepts"] += 1
         if fam == 4:
-            if f.family == "ipv6_only" or f.egress_v4 is None:
+            if f.family == "ipv6_only" or not f.egress_v4s:
                 return self._reject("bad_params", None, now)
-            return None, None, f.egress_v4
+            v4s = self._open_v4s(f) or list(f.egress_v4s)
+            return None, None, v4s[self.rng.randrange(len(v4s))]
         try:
             addr = self.alloc.rotate_addr(0, now)
         except AllocError as e:
             return self._reject(e.reason, None, now)
         return None, addr.to_bytes(16, "big"), None
+
+    def _open_v4s(self, f: Facts) -> list:
+        """The egress IPv4s the port guard leaves open (A7); empty when IPv4 is closed."""
+        if not self.ipv4_open:
+            return []
+        closed = self.ipv4_closed
+        return [a for a in f.egress_v4s if a not in closed] if closed else list(f.egress_v4s)
+
+    def _line_v4(self, f: Facts, open_v4s: list, choice: int) -> bytes:
+        """A line keeps its IPv4 (choice mod N); a closed one is replaced for this connection."""
+        a = f.egress_v4s[choice % len(f.egress_v4s)]
+        if len(open_v4s) == len(f.egress_v4s) or a in open_v4s:
+            return a
+        return open_v4s[choice % len(open_v4s)]
+
+    def _site(self, req):
+        """A12 site key of the request (host name, else the destination network)."""
+        if self.psl is None:
+            self.psl = psl_lib.Psl.load()
+        return psl_lib.site_key(req.called_station, req.dst_addr, self.psl)
 
     # ---- persistence ---------------------------------------------------------------
 
@@ -696,24 +790,24 @@ class Engine:
             b.lists[k] = p.row() if p is not None else None
         self.dirty_lists = {}
         a = self.alloc
-        for k, bd in a.dirty_bindings.items():
-            b.bindings[k] = (
+        for (kind, lid, slot), ln in a.dirty_lines.items():
+            b.bindings[(lid, slot, kind)] = (
                 None
-                if bd is None
+                if ln is None
                 else (
-                    bd.list_id,
-                    bd.slot,
-                    bd.kind,
-                    bd.addr.to_bytes(16, "big"),
-                    bd.net,
-                    bd.account_id,
-                    int(bd.shared),
-                    bd.created_at,
-                    bd.expires_at,
-                    bd.last_used_at,
+                    ln.list_id,
+                    ln.slot,
+                    ln.kind,
+                    ln.addr.to_bytes(16, "big"),
+                    ln.net,
+                    ln.v4,
+                    ln.account_id,
+                    ln.created_at,
+                    ln.expires_at,
+                    ln.last_seen,
                 )
             )
-        a.dirty_bindings = {}
+        a.dirty_lines = {}
         b.events = [(op, lid, slot, _addr_str(addr), reason, at) for op, lid, slot, addr, reason, at in a.events]
         a.events = []
         for lid in self.dirty_rejects:
@@ -723,15 +817,12 @@ class Engine:
         for n in a.dirty_nets:
             scan = n in a.scan
             ref = a.reserved.get(n)
-            cd = a.cooldown.get(n)
-            b.nets[n] = (
-                None if (not scan and ref is None and cd is None) else (int(scan), ref, a.reserved_at.get(n), cd)
-            )
+            b.nets[n] = None if (not scan and ref is None) else (int(scan), ref, a.reserved_at.get(n))
         a.dirty_nets = set()
         for ref in a.dirty_refs:
             if ref.startswith("rel:"):
                 r = a.releases.get(ref[4:])
-                b.refs[ref] = None if r is None else ("release", json.dumps(r[0]), r[1], self.clock())
+                b.refs[ref] = None if r is None else ("release", json.dumps(r[0]), None, r[1])
             else:
                 nets = a.reservations.get(ref)
                 b.refs[ref] = (
@@ -775,7 +866,7 @@ class Engine:
         now = self.clock() if now is None else now
         with self.lock:
             expired = self.alloc.expire_sticky(now)
-            back = self.alloc.expire_cooldowns(now)
+            pruned = self.alloc.prune_mode_lines(now)
             a = self.alloc
             old_refs = [
                 r
@@ -786,11 +877,11 @@ class Engine:
                 a.reservations.pop(r, None)
                 a.reservation_at.pop(r, None)
                 a.dirty_refs.add(r)
-            old_rel = [r for r, (_c, until) in a.releases.items() if until < now - REF_RETENTION_SEC + 86400]
+            old_rel = [r for r, (_c, at) in a.releases.items() if at < now - REF_RETENTION_SEC]
             for r in old_rel:
                 del a.releases[r]
                 a.dirty_refs.add("rel:" + r)
-        return expired, back
+        return expired, pruned
 
     def prune_events(self, now: float | None = None) -> int:
         now = self.clock() if now is None else now
@@ -819,13 +910,16 @@ class Engine:
                 "counts": {
                     "lists": len(self.lists),
                     "accounts": len(self.accounts),
-                    "sticky": self.alloc.n_sticky,
-                    "static": self.alloc.n_static,
+                    "sticky": len(self.alloc.sticky),
+                    "static": len(self.alloc.static),
+                    "lines": len(self.alloc.mode),
                 },
                 "alloc": self.alloc.stats(now),
+                "smartRotation": self.alloc.avoid_stats(now),
                 "latency": {"p50Ms": p50, "p99Ms": p99},
                 "admission": {"open": self.adm_open, "soft": sorted(self.adm_soft)},
                 "ipv4AdmissionOpen": self.ipv4_open,
+                "ipv4Closed": sorted(str(ipaddress.IPv4Address(x)) for x in self.ipv4_closed),
                 "deadman": {
                     "heartbeatAgeSec": None if self.hb_recv is None else round(now - self.hb_recv, 3),
                     "afterSec": self.deadman_after,
@@ -849,6 +943,7 @@ class Engine:
                 "geo": f.geo,
                 "family": f.family,
                 "egressIpv4": f.egress_v4_str,
+                "egressIpv4s": list(f.egress_v4s_str),
                 "prefix": f.prefix_str,
                 "subnets": [f.lo, f.hi],
             }
@@ -923,9 +1018,10 @@ class Engine:
             raise _bad("ref must be a string of 1..200 chars")
         with self.ctl_lock:
             with self.lock:
-                count, until = self.alloc.release_nets(nets, ref, self.clock())
+                count = self.alloc.release_nets(nets, ref, self.clock())
             self._durable()
-        return {"released": count, "coolDownUntil": until}
+        # A6: no cool-down, the /64s are back in the pool at once
+        return {"released": count, "coolDownUntil": None}
 
     def _parse_state(self, req, with_static: bool):
         accounts = req.get("accounts") or []
@@ -963,11 +1059,6 @@ class Engine:
                 out["lists"].append({"id": new.id, "why": new.status})
         elif old is not None and new.pw_rev > old.pw_rev:
             out["lists"].append({"id": new.id, "why": "pw"})
-
-    def _drop_released_static(self, acct_ids, now):
-        for aid in acct_ids:
-            for lid in self.by_account.get(aid, ()):
-                self.alloc.release_list(lid, "account_released", now, kinds=(STATIC,))
 
     def op_snapshot(self, req):
         seq = _int(req, "seq", 0)
@@ -1012,7 +1103,6 @@ class Engine:
                 dirty_lists[lid] = None
                 t["lists"].append({"id": lid, "why": "deleted"})
             by_login, by_account = self._indexes(new_lists)
-            released = {aid for aid, a in new_accounts.items() if a.state == "released"}
             with self.lock:
                 now = self.clock()
                 a = self.alloc
@@ -1025,17 +1115,23 @@ class Engine:
                 self.dirty_lists.update(dirty_lists)
                 self.accounts, self.lists = new_accounts, new_lists
                 self.by_login, self.by_account = by_login, by_account
-                released.update(aid for aid in a.acct_static if aid not in new_accounts)
-                self._drop_released_static(released, now)
+                # A8: a released account keeps nothing reserved and loses nothing either:
+                # its lines' static addresses are derived and come back with a top-up
+                for p in new_lists.values():
+                    old = old_lists.get(p.id)
+                    if old is not None and (old.mode, old.ttl, old.anchor, old.pause) != (
+                        p.mode,
+                        p.ttl,
+                        p.anchor,
+                        p.pause,
+                    ):
+                        a.forget_mode_lines(p.id)
                 adopted = kept = 0
                 refused = {}
                 for lid, slot, addr in static:
                     p = new_lists.get(lid)
-                    acct = new_accounts.get(p.account_id) if p is not None else None
                     if p is None:
                         r = "no_list"
-                    elif acct is not None and acct.state == "released":
-                        r = "released"
                     elif not a.configured:
                         r = "not_ready"
                     else:
@@ -1081,14 +1177,11 @@ class Engine:
                     raise _bad("duplicate login %s" % p.login)
                 batch_logins[p.login] = p.id
             t = {"accounts": [], "lists": []}
-            released = []
             for a in accs:
                 old = self.accounts.get(a.id)
                 if old is not None:
                     a.local_blocked = old.local_blocked
                 self._account_transition(old, a, t)
-                if a.state == "released":
-                    released.append(a.id)
             for p in lsts:
                 old = self.lists.get(p.id)
                 if p.status == "deleted":
@@ -1126,7 +1219,13 @@ class Engine:
                     self.by_account.setdefault(p.account_id, set()).add(p.id)
                     if old is None or old.row() != p.row():
                         self.dirty_lists[p.id] = p
-                self._drop_released_static(released, now)
+                        if old is not None and (old.mode, old.ttl, old.anchor, old.pause) != (
+                            p.mode,
+                            p.ttl,
+                            p.anchor,
+                            p.pause,
+                        ):
+                            self.alloc.forget_mode_lines(p.id)
                 self.seq = seq
                 self.dirty_meta["seq"] = str(seq)
             self._durable()
@@ -1216,9 +1315,60 @@ class Engine:
         open_ = _bool(req, "open", None)
         if open_ is None:
             raise _bad("open is required")
+        addrs = req.get("addrs")
+        closed = set()
+        if addrs is not None:
+            # A7: {ip: open} per egress IPv4 (the port guard counts each address)
+            if not isinstance(addrs, dict) or len(addrs) > 4 * MAX_EGRESS_V4:
+                raise _bad("addrs must be an object {ip: open}")
+            for ip, ok in addrs.items():
+                try:
+                    packed = ipaddress.IPv4Address(ip).packed
+                except (ipaddress.AddressValueError, ValueError):
+                    raise _bad("addrs keys are IPv4 addresses") from None
+                if not isinstance(ok, bool):
+                    raise _bad("addrs values are booleans")
+                if not ok:
+                    closed.add(packed)
         with self.lock:
             self.ipv4_open = open_
+            self.ipv4_closed = frozenset(closed)
         return {"ok": True}
+
+    def op_avoid(self, req):
+        """A12: {entries:[{net, site, until}], removed:[{net, site}], full} (memory only)."""
+        entries, removed = req.get("entries") or [], req.get("removed") or []
+        if not isinstance(entries, list) or not isinstance(removed, list):
+            raise _bad("entries and removed must be lists")
+        full = _bool(req, "full", False)
+
+        def site_of(e):
+            site = e.get("site")
+            if not isinstance(site, str) or not 1 <= len(site) <= 300:
+                raise _bad("avoid site")
+            return site
+
+        parsed, gone = [], []
+        for e in entries:
+            if not isinstance(e, dict):
+                raise _bad("avoid entries are objects")
+            until = _num(e, "until")
+            if until is None:
+                raise _bad("avoid until")
+            parsed.append((_subnet_id(e.get("net")), site_of(e), float(until)))
+        for e in removed:
+            if not isinstance(e, dict):
+                raise _bad("avoid removed are objects")
+            gone.append((_subnet_id(e.get("net")), site_of(e)))
+        if parsed and self.psl is None:
+            p = psl_lib.Psl.load()  # outside the lock: ~9k rules
+            with self.lock:
+                if self.psl is None:
+                    self.psl = p
+        with self.lock:
+            n = self.alloc.avoid_apply(parsed, gone, full, self.clock())
+            sites = len(self.alloc.avoid)
+        return {"ok": True, "pairs": n, "sites": sites}
 
     def op_bindings(self, req):
         after = _int(req, "after", 0, default=0)
@@ -1261,6 +1411,7 @@ class Engine:
         "rejects": op_rejects,
         "reserve_nets": op_reserve_nets,
         "release_nets": op_release_nets,
+        "avoid": op_avoid,
     }
 
     def dispatch(self, req) -> dict:

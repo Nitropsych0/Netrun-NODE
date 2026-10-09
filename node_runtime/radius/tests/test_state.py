@@ -58,14 +58,15 @@ class Persistence(unittest.TestCase):
         a = e2.alloc
         for n in (7, 8, 9):
             self.assertIn(n, a.scan)
-            self.assertNotIn(n, a.free)
-        self.assertIn(reserved[0], a.cooldown)
+            self.assertNotIn(n, a.cand)
+        self.assertIn(reserved[0], a.cand)  # A6: released at once
         self.assertEqual(set(reserved[1:]), {n for n, r in a.reserved.items() if r == "job-9"})
         self.assertEqual(e2.near, {1: 5 << 30})
         self.assertEqual(e2.hb_recv, self.clock() - 30)
         a.check_invariants(self.clock())
         st = e2.dispatch({"op": "status"})
-        self.assertEqual(st["counts"], {"lists": 3, "accounts": 2, "sticky": 2, "static": 1})
+        # the legacy sticky list is a timer list (A10): its line is derived, only the session is remembered
+        self.assertEqual(st["counts"], {"lists": 3, "accounts": 2, "sticky": 1, "static": 1, "lines": 1})
         # the static event feed continues
         self.assertEqual(len(e2.dispatch({"op": "bindings", "after": 0})["items"]), 1)
 

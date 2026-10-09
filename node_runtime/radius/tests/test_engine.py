@@ -117,8 +117,11 @@ class Basics(unittest.TestCase):
         s1 = ask(self.eng, "netrun-stickyy-session-job1")
         s2 = ask(self.eng, "netrun-stickyy-session-job1", port=BASE + 9)
         self.assertEqual(s1.addr, s2.addr)
-        # the base port rotates a bare login even on a sticky list
-        self.assertNotEqual(ask(self.eng, "netrun-stickyy").net, ask(self.eng, "netrun-stickyy").net)
+        # A10: the base port is line slot p0 and follows the list mode (legacy sticky = timer)
+        self.assertEqual(ask(self.eng, "netrun-stickyy").addr, ask(self.eng, "netrun-stickyy").addr)
+        # a session is sticky in every mode, even on a per_request list
+        r1 = ask(self.eng, "netrun-rotaaaa-session-job1")
+        self.assertEqual(ask(self.eng, "netrun-rotaaaa-session-job1", port=BASE + 4).addr, r1.addr)
 
     def test_sticky_ttl_param_and_change(self):
         a = ask(self.eng, "netrun-rotaaaa-session-x-ttl-10m")
@@ -135,25 +138,22 @@ class Basics(unittest.TestCase):
         self.assertEqual(ask(self.eng, "netrun-statica", port=BASE + 3).addr, a.addr)
         p0 = ask(self.eng, "netrun-rotaaaa-static")  # base port, explicit -static -> slot p0
         self.assertEqual(ask(self.eng, "netrun-rotaaaa-static").addr, p0.addr)
-        self.assertIn((10, "p0"), self.eng.alloc.bindings)
+        self.assertIn((10, "p0"), self.eng.alloc.static)
 
-    def test_static_cap_reason(self):
-        self.eng.dispatch({"op": "apply", "baseSeq": 1, "seq": 2, "accounts": [account(1, staticCap=2)], "lists": []})
-        ask(self.eng, "netrun-statica", port=BASE + 1)
-        ask(self.eng, "netrun-statica", port=BASE + 2)
-        self.assertEqual(self.reason_of("netrun-statica", port=BASE + 3), "static_cap")
-
-    def test_trial_sticky_is_shared(self):
-        self.eng.dispatch({"op": "apply", "baseSeq": 1, "seq": 2, "accounts": [account(1, trial=True)], "lists": []})
-        ask(self.eng, "netrun-stickyy", port=BASE + 1)
-        b = self.eng.alloc.bindings[(11, "p1")]
-        self.assertTrue(b.shared)
+    def test_no_caps_and_static_caps_are_ignored(self):
+        # A8: staticCap / stickyExclCap are accepted and ignored; nothing is refused for capacity
+        self.eng.dispatch(
+            {"op": "apply", "baseSeq": 1, "seq": 2, "accounts": [account(1, staticCap=2, trial=True)], "lists": []}
+        )
+        for i in range(1, 40):
+            self.assertTrue(ask(self.eng, "netrun-statica", port=BASE + i).accepted)
+            self.assertTrue(ask(self.eng, "netrun-stickyy-session-s%d" % i).accepted)
+        self.assertNotIn("static_cap", self.eng.dispatch({"op": "status"})["rejects"])
 
     def test_ipv4_destination(self):
         r = ask(self.eng, "netrun-statica", port=BASE + 1, dst=DST4)
         self.assertTrue(r.accepted)
         self.assertEqual(r.attrs, [(8, ipaddress.IPv4Address(rtest.EGRESS4).packed)])
-        self.assertNotIn((12, "p1"), self.eng.alloc.bindings)  # an IPv4 connection holds no /64
         self.eng.dispatch({"op": "ipv4_admission", "open": False})
         self.assertEqual(self.reason_of("netrun-rotaaaa", dst=DST4), "capacity")
         self.assertIsNone(self.reason_of("netrun-rotaaaa", dst=DST6))
@@ -323,6 +323,228 @@ class Probe(unittest.TestCase):
     def test_probe_ignores_admission(self):
         self.eng.dispatch({"op": "admission", "open": False})
         self.assertTrue(ask(self.eng, "netrun-svcprobe", "ProbePassword123", dst=DST6).accepted)
+
+
+def ask_host(eng, user, host, port=BASE, dst=DST6):
+    ra = os.urandom(16)
+    pkt = rtest.proto.build_3proxy_request(
+        9, ra, rtest.SECRET, username=user.encode(), password=PW.encode(), nas_port=port, dst=dst, hostname=host
+    )
+    return rtest.Reply(eng.handle(pkt), ra)
+
+
+class Modes(unittest.TestCase):
+    """A10 list modes and the A11 pause through the request path."""
+
+    def setUp(self):
+        self.clock = rtest.FakeClock()
+        self.eng = rtest.make_engine(self, clock=self.clock)
+        self.t0 = self.clock()
+        setup_state(
+            self.eng,
+            lists=[
+                plist(10, "perreqa", 1, mode="per_request"),
+                plist(11, "timerab", 1, mode="timer", ttlSec=300, timerAnchor=self.t0),
+                plist(12, "linkabc", 1, mode="link"),
+                plist(13, "statica", 1, mode="static"),
+                plist(14, "pausing", 1, mode="per_request", stickyPauseSec=5),
+                plist(15, "tpauses", 1, mode="timer", ttlSec=60, timerAnchor=self.t0, stickyPauseSec=10),
+            ],
+        )
+
+    def apply_list(self, seq, **lst):
+        r = self.eng.dispatch({"op": "apply", "baseSeq": seq - 1, "seq": seq, "accounts": [], "lists": [plist(**lst)]})
+        self.assertNotIn("error", r, r)
+        return r
+
+    def test_per_request(self):
+        nets = {ask(self.eng, "netrun-perreqa", port=BASE + 1).net for _ in range(30)}
+        self.assertEqual(len(nets), 30)
+
+    def test_timer(self):
+        a = ask(self.eng, "netrun-timerab", port=BASE + 1)
+        b = ask(self.eng, "netrun-timerab", port=BASE + 2)
+        self.assertNotEqual(a.addr, b.addr)
+        self.clock.advance(299)
+        self.assertEqual(ask(self.eng, "netrun-timerab", port=BASE + 1).addr, a.addr)
+        self.clock.advance(1)
+        self.assertNotEqual(ask(self.eng, "netrun-timerab", port=BASE + 1).addr, a.addr)
+        # a link change (epoch bump, new anchor) changes the address at once
+        c = ask(self.eng, "netrun-timerab", port=BASE + 2)
+        self.apply_list(
+            2, lid=11, login_id="timerab", aid=1, mode="timer", ttlSec=300, timerAnchor=self.clock(), linkEpoch=1
+        )
+        self.assertNotEqual(ask(self.eng, "netrun-timerab", port=BASE + 2).addr, c.addr)
+
+    def test_link_and_per_line_epochs(self):
+        a = ask(self.eng, "netrun-linkabc", port=BASE + 1)
+        b = ask(self.eng, "netrun-linkabc", port=BASE + 2)
+        self.clock.advance(86400)
+        self.assertEqual(ask(self.eng, "netrun-linkabc", port=BASE + 1).addr, a.addr)
+        self.apply_list(2, lid=12, login_id="linkabc", aid=1, mode="link", lineEpochs={"p1": 1})
+        self.assertNotEqual(ask(self.eng, "netrun-linkabc", port=BASE + 1).addr, a.addr)
+        self.assertEqual(ask(self.eng, "netrun-linkabc", port=BASE + 2).addr, b.addr)
+        self.apply_list(3, lid=12, login_id="linkabc", aid=1, mode="link", linkEpoch=1, lineEpochs={"p1": 1})
+        self.assertNotEqual(ask(self.eng, "netrun-linkabc", port=BASE + 2).addr, b.addr)
+
+    def test_static_survives_a_mode_switch_back(self):
+        a = ask(self.eng, "netrun-statica", port=BASE + 5)
+        self.apply_list(2, lid=13, login_id="statica", aid=1, mode="per_request")
+        self.assertNotEqual(ask(self.eng, "netrun-statica", port=BASE + 5).addr, a.addr)
+        self.apply_list(3, lid=13, login_id="statica", aid=1, mode="static")
+        self.assertEqual(ask(self.eng, "netrun-statica", port=BASE + 5).addr, a.addr)
+
+    def test_pause_on_per_request(self):
+        a = ask(self.eng, "netrun-pausing", port=BASE + 1)
+        self.clock.advance(3)
+        self.assertEqual(ask(self.eng, "netrun-pausing", port=BASE + 1).addr, a.addr)
+        self.clock.advance(6)
+        self.assertNotEqual(ask(self.eng, "netrun-pausing", port=BASE + 1).addr, a.addr)
+        # the rotate param is always fresh, pause or not
+        x = ask(self.eng, "netrun-pausing-rotate", port=BASE + 1).addr
+        self.assertNotEqual(ask(self.eng, "netrun-pausing-rotate", port=BASE + 1).addr, x)
+
+    def test_pause_on_timer(self):
+        a = ask(self.eng, "netrun-tpauses", port=BASE + 1)
+        for _ in range(8):  # busy across the tick at t0 + 60
+            self.clock.advance(9)
+            self.assertEqual(ask(self.eng, "netrun-tpauses", port=BASE + 1).addr, a.addr)
+        self.clock.advance(11)  # quiet: switches
+        self.assertNotEqual(ask(self.eng, "netrun-tpauses", port=BASE + 1).addr, a.addr)
+
+    def test_pause_is_ignored_on_link_and_static_lists(self):
+        self.apply_list(2, lid=12, login_id="linkabc", aid=1, mode="link", stickyPauseSec=5)
+        self.assertIsNone(self.eng.lists[12].pause)
+
+    def test_bad_list_fields(self):
+        for bad in (
+            dict(mode="weekly"),
+            dict(mode="timer", ttlSec=10),
+            dict(mode="link", lineEpochs={"x1": 1}),
+            dict(mode="link", lineEpochs=[1]),
+            dict(mode="per_request", stickyPauseSec=61),
+            dict(mode="timer", timerAnchor="yesterday"),
+        ):
+            r = self.eng.dispatch(
+                {"op": "apply", "baseSeq": 1, "seq": 2, "accounts": [], "lists": [plist(12, "linkabc", 1, **bad)]}
+            )
+            self.assertEqual(r["error"], "bad_request", bad)
+
+    def test_list_rows_survive_a_restart(self):
+        self.apply_list(
+            2, lid=12, login_id="linkabc", aid=1, mode="link", linkEpoch=4, lineEpochs={"p3": 2, "s:s01000": 1}
+        )
+        a = ask(self.eng, "netrun-linkabc", port=BASE + 3)
+        self.eng.flush()
+        eng2 = rtest.make_engine(self, clock=self.clock, path=self.eng._test_dir, with_facts=False)
+        p = eng2.lists[12]
+        self.assertEqual((p.mode, p.link_epoch, p.line_epochs), ("link", 4, {"p3": 2, "s:s01000": 1}))
+        self.assertEqual(eng2.lists[15].pause, 10)
+        self.assertEqual(eng2.lists[11].anchor, self.t0)
+        self.assertEqual(ask(eng2, "netrun-linkabc", port=BASE + 3).addr, a.addr)
+
+
+class EgressIpv4s(unittest.TestCase):
+    """A7/A9: several per-GB IPv4s egress IPv4-only destinations."""
+
+    V4 = ["192.0.2.10", "192.0.2.11"]
+
+    def setUp(self):
+        self.clock = rtest.FakeClock()
+        self.eng = rtest.make_engine(self, clock=self.clock, egressIpv4s=self.V4)
+        setup_state(
+            self.eng,
+            lists=[plist(10, "perreqa", 1, mode="per_request"), plist(13, "statica", 1, mode="static")],
+            accounts=[account(1)],
+        )
+
+    def test_per_request_spreads_and_lines_keep_theirs(self):
+        seen = {str(ask(self.eng, "netrun-perreqa", dst=DST4).addr) for _ in range(40)}
+        self.assertEqual(seen, set(self.V4))
+        for port in range(BASE + 1, BASE + 20):
+            first = ask(self.eng, "netrun-statica", port=port, dst=DST4).addr
+            for _ in range(3):
+                self.assertEqual(ask(self.eng, "netrun-statica", port=port, dst=DST4).addr, first)
+
+    def test_admission_per_address(self):
+        self.eng.dispatch({"op": "ipv4_admission", "open": True, "addrs": {"192.0.2.10": False, "192.0.2.11": True}})
+        for _ in range(20):
+            self.assertEqual(str(ask(self.eng, "netrun-perreqa", dst=DST4).addr), "192.0.2.11")
+        for port in range(BASE + 1, BASE + 10):
+            self.assertEqual(str(ask(self.eng, "netrun-statica", port=port, dst=DST4).addr), "192.0.2.11")
+        self.eng.dispatch({"op": "ipv4_admission", "open": True, "addrs": {"192.0.2.10": False, "192.0.2.11": False}})
+        self.assertFalse(ask(self.eng, "netrun-perreqa", dst=DST4).accepted)
+        self.assertTrue(ask(self.eng, "netrun-perreqa", dst=DST6).accepted)
+        st = self.eng.dispatch({"op": "status"})
+        self.assertEqual(st["ipv4Closed"], self.V4)
+        self.assertEqual(st["facts"]["egressIpv4s"], self.V4)
+        r = self.eng.dispatch({"op": "ipv4_admission", "open": True, "addrs": {"nope": True}})
+        self.assertEqual(r["error"], "bad_request")
+
+    def test_facts_validation(self):
+        r = self.eng.dispatch({"op": "facts", "facts": rtest.facts(egressIpv4s=["300.1.1.1"])})
+        self.assertEqual(r["error"], "bad_request")
+        r = self.eng.dispatch({"op": "facts", "facts": rtest.facts(egressIpv4s=["192.0.2.%d" % i for i in range(65)])})
+        self.assertEqual(r["error"], "bad_request")
+        # without egressIpv4s the single egressIpv4 is the set
+        self.eng.dispatch({"op": "facts", "facts": rtest.facts()})
+        self.assertEqual(self.eng.facts.egress_v4s_str, (rtest.EGRESS4,))
+
+
+class SmartRotation(unittest.TestCase):
+    """A12: ctl avoid and the re-draw on per_request picks."""
+
+    def setUp(self):
+        self.clock = rtest.FakeClock()
+        self.eng = rtest.make_engine(self, clock=self.clock, subnets=[0, 9])
+        setup_state(
+            self.eng,
+            lists=[plist(10, "perreqa", 1, mode="per_request"), plist(12, "linkabc", 1, mode="link")],
+            accounts=[account(1)],
+        )
+
+    def test_avoid_op_and_picks(self):
+        until = self.clock() + 1800
+        r = self.eng.dispatch(
+            {
+                "op": "avoid",
+                "full": True,
+                "entries": [{"net": n, "site": "example.com", "until": until} for n in range(9)],
+                "removed": [],
+            }
+        )
+        self.assertEqual(r, {"ok": True, "pairs": 9, "sites": 1})
+        nets = {ask_host(self.eng, "netrun-perreqa", b"www.example.com").net for _ in range(30)}
+        self.assertEqual(nets, {9})
+        other = {ask_host(self.eng, "netrun-perreqa", b"other.org").net for _ in range(60)}
+        self.assertGreater(len(other), 3)
+        st = self.eng.dispatch({"op": "status"})["smartRotation"]
+        self.assertEqual(st["avoidedPairs"], 9)
+        self.assertGreater(st["picksAvoided1h"], 0)
+        # link lines are not steered by smart rotation (one address per link change)
+        link = ask_host(self.eng, "netrun-linkabc", b"example.com", port=BASE + 1)
+        self.assertTrue(link.accepted)
+        r = self.eng.dispatch(
+            {"op": "avoid", "entries": [], "removed": [{"net": n, "site": "example.com"} for n in range(9)]}
+        )
+        self.assertEqual(r["pairs"], 0)
+
+    def test_without_a_host_the_destination_48_is_the_site(self):
+        site = "v6:2001:db8:ffff::/48"  # DST6's /48
+        self.eng.dispatch(
+            {"op": "avoid", "entries": [{"net": n, "site": site, "until": self.clock() + 60} for n in range(9)]}
+        )
+        self.assertEqual({ask(self.eng, "netrun-perreqa").net for _ in range(20)}, {9})
+
+    def test_bad_avoid_requests(self):
+        for body in (
+            {"entries": "x"},
+            {"entries": [{"net": 70000, "site": "a.com", "until": 1}]},
+            {"entries": [{"net": 1, "site": "", "until": 1}]},
+            {"entries": [{"net": 1, "site": "a.com"}]},
+            {"removed": [{"net": 1}]},
+        ):
+            self.assertEqual(self.eng.dispatch({"op": "avoid", **body})["error"], "bad_request", body)
 
 
 if __name__ == "__main__":

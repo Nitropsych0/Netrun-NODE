@@ -1,4 +1,4 @@
-"""Per-GB username grammar (frozen interface I1).
+"""Per-GB username grammar (frozen interface I1, with amendment A10).
 
     netrun-<id>[-session-<s>][-ttl-<N>(s|m|h)][-static][-rotate][-country-<cc>]
 
@@ -6,11 +6,24 @@
 - <id> = [a-z0-9]{5,12}; ids starting with "svc" are reserved
   ("netrun-svcprobe" is the service probe);
 - params in any order, each at most once:
-  session-[a-z0-9_]{1,32} | ttl-<N>(s|m|h) with 60 <= seconds <= 86400 |
+  session-[a-z0-9_]{1,32} | ttl-<N>(s|m|h) with 30 <= seconds <= 86400 (A10) |
   static | rotate | country-[a-z]{2} (must equal the node's geo);
 - refused combinations: rotate+session, rotate+ttl, rotate+static, static+ttl.
 
 Errors: bad_login (the base login itself is unusable) or bad_params.
+
+Mode resolution (A10: every port is a line slot that follows the list's
+«Смена IP» mode; the base port no longer means rotation), first match wins:
+  1. rotate                       -> a fresh address for this connection;
+  2. static                       -> the slot's static address;
+  3. a session that is not a line slot (anything but s<5 digits>)
+                                  -> a sticky session for ttl (default 600 s),
+                                     whatever the list's mode;
+  4. otherwise the slot (p<port - base>, or s:sNNNNN for lines 1000+) follows
+     the list mode: per_request -> per_request (ttl given: sticky for ttl);
+     timer -> timer windows of ttl (the param) or the list ttl; link -> link
+     (ttl given: sticky); static -> static (ttl given: sticky).
+The legacy list modes map: rotate -> per_request, sticky -> timer.
 """
 
 from __future__ import annotations
@@ -20,13 +33,14 @@ import re
 PROBE_LOGIN = "netrun-svcprobe"
 MAX_BYTES = 120  # the name must be shorter than this (3proxy truncates at 128)
 DEFAULT_STICKY_TTL = 600
-TTL_MIN = 60
+TTL_MIN = 30  # A10: custom TTL 30 s .. 24 h
 TTL_MAX = 86400
 
 _ID_RE = re.compile(r"[a-z0-9]{5,12}\Z")
 _SESSION_RE = re.compile(r"[a-z0-9_]{1,32}\Z")
 _TTL_RE = re.compile(r"([0-9]{1,6})([smh])\Z")
 _CC_RE = re.compile(r"[a-z]{2}\Z")
+_LINE_SESSION_RE = re.compile(r"s[0-9]{5}\Z")  # I2: the slot of line 1000+ (s01000 .. s10000)
 _MULT = {"s": 1, "m": 60, "h": 3600}
 
 
@@ -128,31 +142,55 @@ def parse(raw, geo: str | None = None) -> Login:
     return out
 
 
-def resolve(login: Login, port: int, base_port: int, list_mode: str, list_ttl: int | None):
-    """Mode and slot per the I1 table: returns (mode, ttl_sec, slot).
+# list modes after A10 (the legacy names map onto them)
+PER_REQUEST = "per_request"
+TIMER = "timer"
+LINK = "link"
+STATIC = "static"
+LIST_MODES = (PER_REQUEST, TIMER, LINK, STATIC)
+LEGACY_MODES = {"rotate": PER_REQUEST, "sticky": TIMER}
 
-    mode: "rotate" (ttl 0, slot None), "sticky" (ttl > 0) or "static" (ttl None).
-    Slot: "s:<session>" when a session is given, else "p<port - base>".
+# resolved per-connection modes
+FRESH = "fresh"  # a new random address for this one connection (the rotate param)
+STICKY = "sticky"  # a remembered address for ttl from its first connection
+
+
+def list_mode(mode: str) -> str:
+    """Normalise a list mode (legacy rotate/sticky accepted)."""
+    m = LEGACY_MODES.get(mode, mode)
+    if m not in LIST_MODES:
+        raise ValueError("unknown list mode %r" % mode)
+    return m
+
+
+def is_line_session(session: str | None) -> bool:
+    return session is not None and _LINE_SESSION_RE.match(session) is not None
+
+
+def resolve(login: Login, port: int, base_port: int, mode: str, list_ttl: int | None):
+    """Per-connection mode and slot (see the module doc): returns (mode, ttl_sec, slot).
+
+    mode: fresh (slot None), per_request, timer (ttl = the window), link, static or
+    sticky (ttl = the session TTL). Slot: "s:<session>" when a session is given,
+    else "p<port - base>" (the base port is slot p0).
     """
     if login.rotate:
-        return "rotate", 0, None
+        return FRESH, 0, None
+    mode = LEGACY_MODES.get(mode, mode)
     slot = ("s:" + login.session) if login.session is not None else "p%d" % (port - base_port)
     if login.static:
-        return "static", None, slot
+        return STATIC, None, slot
+    if login.session is not None and not is_line_session(login.session):
+        return STICKY, login.ttl or DEFAULT_STICKY_TTL, slot
+    if mode == TIMER:
+        return TIMER, login.ttl or list_ttl or DEFAULT_STICKY_TTL, slot
     if login.ttl is not None:
-        return "sticky", login.ttl, slot
-    if login.session is not None:
-        if list_mode == "static":
-            return "static", None, slot
-        ttl = list_ttl if (list_mode == "sticky" and list_ttl) else DEFAULT_STICKY_TTL
-        return "sticky", ttl, slot
-    if port == base_port:
-        return "rotate", 0, None
-    if list_mode == "static":
-        return "static", None, slot
-    if list_mode == "sticky":
-        return "sticky", list_ttl or DEFAULT_STICKY_TTL, slot
-    return "rotate", 0, None
+        return STICKY, login.ttl, slot
+    if mode == STATIC:
+        return STATIC, None, slot
+    if mode == LINK:
+        return LINK, None, slot
+    return PER_REQUEST, None, slot
 
 
 def format_ttl(sec: int) -> str:
