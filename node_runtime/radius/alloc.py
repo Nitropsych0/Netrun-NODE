@@ -27,7 +27,9 @@ used; the exception is counted (sameAccount64).
 
 from __future__ import annotations
 
+import heapq
 import os
+from collections import OrderedDict
 import random
 import time
 from array import array
@@ -46,6 +48,11 @@ ROTATE_BEST_OF = 4
 SHARED_SAMPLE = 32
 SHARED_SOFT_MAX = 32  # bindings per shared /64 before a fresh one is preferred
 PREV_NET_TTL = 3600
+PREV_NET_MAX = 200_000
+# Safety caps (not tunable by customers): session ids are customer-chosen, so live
+# sticky bindings must stay bounded for MemoryMax. Refusals are reason "capacity".
+MAX_BINDINGS = 250_000
+MAX_STICKY_PER_ACCOUNT = 20_000
 STATIC = "static"
 STICKY = "sticky"
 
@@ -179,10 +186,14 @@ class Allocator:
         self.by_list = {}  # list_id -> {slot: Binding}
         self.acct_static = {}
         self.acct_excl_sticky = {}
+        self.acct_sticky = {}
+        self.sticky_heap = []  # (expires_at, list_id, slot); stale entries are skipped
+        self.max_bindings = MAX_BINDINGS
+        self.max_sticky_per_account = MAX_STICKY_PER_ACCOUNT
         self.n_static = 0
         self.n_sticky = 0
         self.last_used = _u32_array()
-        self.prev_net = {}  # (list_id, slot) -> (net, until)
+        self.prev_net = OrderedDict()  # (list_id, slot) -> (net, until), oldest first
         self.same_account_events = 0
         # persistence journal, drained by the engine's flush
         self.dirty_bindings = {}  # key -> Binding | None
@@ -403,6 +414,7 @@ class Allocator:
             self.n_static += 1
         else:
             self.n_sticky += 1
+            self.acct_sticky[b.account_id] = self.acct_sticky.get(b.account_id, 0) + 1
             if not b.shared:
                 self.acct_excl_sticky[b.account_id] = self.acct_excl_sticky.get(b.account_id, 0) + 1
         if b.shared and not h.shared:
@@ -438,6 +450,7 @@ class Allocator:
             self.n_static -= 1
         else:
             self.n_sticky -= 1
+            self._dec(self.acct_sticky, b.account_id)
             if not b.shared:
                 self._dec(self.acct_excl_sticky, b.account_id)
         if not h.binds:
@@ -454,6 +467,8 @@ class Allocator:
         self.by_list.setdefault(b.list_id, {})[b.slot] = b
         self._hold_add(b)
         self.dirty_bindings[b.key()] = b
+        if b.kind == STICKY and b.expires_at is not None:
+            heapq.heappush(self.sticky_heap, (b.expires_at, b.list_id, b.slot))
         if b.kind == STATIC and event_reason:
             self.events.append(("add", b.list_id, b.slot, b.addr, event_reason, now))
 
@@ -471,8 +486,9 @@ class Allocator:
         self.dirty_bindings[key] = None
         if b.kind == STATIC:
             self.events.append(("release", b.list_id, b.slot, b.addr, reason, now))
-        else:
+        elif len(self.prev_net) < PREV_NET_MAX:
             self.prev_net[key] = (b.net, now + PREV_NET_TTL)
+            self.prev_net.move_to_end(key)  # insertion order = expiry order
 
     def release_list(self, list_id: int, reason: str, now: float, kinds=(STATIC, STICKY)) -> int:
         slots = self.by_list.get(list_id)
@@ -501,7 +517,13 @@ class Allocator:
         self.bindings[b.key()] = b
         self.by_list.setdefault(b.list_id, {})[b.slot] = b
         self._hold_add(b)
+        if b.kind == STICKY and b.expires_at is not None:
+            self.sticky_heap.append((b.expires_at, b.list_id, b.slot))
         return True
+
+    def loaded(self):
+        """End of start-up loading."""
+        heapq.heapify(self.sticky_heap)
 
     # ---- picks ---------------------------------------------------------------------
 
@@ -621,6 +643,7 @@ class Allocator:
                 if new_exp != b.expires_at:
                     b.expires_at = new_exp
                     self.dirty_bindings[key] = b
+                    heapq.heappush(self.sticky_heap, (new_exp, list_id, slot))
                 b.last_used_at = now
                 return b
             avoid = b.net
@@ -629,6 +652,11 @@ class Allocator:
             prev = self.prev_net.get(key)
             if prev is not None and prev[1] > now:
                 avoid = prev[0]
+        if (
+            len(self.bindings) >= self.max_bindings
+            or self.acct_sticky.get(account_id, 0) >= self.max_sticky_per_account
+        ):
+            raise AllocError("capacity")
         shared = True
         n = None
         if self.acct_excl_sticky.get(account_id, 0) < excl_cap and self._reserve_ok(sticky_pct):
@@ -666,6 +694,8 @@ class Allocator:
                 self.events.append(("add", b.list_id, b.slot, b.addr, "converted", now))
                 return b
             self.release(b, "converted", now)
+        if len(self.bindings) >= self.max_bindings:
+            raise AllocError("capacity")
         if not len(self.free) or len(self.free) < static_pct / 100.0 * len(self.cand):
             raise AllocError("capacity")
         n = self._pick_exclusive()
@@ -684,6 +714,7 @@ class Allocator:
             self.n_static -= 1
         else:
             self.n_sticky -= 1
+            self._dec(self.acct_sticky, b.account_id)
             if not b.shared:
                 self._dec(self.acct_excl_sticky, b.account_id)
 
@@ -695,6 +726,7 @@ class Allocator:
             self.n_static += 1
         else:
             self.n_sticky += 1
+            self.acct_sticky[b.account_id] = self.acct_sticky.get(b.account_id, 0) + 1
             if not b.shared:
                 self.acct_excl_sticky[b.account_id] = self.acct_excl_sticky.get(b.account_id, 0) + 1
 
@@ -725,15 +757,29 @@ class Allocator:
     # ---- housekeeping --------------------------------------------------------------
 
     def expire_sticky(self, now: float) -> int:
-        dead = [
-            b for b in self.bindings.values() if b.kind == STICKY and b.expires_at is not None and b.expires_at <= now
-        ]
-        for b in dead:
+        heap = self.sticky_heap
+        n = 0
+        while heap and heap[0][0] <= now:
+            _exp, lid, slot = heapq.heappop(heap)
+            b = self.bindings.get((lid, slot))
+            if b is None or b.kind != STICKY or b.expires_at is None or b.expires_at > now:
+                continue  # stale entry (released, converted or extended)
             self.release(b, "expired", now)
-        if self.prev_net:
-            for k in [k for k, (_n, until) in self.prev_net.items() if until <= now]:
-                del self.prev_net[k]
-        return len(dead)
+            n += 1
+        if len(heap) > 2 * self.n_sticky + 4096:
+            self.sticky_heap = [
+                (b.expires_at, b.list_id, b.slot)
+                for b in self.bindings.values()
+                if b.kind == STICKY and b.expires_at is not None
+            ]
+            heapq.heapify(self.sticky_heap)
+        pn = self.prev_net
+        while pn:
+            k, (_net, until) = next(iter(pn.items()))
+            if until > now:
+                break
+            pn.popitem(last=False)
+        return n
 
     def stats(self, now: float) -> dict:
         bound_excl = 0
@@ -793,4 +839,10 @@ class Allocator:
                 assert h.n == 1, n
         assert static_per_acct == self.acct_static, (static_per_acct, self.acct_static)
         assert excl_sticky == self.acct_excl_sticky, (excl_sticky, self.acct_excl_sticky)
+        sticky_per_acct = {}
+        for b in self.bindings.values():
+            if b.kind == STICKY:
+                sticky_per_acct[b.account_id] = sticky_per_acct.get(b.account_id, 0) + 1
+                assert (b.expires_at, b.list_id, b.slot) in self.sticky_heap, b.key()
+        assert sticky_per_acct == self.acct_sticky, (sticky_per_acct, self.acct_sticky)
         assert set(self.shared_nets.items) == {n for n, h in self.holds.items() if h.shared}

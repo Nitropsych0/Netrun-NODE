@@ -370,6 +370,11 @@ class Engine:
         self.lock = threading.Lock()
         self.ctl_lock = threading.Lock()
         self.alloc = Allocator(rng=rng, clock=clock)
+        self.alloc.max_bindings = _env_num(env, "PERGB_BINDINGS_MAX", self.alloc.max_bindings, int)
+        self.alloc.max_sticky_per_account = _env_num(
+            env, "PERGB_STICKY_MAX_PER_ACCOUNT", self.alloc.max_sticky_per_account, int
+        )
+        self._pending_bindings = None
         self.secret = secret
         self.facts = None
         self.accounts = {}
@@ -470,6 +475,7 @@ class Engine:
         elif data["bindings"]:
             log("bindings kept on disk until facts arrive")
             self._pending_bindings = data["bindings"]
+        a.loaded()
         if dropped:
             log("dropped %d inconsistent bindings at load" % dropped)
         a.dirty_nets.clear()
@@ -524,6 +530,7 @@ class Engine:
                     a.dirty_bindings[(list_id, slot)] = None
                     if kind == STATIC:
                         a.events.append(("release", list_id, slot, b.addr, "load_conflict", now))
+            a.loaded()
 
     # ---- request path --------------------------------------------------------------
 

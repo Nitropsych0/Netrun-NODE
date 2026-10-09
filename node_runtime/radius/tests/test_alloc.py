@@ -231,6 +231,56 @@ class Sticky(unittest.TestCase):
         self.assertEqual(s.kind, "static")
 
 
+class SafetyCaps(unittest.TestCase):
+    def test_sticky_per_account_cap(self):
+        a, clock = mk()
+        a.max_sticky_per_account = 5
+        for i in range(5):
+            sticky(a, clock, 1, "s:%d" % i)
+        with self.assertRaises(AllocError) as cm:
+            sticky(a, clock, 1, "s:new")
+        self.assertEqual(cm.exception.reason, "capacity")
+        sticky(a, clock, 2, "s:new", acct=2)
+        sticky(a, clock, 1, "s:0")  # an existing slot is still served
+        clock.advance(601)
+        a.expire_sticky(clock())
+        sticky(a, clock, 1, "s:new")  # room again after expiry
+
+    def test_node_wide_binding_cap(self):
+        a, clock = mk()
+        a.max_bindings = 4
+        for i in range(4):
+            sticky(a, clock, i, "p1", acct=i)
+        with self.assertRaises(AllocError):
+            sticky(a, clock, 9, "p1", acct=9)
+        with self.assertRaises(AllocError):
+            static(a, clock, 9, "p2", acct=9)
+
+    def test_heap_expiry_honours_ttl_changes(self):
+        a, clock = mk()
+        b = sticky(a, clock, 1, "p1", ttl=600)
+        clock.advance(300)
+        sticky(a, clock, 1, "p1", ttl=3600)
+        clock.advance(400)  # past the first expiry, before the new one
+        self.assertEqual(a.expire_sticky(clock()), 0)
+        self.assertIn((1, "p1"), a.bindings)
+        clock.advance(3000)
+        self.assertEqual(a.expire_sticky(clock()), 1)
+        self.assertNotIn(b.key(), a.bindings)
+        self.assertEqual(len(a.sticky_heap), 0)
+
+    def test_prev_net_is_pruned_in_order(self):
+        a, clock = mk()
+        for i in range(10):
+            b = sticky(a, clock, 1, "p%d" % i, ttl=60)
+            a.release(b, "test", clock())
+            clock.advance(10)
+        self.assertEqual(len(a.prev_net), 10)
+        clock.advance(3600 - 55)  # releases at +0..+90 s, now +3645 s: the first five are over
+        a.expire_sticky(clock())
+        self.assertEqual(len(a.prev_net), 5)
+
+
 class Excluded(unittest.TestCase):
     def test_shrink_guard(self):
         a, clock = mk()
