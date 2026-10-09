@@ -3,8 +3,10 @@
 # the DNS gate (no CA call for a name that does not point here), one failing
 # name never stopping the others, the crt-list (IP certificate first), stale
 # PEM removal, reload only on a change, the base-config migration to the
-# crt-list, and renew calling the hostname step. lego / haproxy / systemctl /
-# getent / ip are stubs on PATH; certificates are real (openssl, self-signed).
+# crt-list, and renew calling the hostname step; a stale answer of the node's
+# resolver (2026-10-09) checked against the public resolvers and flushed.
+# lego / haproxy / systemctl / getent / dig / unbound-control / ip are stubs on
+# PATH; certificates are real (openssl, self-signed).
 # Part 1 sources the script's functions; part 2 runs the script itself
 # (set -euo pipefail for real); part 3 (when a real haproxy is found:
 # NETRUN_TEST_HAPROXY=<path>, else `haproxy` on PATH) checks the crt-list and
@@ -28,8 +30,8 @@ REAL_HAPROXY="${NETRUN_TEST_HAPROXY:-$(command -v haproxy 2>/dev/null || true)}"
 
 # ── stubs ─────────────────────────────────────────────────────────
 STUB="$TMP/bin"; mkdir -p "$STUB"
-export STUB_LOG="$TMP/calls.log" DNS_MAP="$TMP/dns.map"
-: > "$STUB_LOG"; : > "$DNS_MAP"
+export STUB_LOG="$TMP/calls.log" DNS_MAP="$TMP/dns.map" DNS_STALE="$TMP/dns.stale" PUBLIC_DNS_MAP="$TMP/dns.public"
+: > "$STUB_LOG"; : > "$DNS_MAP"; : > "$DNS_STALE"; : > "$PUBLIC_DNS_MAP"
 # lego: logs the call; LEGO_FAIL names fail like a refused HTTP-01; LEGO_NOOP
 # names exit 0 leaving the files alone (lego 5 `run` deciding "not due"); an
 # IP gets dummy files, a hostname a real self-signed certificate (LEGO_DAYS,
@@ -61,11 +63,44 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -keyout "$path/certificates/$dom.key" -out "$path/certificates/$dom.crt" -days "${LEGO_DAYS:-90}" \
   -subj "/CN=$dom" -addext "subjectAltName=DNS:$dom" >/dev/null 2>&1
 EOF
-# getent ahostsv4 <name>: "<name> <ip>" lines of $DNS_MAP (exit 2 = not found).
+# getent ahostsv4 <name> = the node's own resolver (unbound): "<name> <ip>"
+# lines of $DNS_MAP (the zone's records; exit 2 = not found) — unless
+# $DNS_STALE has a line "<name> [<ip> ...]" for it: a stale cache entry
+# (no address = a cached NXDOMAIN) that answers until unbound-control flushes it.
 cat > "$STUB/getent" <<'EOF'
 #!/usr/bin/env bash
 [ "$1" = ahostsv4 ] || exit 2
-awk -v h="$2" '$1 == h { print $2 "       STREAM " h; print $2 "       DGRAM"; f = 1 } END { exit f ? 0 : 2 }' "$DNS_MAP"
+map="$DNS_MAP"
+if [ -s "$DNS_STALE" ] && awk -v h="$2" '$1 == h { f = 1 } END { exit !f }' "$DNS_STALE"; then map="$DNS_STALE"; fi
+awk -v h="$2" '$1 == h { for (i = 2; i <= NF; i++) { print $i "       STREAM " h; print $i "       DGRAM"; f = 1 } } END { exit f ? 0 : 2 }' "$map"
+EOF
+# dig +short ... A <name> @<server> = a public resolver: the lines
+# "<server> <name> [<ip>]" of $PUBLIC_DNS_MAP when it has any for that server
+# and name (no address = NXDOMAIN), else the zone's records ($DNS_MAP). A
+# server in DIG_NOREPLY ("<server> ...") times out (dig: exit 9).
+cat > "$STUB/dig" <<'EOF'
+#!/usr/bin/env bash
+server="" name=""
+for a in "$@"; do case "$a" in @*) server="${a#@}" ;; +*|A) ;; *) name="$a" ;; esac; done
+echo "dig @$server $name" >> "$STUB_LOG"
+case " ${DIG_NOREPLY:-} " in *" $server "*) echo ";; connection timed out; no servers could be reached"; exit 9 ;; esac
+if [ -s "$PUBLIC_DNS_MAP" ] && awk -v s="$server" -v h="$name" '$1 == s && $2 == h { f = 1 } END { exit !f }' "$PUBLIC_DNS_MAP"; then
+  awk -v s="$server" -v h="$name" '$1 == s && $2 == h && NF > 2 { print $3 }' "$PUBLIC_DNS_MAP"
+else
+  awk -v h="$name" '$1 == h { print $2 }' "$DNS_MAP"
+fi
+EOF
+# unbound-control: logged; `flush <name>` drops the name's $DNS_STALE line.
+# UNBOUND_CONTROL_FAIL=1: fails (unbound down / no remote control);
+# UNBOUND_FLUSH_NOOP=1: says ok but the stale answer stays.
+cat > "$STUB/unbound-control" <<'EOF'
+#!/usr/bin/env bash
+echo "unbound-control $*" >> "$STUB_LOG"
+[ "${UNBOUND_CONTROL_FAIL:-0}" != 1 ] || { echo "error: connect: Connection refused" >&2; exit 1; }
+if [ "$1" = flush ] && [ -n "${2:-}" ] && [ -s "$DNS_STALE" ] && [ "${UNBOUND_FLUSH_NOOP:-0}" != 1 ]; then
+  awk -v h="$2" '$1 != h' "$DNS_STALE" > "$DNS_STALE.tmp" && mv -f "$DNS_STALE.tmp" "$DNS_STALE"
+fi
+echo ok
 EOF
 # haproxy -c: fails when $TMP/haproxy.reject exists, or when a crt-list named
 # by a -f config (or a PEM it names) is missing — as the real check does —
@@ -104,6 +139,12 @@ export NETRUN_ENV_FILE="$TMP/no-netrun.env"   # hermetic: no host /etc/netrun/ne
 
 IP=45.32.10.20
 dns() { printf '%s %s\n' "$1" "$2" >> "$DNS_MAP"; }
+# stale <name> [<ip> ...]: the node's resolver holds a stale answer (none = NXDOMAIN).
+stale() { printf '%s\n' "$*" >> "$DNS_STALE"; }
+# pub <server> <name> [<ip>]: what public resolver <server> says (none = NXDOMAIN).
+pub() { printf '%s\n' "$*" >> "$PUBLIC_DNS_MAP"; }
+flushes() { grep -c '^unbound-control ' "$STUB_LOG" || true; }
+digs() { grep -c '^dig ' "$STUB_LOG" || true; }
 lego_calls() { grep -c "^lego run .*--domains $1 " "$STUB_LOG" || true; }
 reloads() { grep -c '^systemctl reload haproxy' "$STUB_LOG" || true; }
 # Self-signed certificate for $1 (SAN DNS:$1) -> $2.crt / $2.key, $3 days.
@@ -126,7 +167,7 @@ fresh() {
     NETRUN_HTTPS_HAPROXY_CFG="$d/haproxy.cfg" NETRUN_HTTPS_FRONTEND_DIR="$d/netrun.d"
   mkdir -p "$d/tls" "$d/lego/certificates"
   printf 'IPCERT 0\nIPKEY\n' > "$d/tls/node.pem"
-  : > "$STUB_LOG"; : > "$DNS_MAP"; rm -f "$HAPROXY_REJECT" "$HAPROXY_REJECT_NAMES"
+  : > "$STUB_LOG"; : > "$DNS_MAP"; : > "$DNS_STALE"; : > "$PUBLIC_DNS_MAP"; rm -f "$HAPROXY_REJECT" "$HAPROXY_REJECT_NAMES"
   D="$d"
 }
 # Source the functions with the fresh paths; haproxy.cfg / frontends in $D.
@@ -167,9 +208,12 @@ ok "hostname list: lowercase FQDNs, deduplicated, IPs / wildcards / bad labels d
   for h in b d e; do [ "$(lego_calls $h.example.com)" = 0 ] || { echo "CA called for $h (DNS not here)"; exit 1; }; done
   [ "$(lego_calls a.example.com)" = 1 ] && [ "$(lego_calls c.example.com)" = 1 ] || { cat "$STUB_LOG"; exit 1; }
   # c came before d / e and failed: they were still looked at (b, d, e notes).
-  grep -q '^dns: A 9.9.9.9, not 45.32.10.20$' "$HOSTS_DIR/b.example.com.error" || exit 1
-  grep -q "^dns: A $IP 9.9.9.9, not $IP\$" "$HOSTS_DIR/d.example.com.error" || exit 1
-  grep -q '^dns: A missing' "$HOSTS_DIR/e.example.com.error" || exit 1
+  # (each note also says what the public resolvers gave: the dig stub answers
+  # from the zone's records, so they agree with the node's resolver here)
+  grep -qx 'dns: A 9.9.9.9, not 45.32.10.20 (public resolvers: @1.1.1.1 9.9.9.9, @8.8.8.8 9.9.9.9)' "$HOSTS_DIR/b.example.com.error" || { cat "$HOSTS_DIR/b.example.com.error"; exit 1; }
+  grep -qx "dns: A $IP 9.9.9.9, not $IP (public resolvers: @1.1.1.1 $IP 9.9.9.9, @8.8.8.8 $IP 9.9.9.9)" "$HOSTS_DIR/d.example.com.error" || exit 1
+  grep -qx 'dns: A missing, not 45.32.10.20 (public resolvers: @1.1.1.1 missing, @8.8.8.8 missing)' "$HOSTS_DIR/e.example.com.error" || exit 1
+  [ "$(flushes)" = 0 ] || { echo "unbound flushed for a name no public resolver places here"; exit 1; }
   grep -q '^acme: lego exit 1: .*unauthorized' "$HOSTS_DIR/c.example.com.error" || { cat "$HOSTS_DIR/c.example.com.error"; exit 1; }
   [ ! -e "$HOSTS_DIR/a.example.com.error" ] || exit 1
   grep -q -- '--domains a.example.com --http --no-random-sleep' "$STUB_LOG" || exit 1
@@ -219,7 +263,7 @@ ok "ACME step: a name whose A record is not exactly the node IPv4 never reaches 
   # no per-GB: only the public IPv4 counts
   certs_obtain "$IP" || exit 1
   [ "$(lego_calls us-1.proxy.netrun.lol)" = 0 ] && [ "$(lego_calls us1.proxy.netrun.lol)" = 1 ] || { cat "$STUB_LOG"; exit 1; }
-  grep -qx "dns: A 45.32.99.7, not $IP" "$HOSTS_DIR/us-1.proxy.netrun.lol.error" || exit 1
+  grep -qx "dns: A 45.32.99.7, not $IP (public resolvers: @1.1.1.1 45.32.99.7, @8.8.8.8 45.32.99.7)" "$HOSTS_DIR/us-1.proxy.netrun.lol.error" || exit 1
   # option A (egressIpv4 null or = the public IPv4): the same
   printf '{"base":31000,"count":1000,"egressIpv4":"%s"}' "$IP" > "$NETRUN_PERGB_ENABLE_FILE"
   [ -z "$(pergb_ipv4 "$IP")" ] || { echo "option A has no per-GB IPv4"; exit 1; }
@@ -230,13 +274,111 @@ ok "ACME step: a name whose A record is not exactly the node IPv4 never reaches 
   certs_obtain "$IP" || { cat "$D/log"; exit 1; }
   [ "$(lego_calls us-1.proxy.netrun.lol)" = 1 ] || { echo "the per-GB host name did not reach lego"; cat "$STUB_LOG"; exit 1; }
   [ "$(lego_calls other.example.com)" = 0 ] || exit 1
-  grep -qx "dns: A 9.9.9.9, not $IP or 45.32.99.7" "$HOSTS_DIR/other.example.com.error" || { cat "$HOSTS_DIR/other.example.com.error"; exit 1; }
+  grep -qx "dns: A 9.9.9.9, not $IP or 45.32.99.7 (public resolvers: @1.1.1.1 9.9.9.9, @8.8.8.8 9.9.9.9)" "$HOSTS_DIR/other.example.com.error" || { cat "$HOSTS_DIR/other.example.com.error"; exit 1; }
   printf '{"base":10000,"enabled":false,"egressIpv4":"45.32.99.7"}' > "$NETRUN_PERGB_ENABLE_FILE"
   [ -z "$(pergb_ipv4 "$IP")" ] || exit 1
   printf 'not json' > "$NETRUN_PERGB_ENABLE_FILE"
   [ -z "$(pergb_ipv4 "$IP")" ] || exit 1
 ) || fail "ACME step, pay-per-GB option B"
 ok "ACME step: with a dedicated per-GB IPv4 (option B) a name pointing at it gets its certificate; option A / no per-GB / a broken enable.json: the public IPv4 only"
+
+# ── 2c. a stale answer of the node's resolver (NETRUN Chicago, 2026-10-09) ──
+# unbound cached the NXDOMAIN of a lookup made a moment before the
+# orchestrator created the record; 1.1.1.1 / 8.8.8.8 already gave the node's
+# address, and every run skipped the name until a manual flush.
+(
+  fresh stale; load
+  N=us.proxy.netrun.lol
+  printf '%s\n' "$N" > "$HOSTNAMES_FILE"
+  # (a) local NXDOMAIN, every public resolver gives the node's address: ONE
+  #     flush of that one name, the node's resolver asked again, issued.
+  dns "$N" "$IP"; stale "$N"
+  [ -z "$(resolve_ipv4 "$N")" ] || { echo "stub: the stale NXDOMAIN does not answer"; exit 1; }
+  certs_obtain "$IP" || { cat "$D/log"; exit 1; }
+  [ "$(grep '^unbound-control ' "$STUB_LOG")" = "unbound-control flush $N" ] || { cat "$STUB_LOG"; echo "not exactly one flush of that one name"; exit 1; }
+  grep -q "^dig @1.1.1.1 $N\$" "$STUB_LOG" && grep -q "^dig @8.8.8.8 $N\$" "$STUB_LOG" || { cat "$STUB_LOG"; exit 1; }
+  [ "$(lego_calls "$N")" = 1 ] || { cat "$STUB_LOG"; echo "not issued after the flush"; exit 1; }
+  grep -qx "$N: the node's resolver had a stale answer (missing; every public resolver: $IP) — flushed from unbound, it now answers $IP" "$D/log" || { cat "$D/log"; exit 1; }
+  [ "$(resolve_ipv4 "$N")" = "$IP" ] && [ ! -e "$HOSTS_DIR/$N.error" ] || exit 1
+  #     Next run: the node's resolver agrees, which is enough (as before):
+  #     no public lookup, no flush (and the certificate is fresh: no CA call).
+  : > "$STUB_LOG"
+  certs_obtain "$IP" || exit 1
+  [ "$(digs)" = 0 ] && [ "$(flushes)" = 0 ] && [ "$(lego_calls "$N")" = 0 ] || { cat "$STUB_LOG"; exit 1; }
+  # (b) no record anywhere: skipped, no flush, no CA call; the note says what
+  #     the public resolvers gave.
+  N=us-2.proxy.netrun.lol
+  printf '%s\n' "$N" > "$HOSTNAMES_FILE"; : > "$STUB_LOG"; : > "$D/log"
+  certs_obtain "$IP" || exit 1
+  [ "$(lego_calls "$N")" = 0 ] && [ "$(flushes)" = 0 ] || { cat "$STUB_LOG"; exit 1; }
+  grep -qx "dns: A missing, not $IP (public resolvers: @1.1.1.1 missing, @8.8.8.8 missing)" "$HOSTS_DIR/$N.error" || { cat "$HOSTS_DIR/$N.error"; exit 1; }
+  grep -qx "skip $N: its A record is missing, not $IP (public resolvers: @1.1.1.1 missing, @8.8.8.8 missing) — not sent to the CA" "$D/log" || { cat "$D/log"; exit 1; }
+  # (c) the public resolvers point elsewhere (the node's resolver: a stale
+  #     NXDOMAIN): skipped, nothing flushed.
+  dns "$N" 9.9.9.9; stale "$N"; : > "$STUB_LOG"
+  certs_obtain "$IP" || exit 1
+  [ "$(lego_calls "$N")" = 0 ] && [ "$(flushes)" = 0 ] || { cat "$STUB_LOG"; exit 1; }
+  grep -qx "dns: A missing, not $IP (public resolvers: @1.1.1.1 9.9.9.9, @8.8.8.8 9.9.9.9)" "$HOSTS_DIR/$N.error" || { cat "$HOSTS_DIR/$N.error"; exit 1; }
+  # (d) only SOME public resolvers place it here — one still has the
+  #     NXDOMAIN, gives no reply, or a round robin with another address:
+  #     skipped, nothing flushed.
+  : > "$DNS_MAP"; : > "$DNS_STALE"; dns "$N" "$IP"; stale "$N"; pub 8.8.8.8 "$N"; : > "$STUB_LOG"
+  certs_obtain "$IP" || exit 1
+  [ "$(lego_calls "$N")" = 0 ] && [ "$(flushes)" = 0 ] || { cat "$STUB_LOG"; echo "one public resolver was enough"; exit 1; }
+  grep -qx "dns: A missing, not $IP (public resolvers: @1.1.1.1 $IP, @8.8.8.8 missing)" "$HOSTS_DIR/$N.error" || { cat "$HOSTS_DIR/$N.error"; exit 1; }
+  : > "$PUBLIC_DNS_MAP"; : > "$STUB_LOG"
+  DIG_NOREPLY=8.8.8.8 certs_obtain "$IP" || exit 1
+  [ "$(lego_calls "$N")" = 0 ] && [ "$(flushes)" = 0 ] || { cat "$STUB_LOG"; exit 1; }
+  grep -qx "dns: A missing, not $IP (public resolvers: @1.1.1.1 $IP, @8.8.8.8 no reply)" "$HOSTS_DIR/$N.error" || { cat "$HOSTS_DIR/$N.error"; exit 1; }
+  pub 8.8.8.8 "$N" "$IP"; pub 8.8.8.8 "$N" 9.9.9.9; : > "$STUB_LOG"
+  certs_obtain "$IP" || exit 1
+  [ "$(lego_calls "$N")" = 0 ] && [ "$(flushes)" = 0 ] || { cat "$STUB_LOG"; exit 1; }
+  grep -qx "dns: A missing, not $IP (public resolvers: @1.1.1.1 $IP, @8.8.8.8 $IP 9.9.9.9)" "$HOSTS_DIR/$N.error" || { cat "$HOSTS_DIR/$N.error"; exit 1; }
+  # (e) a name moved here from another node: the node's resolver still has
+  #     the old address — flushed, issued.
+  N=us-3.proxy.netrun.lol
+  printf '%s\n' "$N" > "$HOSTNAMES_FILE"; : > "$PUBLIC_DNS_MAP"; dns "$N" "$IP"; stale "$N" 9.9.9.9; : > "$STUB_LOG"
+  certs_obtain "$IP" || exit 1
+  [ "$(grep '^unbound-control ' "$STUB_LOG")" = "unbound-control flush $N" ] && [ "$(lego_calls "$N")" = 1 ] || { cat "$STUB_LOG"; exit 1; }
+  # (f) the flush fails, or the node's resolver still answers wrong after it:
+  #     every public resolver agreeing stands (the CA never asks this node's
+  #     resolver), said loudly; still one flush, never more.
+  N=us-4.proxy.netrun.lol
+  printf '%s\n' "$N" > "$HOSTNAMES_FILE"; dns "$N" "$IP"; stale "$N"; : > "$STUB_LOG"; : > "$D/log"
+  UNBOUND_CONTROL_FAIL=1 certs_obtain "$IP" || exit 1
+  [ "$(flushes)" = 1 ] && [ "$(lego_calls "$N")" = 1 ] || { cat "$STUB_LOG"; exit 1; }
+  grep -qx "WARNING: $N: the node's resolver answers missing but every public resolver gives $IP — unbound-control flush $N failed; going by the public resolvers" "$D/log" || { cat "$D/log"; exit 1; }
+  N=us-5.proxy.netrun.lol
+  printf '%s\n' "$N" > "$HOSTNAMES_FILE"; dns "$N" "$IP"; stale "$N"; : > "$STUB_LOG"; : > "$D/log"
+  UNBOUND_FLUSH_NOOP=1 certs_obtain "$IP" || exit 1
+  [ "$(flushes)" = 1 ] && [ "$(lego_calls "$N")" = 1 ] || { cat "$STUB_LOG"; exit 1; }
+  grep -qx "WARNING: $N: the node's resolver still answers missing after unbound-control flush $N but every public resolver gives $IP — going by the public resolvers" "$D/log" || { cat "$D/log"; exit 1; }
+  # (g) pay-per-GB option B: every public resolver gives the per-GB IPv4.
+  export NETRUN_PERGB_ENABLE_FILE="$D/enable.json"
+  printf '{"base":10000,"count":1000,"egressIpv4":"45.32.99.7"}' > "$NETRUN_PERGB_ENABLE_FILE"
+  N=us-6.proxy.netrun.lol
+  printf '%s\n' "$N" > "$HOSTNAMES_FILE"; dns "$N" 45.32.99.7; stale "$N"; : > "$STUB_LOG"
+  certs_obtain "$IP" || exit 1
+  [ "$(flushes)" = 1 ] && [ "$(lego_calls "$N")" = 1 ] || { cat "$STUB_LOG"; exit 1; }
+  unset NETRUN_PERGB_ENABLE_FILE
+  # (h) NETRUN_HTTPS_PUBLIC_RESOLVERS=off — the node's resolver alone, as
+  #     before: skipped; nothing asked, nothing flushed. A setting without a
+  #     usable address does the same.
+  N=us-7.proxy.netrun.lol
+  printf '%s\n' "$N" > "$HOSTNAMES_FILE"; dns "$N" "$IP"; stale "$N"; : > "$STUB_LOG"
+  NETRUN_HTTPS_PUBLIC_RESOLVERS=off certs_obtain "$IP" || exit 1
+  [ "$(digs)" = 0 ] && [ "$(flushes)" = 0 ] && [ "$(lego_calls "$N")" = 0 ] || { cat "$STUB_LOG"; exit 1; }
+  grep -qx "dns: A missing, not $IP" "$HOSTS_DIR/$N.error" || { cat "$HOSTS_DIR/$N.error"; exit 1; }
+  NETRUN_HTTPS_PUBLIC_RESOLVERS='-x ../etc' certs_obtain "$IP" || exit 1
+  [ "$(digs)" = 0 ] && [ "$(flushes)" = 0 ] && [ "$(lego_calls "$N")" = 0 ] || { cat "$STUB_LOG"; exit 1; }
+  # (i) the setting: IP literals only (each becomes a dig argument), commas or spaces.
+  [ "$(NETRUN_HTTPS_PUBLIC_RESOLVERS='9.9.9.9, 2606:4700:4700::1111 -x --foo 1.1.1 ../etc @1.1.1.1 9.9.9.9;id' public_resolvers | tr '\n' ' ')" = "9.9.9.9 2606:4700:4700::1111 " ] \
+    || { echo "public_resolvers: $(NETRUN_HTTPS_PUBLIC_RESOLVERS='9.9.9.9, 2606:4700:4700::1111 -x --foo 1.1.1 ../etc @1.1.1.1 9.9.9.9;id' public_resolvers | tr '\n' ' ')"; exit 1; }
+  [ "$(public_resolvers | tr '\n' ' ')" = "1.1.1.1 8.8.8.8 " ] || exit 1
+  printf 'NETRUN_HTTPS_PUBLIC_RESOLVERS="9.9.9.9 149.112.112.112"\n' > "$D/netrun.env"
+  [ "$(NETRUN_ENV_FILE="$D/netrun.env" public_resolvers | tr '\n' ' ')" = "9.9.9.9 149.112.112.112 " ] || exit 1
+) || fail "ACME step, stale answer of the node's resolver"
+ok "ACME step: a stale NXDOMAIN / old address in the node's resolver while every public resolver gives the node's address -> one 'unbound-control flush <name>', asked again, issued (also when the flush fails: loudly); missing everywhere / public elsewhere / public split / no reply -> skipped, nothing flushed; the node's resolver agreeing is enough (no public lookup); off = as before"
 
 # ── 3. apply step: crt-list (IP first), PEMs 0600, stale removal, reload only on change ──
 (
@@ -533,6 +675,23 @@ NETRUN_PROXY_DIR="$D/proxy" bash "$HTTPS" status > "$D/status" 2>&1 || { cat "$D
 grep -q '^host cert : a.example.com notAfter=' "$D/status" && grep -q '^host cert : b.example.com none — dns: A 9.9.9.9' "$D/status" \
   && grep -q '^crt-list  : 2 line(s)' "$D/status" && grep -q '^served    : a.example.com (verified reload ' "$D/status" || { cat "$D/status"; fail "e2e status"; }
 ok "script: certs (DNS skip, failing name, crt-list, one reload, served.json, certs-applied, quiet re-run, backoff = exit 0), renew (IP + hostnames, one reload; backoff = exit 0, lego failure = exit 1; IP-only without a list), sync lock free while lego runs on pass 2, status"
+
+# ── 7b. the script itself, NETRUN Chicago 2026-10-09: two new names whose ──
+# NXDOMAIN the node's resolver cached, a third with no record at all.
+fresh e2e-stale
+(. "$TMP/lib.sh"; base_config_text > "$NETRUN_HTTPS_HAPROXY_CFG")
+printf '%s\n' us.proxy.netrun.lol us-1.proxy.netrun.lol nope.proxy.netrun.lol > "$NETRUN_HTTPS_HOSTNAMES_FILE"
+dns us.proxy.netrun.lol "$IP"; dns us-1.proxy.netrun.lol "$IP"; stale us.proxy.netrun.lol; stale us-1.proxy.netrun.lol
+bash "$HTTPS" certs > "$D/out" 2>&1 || { cat "$D/out"; fail "e2e stale: certs"; }
+[ "$(grep '^unbound-control ' "$STUB_LOG" | tr '\n' '|')" = "unbound-control flush us.proxy.netrun.lol|unbound-control flush us-1.proxy.netrun.lol|" ] \
+  || { cat "$STUB_LOG"; fail "e2e stale: one flush per stale name, nothing else"; }
+[ "$(lego_calls us.proxy.netrun.lol)" = 1 ] && [ "$(lego_calls us-1.proxy.netrun.lol)" = 1 ] && [ "$(lego_calls nope.proxy.netrun.lol)" = 0 ] \
+  || { cat "$STUB_LOG"; fail "e2e stale: lego calls"; }
+grep -qF 'skip nope.proxy.netrun.lol: its A record is missing, not 45.32.10.20 (public resolvers: @1.1.1.1 missing, @8.8.8.8 missing) — not sent to the CA' "$D/out" \
+  || { cat "$D/out"; fail "e2e stale: the name with no record must be skipped"; }
+[ "$(cat "$D/tls/crt-list" | tr '\n' '|')" = "$D/tls/node.pem|$D/tls/hosts/us.proxy.netrun.lol.pem us.proxy.netrun.lol|$D/tls/hosts/us-1.proxy.netrun.lol.pem us-1.proxy.netrun.lol|" ] \
+  || { cat "$D/tls/crt-list"; fail "e2e stale: crt-list"; }
+ok "script: names the node's resolver had a stale NXDOMAIN for are flushed (one 'unbound-control flush <name>' each) and issued; a name with no record anywhere is skipped"
 
 # ── 8. real `haproxy -c` (review): the crt-list loads; a certificate haproxy ──
 # rejects (RSA-512: "ee key too small") drops only its own line, with haproxy
