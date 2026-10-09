@@ -248,7 +248,8 @@ function createPergb(deps = {}) {
   let enableDoc = null; // enable.json
   let pool = null; // parsed pool file (on)
   let tagger = null;
-  let excludedSet = new Set();
+  let excludedSet = new Set(); // per-piece /64s: the last scan ∪ reservedLocal
+  const reservedLocal = new Set(); // reserve_nets answers since start (until released)
   const excludedInfo = { at: null, count: null, complete: null, error: null, pushes: 0, reason: null };
   let canary = null; // [[ip, port]] in use
   const radius = { epoch: null, seq: null, ready: null, dbRecovered: null, last: null, error: null, at: null };
@@ -444,7 +445,7 @@ function createPergb(deps = {}) {
     lastExcludedAt = now();
     try {
       const r = await ctl.call("excluded", { nets, complete: scan.complete, scanId });
-      excludedSet = new Set([...scan.nets]);
+      excludedSet = new Set([...scan.nets, ...reservedLocal]);
       Object.assign(excludedInfo, { at: new Date(now()).toISOString(), count: r.excluded, scanned: nets.length, complete: scan.complete, error: null });
       excludedInfo.pushes += 1;
       return { ok: true, excluded: r.excluded, scanned: nets.length, complete: scan.complete };
@@ -1012,7 +1013,10 @@ function createPergb(deps = {}) {
       return { status: h.status, body: h.body };
     }
     const ids = (reply.nets || []).map(Number).filter((n) => Number.isInteger(n));
-    for (const id of ids) excludedSet.add(id);
+    for (const id of ids) {
+      excludedSet.add(id);
+      reservedLocal.add(id);
+    }
     return { status: 200, body: { success: true, ref: reply.ref || req.ref, nets: ids.map((id) => netText(p.prefixBase, id)), subnetIds: ids, prefix: p.prefix } };
   }
 
@@ -1036,6 +1040,7 @@ function createPergb(deps = {}) {
       const h = httpError(e);
       return { status: h.status, body: h.body };
     }
+    for (const id of ids) reservedLocal.delete(id);
     return { status: 200, body: { success: true, released: reply.released, coolDownUntil: reply.coolDownUntil === undefined ? null : reply.coolDownUntil } };
   }
 

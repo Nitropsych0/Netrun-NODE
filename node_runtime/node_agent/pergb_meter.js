@@ -367,7 +367,7 @@ function createMeter(opts = {}) {
   }
 
   function noteTuple(rec) {
-    if (!rec.ipv4 || !rec.login || !loginInfo(rec.login)) return;
+    if (!rec.ipv4 || !rec.login || rec.inBytes + rec.outBytes === 0 || !loginInfo(rec.login)) return;
     const key = tupleKey(rec.localIp, rec.port, rec.clientIp, rec.clientPort);
     const cur = tuples.get(key);
     if (cur && cur.login === rec.login && !cur.final) {

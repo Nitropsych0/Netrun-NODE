@@ -259,7 +259,9 @@ function createEnforcer(deps) {
       }
       const effective = cum + (p.near ? unlogged : 0);
       view.set(a.id, { cum, limit, rate: Math.round(p.rate), near: p.near, unlogged, effective, sockets: detail ? detail.sockets : null, unrecorded4: detail ? detail.unrecorded : null });
-      if (limit === null) continue;
+      // no limit, or blocked / released by the orchestrator (RADIUS refuses
+      // it already; the transition killed its sessions): nothing local to do
+      if (limit === null || a.state !== "active") continue;
       const full = Boolean(a.limit && a.limit.full);
       if (effective >= limit) {
         if (!a.localBlocked) {
