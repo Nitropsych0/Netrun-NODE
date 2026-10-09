@@ -1,0 +1,59 @@
+# Pay-per-GB v2 — the Linux-only checks of the node side (netns, nft,
+# systemd, Docker builds, haproxy). Jobs of lane L1 (netrun-radius) are
+# prefixed l1-.
+name: pergb-linux
+
+on:
+  push:
+    branches: ["feat/pergb2-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  l1-radius-unit:
+    name: "L1: netrun-radius unit tests (python ${{ matrix.python }})"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: unittest (codec, grammar, tag, allocator, state, ctl, socket activation, READY, load, e2e dry run)
+        env:
+          NETRUN_RADIUS_PERF_SLACK: "2"
+        run: python -I -m unittest discover -s node_runtime/radius/tests -v
+
+  l1-radius-systemd:
+    name: "L1: netrun-radius units under a real systemd"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning scripts/test_pergb_radius_e2e.sh scripts/test_netrun_radius_units.sh
+      - name: verify, socket activation, READY, restarts under load, crash loop, watchdog, corrupt DB
+        env:
+          NETRUN_RADIUS_PERF_SLACK: "2"
+        run: sudo --preserve-env=NETRUN_RADIUS_PERF_SLACK bash scripts/test_netrun_radius_units.sh --throwaway-host
+
+  l1-radius-e2e:
+    name: "L1: netrun-radius + 3proxy end to end (network namespace)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: e2e (3proxy-pergb when present, else the stock 0.9.3 binary)
+        run: sudo bash scripts/test_pergb_radius_e2e.sh --out "$RUNNER_TEMP/e2e"
+      - name: Upload results and captured Access-Requests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: l1-radius-e2e
+          path: ${{ runner.temp }}/e2e

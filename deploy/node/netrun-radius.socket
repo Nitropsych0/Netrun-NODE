@@ -1,0 +1,19 @@
+# NETRUN per-GB RADIUS socket (plan §3.1). Installed (disabled) by
+# deploy/node/install_pergb.sh; enabled and started by the agent's /pergb/enable
+# through netrun-pergb.target.
+# systemd owns the socket, so datagrams queue while netrun-radius.service
+# restarts (a restart within 3proxy's 3 s RADIUS timeout loses nothing), and
+# TriggerLimitIntervalSec=0 means a crash loop can never close it.
+[Unit]
+Description=NETRUN per-GB RADIUS socket (127.0.0.1:1812/udp)
+PartOf=netrun-pergb.target
+Before=netrun-pergb.target
+
+[Socket]
+ListenDatagram=127.0.0.1:1812
+ReceiveBuffer=16M
+TriggerLimitIntervalSec=0
+Service=netrun-radius.service
+
+[Install]
+WantedBy=netrun-pergb.target

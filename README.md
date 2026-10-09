@@ -742,6 +742,13 @@ paths (400 missing ports / 404 unknown port / 200 partial empty map).
 Happy-path with a real reserved port is exercised end-to-end by the
 orchestrator integration tests.
 
+### Pay-per-GB v2: netrun-radius
+
+The shared per-GB ports authenticate through a local RADIUS server,
+`node_runtime/radius/` (units `deploy/node/netrun-radius.socket` / `.service`,
+state `/var/lib/netrun-radius/radius.db`, ctl `/run/netrun-radius/ctl.sock`).
+Design, ctl ops, runbook and tests: [node_runtime/radius/README.md](node_runtime/radius/README.md).
+
 ## IPv6 egress rotation (Wave IPV6-ROTATION)
 
 Changes the IPv6 address a proxy's **new** connections leave from, per port, without

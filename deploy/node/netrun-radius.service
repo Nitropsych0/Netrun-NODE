@@ -1,0 +1,68 @@
+# NETRUN per-GB RADIUS (plan §3.1-§3.4): node_runtime/radius -> /opt/netrun/radius.
+# Socket-activated by netrun-radius.socket (fd 3); the agent talks to it over
+# /run/netrun-radius/ctl.sock. State: /var/lib/netrun-radius/radius.db (sqlite,
+# not backed up: the orchestrator re-pushes everything after an epoch change).
+# Secret: /etc/netrun-pergb/radius.secret (0640 root:netrun-radius), never argv.
+#
+# Restarts never stop: StartLimitIntervalSec=0 + Restart=always + RestartSec=1,
+# so start-limit-hit (and with it a closed socket) cannot happen. WatchdogSec:
+# the sweeper pings only while the UDP loop is alive.
+# MemoryMax: measured 2026-10-09 with 50k lists + 100k bindings + 25k accounts:
+# ~160 MiB live, ~235 MiB RSS; 512M = about 2x. The in-process caps
+# (PERGB_BINDINGS_MAX, PERGB_STICKY_MAX_PER_ACCOUNT) keep the state bounded.
+[Unit]
+Description=NETRUN per-GB RADIUS
+Documentation=file:///opt/netrun/radius/README.md
+Requires=netrun-radius.socket
+After=netrun-radius.socket
+PartOf=netrun-pergb.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=netrun-radius
+Group=netrun-radius
+Slice=netrun-pergb.slice
+ExecStart=/usr/bin/python3 -I /opt/netrun/radius/netrun_radius.py
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=NETRUN_RADIUS_SECRET_FILE=/etc/netrun-pergb/radius.secret
+Environment=NETRUN_RADIUS_CTL=/run/netrun-radius/ctl.sock
+StateDirectory=netrun-radius
+StateDirectoryMode=0700
+RuntimeDirectory=netrun-radius
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=1
+WatchdogSec=10s
+TimeoutStartSec=30
+TimeoutStopSec=10
+MemoryMax=512M
+LimitNOFILE=65536
+UMask=0077
+# hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+IPAddressDeny=any
+IPAddressAllow=localhost
