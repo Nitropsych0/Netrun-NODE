@@ -182,7 +182,7 @@ new_root() {
 install_run() { NETRUN_PERGB_ROOT="$R" NETRUN_PERGB_SRC="$SRC" NETRUN_PERGB_NO_CHOWN=1 bash "$INSTALLER" "$@"; }
 snapshot() {
   find "$R" | sort | while read -r f; do
-    if [ -f "$f" ]; then echo "$f $(mode_of "$f") $(sha256_of "$f") $(ls -lT "$f" 2>/dev/null | awk '{ print $6 $7 $8 $9 }' || stat -c %Y "$f")";
+    if [ -f "$f" ]; then echo "$f $(mode_of "$f") $(sha256_of "$f") $(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")";
     else echo "$f $(mode_of "$f")"; fi
   done
 }

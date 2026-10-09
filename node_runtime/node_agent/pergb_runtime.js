@@ -995,6 +995,15 @@ async function disable(opts = {}, deps = {}) {
   };
 }
 
+// The node's primary IPv4 (option A: the per-GB egress when the enable
+// request's egressIpv4 is null): the source of the default route.
+async function detectPrimaryIpv4(deps = {}) {
+  const run = deps.run || execCapture;
+  const r = await run("ip", ["-4", "-o", "route", "get", "1.1.1.1"], { timeoutMs: 10000 });
+  const m = /\bsrc (\d+\.\d+\.\d+\.\d+)\b/.exec(String((r && r.stdout) || ""));
+  return r && r.code === 0 && m && isIpv4(m[1]) ? m[1] : null;
+}
+
 // Unit states for /pergb/status: { enabled, procs: [{unit, first, last,
 // active, pid}], haproxy: {active, pid}, target: {active, enabled} }.
 async function status(deps = {}) {
@@ -1056,6 +1065,7 @@ module.exports = {
   checkUsers,
   readEnable,
   sharedRange,
+  detectPrimaryIpv4,
   apply,
   disable,
   status,

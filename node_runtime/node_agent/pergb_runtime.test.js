@@ -543,3 +543,10 @@ test("sharedRange: null without enable.json or with a foreign file; option B rep
   assert.ok(res.ok, JSON.stringify(res));
   assert.deepStrictEqual(rt.sharedRange(n.settings), { enabled: true, base: 10000, last: 10999, count: 1000, egressIpv4: "198.51.100.9", dedicatedIpv4: "198.51.100.9" });
 });
+
+test("detectPrimaryIpv4: the src of the default route, null when unknown", async () => {
+  const run = (out, code = 0) => async () => ({ code, stdout: out, stderr: "" });
+  assert.strictEqual(await rt.detectPrimaryIpv4({ run: run("1.1.1.1 via 45.76.0.1 dev enp1s0 src 45.76.10.20 uid 0 \\    cache \n") }), "45.76.10.20");
+  assert.strictEqual(await rt.detectPrimaryIpv4({ run: run("", 2) }), null);
+  assert.strictEqual(await rt.detectPrimaryIpv4({ run: run("1.1.1.1 dev wg0 table 51820\n") }), null);
+});
