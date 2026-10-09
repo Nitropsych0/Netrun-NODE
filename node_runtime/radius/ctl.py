@@ -4,7 +4,7 @@ Unix stream socket /run/netrun-radius/ctl.sock (0600). One JSON request line and
 one JSON response line per connection; errors are {"error": code, ...}.
 The node agent is the only client. Ops: status, facts, excluded, snapshot, apply,
 heartbeat, near_stats, local_block, admission, ipv4_admission, bindings, logins,
-accounts, rejects, reserve_nets, release_nets (amendment A1).
+accounts, rejects, reserve_nets, release_nets (amendment A1), avoid (A12), reserved (A13-I).
 """
 
 from __future__ import annotations

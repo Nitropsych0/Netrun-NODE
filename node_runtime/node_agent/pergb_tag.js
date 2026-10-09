@@ -16,6 +16,12 @@
 //
 // The reference is node_runtime/radius/tag.py; both are checked against
 // node_runtime/radius/tests/feistel_vectors.json.
+//
+// Per-piece (amendment A13-I): a piece list's address is FIXED — its own /64
+// (pieceNet) + the tag of its list id with r16 derived from the id:
+//   r16 = HMAC_SHA256(k, "netrun-pergb-pick-r\0" ‖ "piece\0" ‖ L(4, BE) ‖ "\0\0" ‖ j(4, BE))[0:2]
+// for the first j = 0, 1, ... whose iid is >= 2^32 (RADIUS alloc.piece_iid;
+// vectors node_runtime/radius/tests/piece_vectors.json).
 
 const crypto = require("crypto");
 const net = require("net");
@@ -83,6 +89,25 @@ function decrypt(key, iid) {
   const listId = left >>> 0;
   const r16 = right >>> 16;
   return { listId, r16, valid: (right & 0xffff) === mac16(key, listId, r16) };
+}
+
+const PIECE_SEED = Buffer.from("netrun-pergb-pick-r\0piece\0", "latin1");
+
+// The fixed interface id (BigInt) of piece list listId (A13-I).
+function pieceIid(key, listId) {
+  checkKey(key);
+  if (!Number.isInteger(listId) || listId < 0 || listId > MASK32) throw new RangeError("listId out of range");
+  const b = Buffer.alloc(PIECE_SEED.length + 10);
+  PIECE_SEED.copy(b, 0);
+  b.writeUInt32BE(listId >>> 0, PIECE_SEED.length);
+  // two zero bytes (the empty slot and extra), then j
+  for (let j = 0; j < 64; j += 1) {
+    b.writeUInt32BE(j, PIECE_SEED.length + 6);
+    const d = hmac(key, b);
+    const iid = encrypt(key, listId, (d[0] << 8) | d[1]);
+    if (iid >= IID_MIN) return iid;
+  }
+  throw new Error("no piece interface id >= 2^32 in 64 draws");
 }
 
 // "2602:f2dc:a9:12:..." -> BigInt, or null (zone ids and IPv4 refused).
@@ -176,6 +201,10 @@ function createTagger({ key, prefix }) {
       const iid = encrypt(k, listId, r16);
       return bigToIpv6(p.base | (BigInt(subnetId) << 64n) | iid);
     },
+    // A13-I: the fixed address of piece list listId in its /64 pieceNet
+    pieceAddress(pieceNet, listId) {
+      return bigToIpv6(p.base | (BigInt(pieceNet) << 64n) | pieceIid(k, listId));
+    },
   };
 }
 
@@ -185,6 +214,7 @@ module.exports = {
   mac16,
   encrypt,
   decrypt,
+  pieceIid,
   ipv6ToBig,
   bigToIpv6,
   parsePrefix48,

@@ -39,6 +39,12 @@ probes, /64s another static or sticky line of the same list uses). The host
 part uses r16 = H_r(k, kind, list, slot, extra, j) for j = 0, 1, ... until the
 interface id is >= 2^32; the IPv4 egress index (A7) is H_v4(...) mod N.
 H = HMAC-SHA256 (see _derive).
+
+Per-piece on RADIUS (A13, contract A13-I): a piece list owns ONE /64 of the
+pool, reserved through reserve_nets under a ref "piece:<order_ref>"; its
+address is that /64 + the tagged host H_r(k, "piece", list, "", "", j) — fixed
+for the life of the list, nothing stored (piece_addr). Reserved /64s are never
+candidates, so per-GB never touches a piece's /64.
 """
 
 from __future__ import annotations
@@ -81,6 +87,9 @@ STICKY = "sticky"
 TIMER = "timer"
 LINK = "link"
 PAUSE = "pr"  # per_request line held by the A11 pause
+PIECE = "piece"  # A13: the derivation kind of a per-piece address
+PIECE_REF = "piece:"  # A13-I: reserve_nets refs of per-piece proxies start with this
+PIECE_IID_CACHE = 200_000
 
 _LABEL_NET = b"netrun-pergb-pick\x00"
 _LABEL_R16 = b"netrun-pergb-pick-r\x00"
@@ -242,6 +251,7 @@ class Allocator:
         self.avoid_picks = _Window()
         self.avoid_exhausted = _Window()
         self.exhausted_sites = OrderedDict()  # site -> count (last 100 sites)
+        self.piece_iids = {}  # A13: list_id -> the piece's interface id (derived; cleared with the key)
         # persistence journal, drained by the engine's flush
         self.dirty_lines = {}  # (kind, list_id, slot) -> Line | None
         self.events = []  # (op, list_id, slot, addr, reason, at)
@@ -270,7 +280,9 @@ class Allocator:
             self._forget_all("key_changed", now)
         self.prefix = prefix
         self.prefix_str = prefix_str
-        self.tagger = Tagger(key) if (self.tagger is None or self.tagger.key != key) else self.tagger
+        if self.tagger is None or self.tagger.key != key:
+            self.tagger = Tagger(key)
+            self.piece_iids = {}
         range_changed = (self.lo, self.hi) != (lo, hi)
         self.lo, self.hi = lo, hi
         if range_changed:
@@ -383,6 +395,28 @@ class Allocator:
             self.addr_of(n, self._derive_iid(kind, list_id, slot, extra)),
             self._derive_v4(kind, list_id, slot, extra),
         )
+
+    # ---- per-piece (A13) -----------------------------------------------------------
+
+    def is_piece_net(self, net: int) -> bool:
+        """The /64 is in the pool and reserved for a per-piece proxy (a "piece:" ref)."""
+        ref = self.reserved.get(net)
+        return ref is not None and ref.startswith(PIECE_REF) and self.in_pool(net)
+
+    def piece_iid(self, list_id: int) -> int:
+        """The fixed interface id of a piece list: the I3 tag of list_id with
+        r16 = HMAC_SHA256(k, "netrun-pergb-pick-r\\0" ‖ "piece\\0" ‖ list_id(4) ‖ "\\0\\0" ‖ j(4))[0:2],
+        the first j = 0, 1, ... whose interface id is >= 2^32."""
+        iid = self.piece_iids.get(list_id)
+        if iid is None:
+            iid = self._derive_iid(PIECE, list_id, "", "")
+            if len(self.piece_iids) >= PIECE_IID_CACHE:
+                self.piece_iids.clear()
+            self.piece_iids[list_id] = iid
+        return iid
+
+    def piece_addr(self, list_id: int, net: int) -> int:
+        return self.addr_of(net, self.piece_iid(list_id))
 
     # ---- excluded transitions ------------------------------------------------------
 
@@ -541,6 +575,48 @@ class Allocator:
         self.releases[ref] = (count, now)
         self.dirty_refs.add("rel:" + ref)
         return count
+
+    def reserve_exact(self, nets, ref: str, now: float):
+        """reserve_nets with explicit nets ("ensure"): every net ends up reserved under
+        ref, or nothing changes. For restoring known reservations (a lost RADIUS DB, the
+        agent's journal) — no capacity floor, no recently-used rule: these /64s were
+        per-piece's already. Refuses net_unavailable when a net is outside the pool,
+        found by the per-piece scan or reserved under another ref.
+        Returns (nets, newly_reserved_count)."""
+        if not self.configured:
+            raise CtlRefused("not_ready")
+        bad = []
+        for n in nets:
+            if not self.in_pool(n):
+                bad.append({"net": n, "why": "outside_pool"})
+            elif n in self.scan:
+                bad.append({"net": n, "why": "per_piece_scan"})
+            else:
+                holder = self.reserved.get(n)
+                if holder is not None and holder != ref:
+                    bad.append({"net": n, "why": "reserved", "ref": holder})
+        if bad:
+            raise CtlRefused("net_unavailable", nets=bad[:100], count=len(bad))
+        new = 0
+        for n in nets:
+            if self.reserved.get(n) != ref:
+                self.reserved[n] = ref
+                self.reserved_at[n] = now
+                self._refresh_net(n, now)
+                new += 1
+        rec = self.reservations.get(ref)
+        if rec is None:
+            self.reservations[ref] = list(nets)
+            self.reservation_at[ref] = now
+            self.dirty_refs.add(ref)
+        else:
+            have = set(rec)
+            extra = [n for n in nets if n not in have]
+            if extra:
+                self.reservations[ref] = rec + extra
+                self.reservation_at[ref] = now
+                self.dirty_refs.add(ref)
+        return list(nets), new
 
     # ---- line bookkeeping ----------------------------------------------------------
 

@@ -61,3 +61,19 @@ test("ipv6 text <-> BigInt", () => {
   assert.strictEqual(tag.parsePrefix48("2602:F2DC:A9:12::5/48").text, "2602:f2dc:a9::/48");
   assert.strictEqual(tag.parsePrefix48("2602:f2dc:a9::/64"), null);
 });
+
+test("A13-I piece addresses match the shared vectors (node_runtime/radius/tests/piece_vectors.json)", () => {
+  const pv = require("../radius/tests/piece_vectors.json");
+  let n = 0;
+  for (const c of pv.cases) {
+    const t = tag.createTagger({ key: c.key, prefix: c.prefix });
+    for (const v of c.vectors) {
+      assert.strictEqual(tag.pieceIid(Buffer.from(c.key, "base64"), v.listId).toString(16).padStart(16, "0"), v.iid);
+      assert.strictEqual(t.pieceAddress(v.pieceNet, v.listId), v.addr);
+      const d = t.decodeAddress(v.addr);
+      assert.deepStrictEqual([d.subnetId, d.listId, d.r16, d.valid], [v.pieceNet, v.listId, v.r16, true]);
+      n += 1;
+    }
+  }
+  assert.ok(n >= 12);
+});

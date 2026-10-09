@@ -74,6 +74,9 @@ async function buildDescribe({
       // the TLS port below); 1 / the port when this agent has it.
       pergb_radius: pergbRadius ? 1 : 0,
       pergb_tls_port: pergbRadius ? Number(pergbTlsPort) || 8086 : null,
+      // Amendment A13-I — per-piece proxies as RADIUS piece lists (kind
+      // "piece", pieceNet), reserve_nets with explicit nets.
+      pergb_pieces: pergbRadius ? 1 : 0,
     },
   };
 }

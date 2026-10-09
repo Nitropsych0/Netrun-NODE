@@ -73,11 +73,12 @@ test.after(async () => {
   fs.rmSync(TMP, { recursive: true, force: true });
 });
 
-test("/describe: supports.pergb_radius = 1 and supports.pergb_tls_port = 8086", { timeout: 30000 }, async () => {
+test("/describe: supports.pergb_radius = 1, supports.pergb_tls_port = 8086, supports.pergb_pieces = 1", { timeout: 30000 }, async () => {
   const d = await req(PORT, "GET", "/describe");
   assert.strictEqual(d.status, 200);
   assert.strictEqual(d.json.supports.pergb_radius, 1);
   assert.strictEqual(d.json.supports.pergb_tls_port, 8086);
+  assert.strictEqual(d.json.supports.pergb_pieces, 1, "A13-I: piece lists on RADIUS");
 });
 
 test("/health: an additive pergb block without secrets; the liveness answer stays {ok:true}", { timeout: 30000 }, async () => {

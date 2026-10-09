@@ -410,6 +410,75 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     await assert.rejects(pool.reserve({ count: 5001, ref: "too-many" }), (e) => e.code === "bad_request");
   });
 
+  let pieceNet;
+  let pieceAddr;
+  const PIECE_ACCOUNT = { id: 70, kind: "piece", state: "active", expiresAt: Math.floor(Date.now() / 1000) + 86400 };
+  const PIECE_LIST = (id, net) => LIST(id, `netrun-piece${id}`, 70, { kind: "piece", mode: "static", lineCount: 1, pieceNet: net });
+  await t.test("A13-I per-piece on RADIUS: its /64 reserved, the record checked, a fixed address, kills / attribution / usage", async () => {
+    let r = await call("POST", "/pergb/reserve_nets", { body: { count: 1, owner: "perpiece", ref: "piece:order_77" } });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    pieceNet = r.json.subnetIds[0];
+    let freeNet = 0x4000;
+    while (pergb._excluded().has(freeNet)) freeNet += 1;
+    const accounts = [ACCOUNT(10), ACCOUNT(20), PIECE_ACCOUNT];
+    const lists = [LIST(1, "netrun-aaaa1", 10, { pwRev: 2 }), LIST(2, "netrun-aaaa2", 10), LIST(3, "netrun-bbbb3", 20), PIECE_LIST(7, pieceNet), PIECE_LIST(8, freeNet)];
+    r = await call("PUT", "/pergb/state?snapshotId=p1&page=1&pages=1&seq=20", { body: { accounts, lists, static: [] } });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.pieces.accepted, 1);
+    assert.deepStrictEqual(r.json.pieces.rejected.map((x) => [x.id, x.error]), [[8, "piece_net_not_reserved"]], "a pieceNet that was never reserved");
+    pieceAddr = r.json.pieces.addrs["7"];
+    assert.strictEqual(pieceAddr, tg.pieceAddress(pieceNet, 7), "the agent and RADIUS derive the same address");
+    // the fixed address on any shared port; IPv4 from the primary IPv4; only -country- allowed
+    for (const nasPort of [31000, 31777, 31999]) {
+      const a = await radprobe.probeOnce({ port: radius.udpPort, secret: T.SECRET, username: "netrun-piece7", password: "pass-7", nasPort, dst: "2606:4700::1", dstPort: 443 });
+      assert.deepStrictEqual([a.verdict, a.framedAddr], ["accept", pieceAddr]);
+    }
+    const v4 = await radprobe.probeOnce({ port: radius.udpPort, secret: T.SECRET, username: "netrun-piece7-country-us", password: "pass-7", nasPort: 31001, dst: "93.184.216.34", dstPort: 443 });
+    assert.deepStrictEqual([v4.verdict, v4.framedAddr], ["accept", EGRESS]);
+    const st = await pergb.ctl.call("status", {});
+    assert.strictEqual(st.facts.primaryIpv4, EGRESS, "option A: the entry IPv4 is the primary one");
+    const ses = await radprobe.probeOnce({ port: radius.udpPort, secret: T.SECRET, username: "netrun-piece7-session-x1", password: "pass-7", nasPort: 31001, dst: "2606:4700::1", dstPort: 443 });
+    assert.strictEqual(ses.verdict, "reject");
+    // the agent knows the piece's /64: per-piece for kills, attribution, smart rotation; journaled
+    assert.ok(pergb._excluded().has(pieceNet));
+    assert.strictEqual(pergb._pieceNets().get(pieceNet).listId, 7);
+    assert.deepStrictEqual(pergb._journal().refs["piece:order_77"], [pieceNet]);
+    // kills: a per-GB account kill never touches the piece; its list / account kill does
+    world.sockets = [
+      { local: pieceAddr, lport: 40500, peer: "2606:4700::1", pport: 443, sent: 1, received: 1, cgroup: T.CG(T.UNIT_A) },
+      { local: pieceAddr, lport: 40501, peer: "2606:4700::2", pport: 443, sent: 1, received: 1, cgroup: T.CG(T.UNIT_B) },
+      { local: addr1, lport: 40502, peer: "2606:4700::1", pport: 443, sent: 1, received: 1, cgroup: T.CG(T.UNIT_A) },
+    ];
+    world.killed = [];
+    r = await call("POST", "/pergb/kill", { body: { accountId: 10 } });
+    assert.deepStrictEqual(world.killed.map((s) => s.lport), [40502]);
+    r = await call("POST", "/pergb/kill", { body: { listId: 7 } });
+    assert.strictEqual(r.json.killed6, 2);
+    // attribution: the piece, by its exact fixed address
+    r = await call("GET", `/pergb/attribution?addr=${encodeURIComponent(pieceAddr)}`);
+    assert.deepStrictEqual([r.json.kind, r.json.listId, r.json.tagValid, r.json.piece.exact, r.json.piece.accountId], ["piece", 7, true, true, 70]);
+    // usage: counted under its login, marked piece; never locally blocked
+    fs.appendFileSync(path.join(logDir, hourName(31000)), `${rec({ user: "netrun-piece7-country-us", bound: pieceAddr, i: 900, o: 90, cport: 42000 })}\n`);
+    await pergb.mainTick();
+    const u = await call("GET", "/pergb/usage?since=0&bindingsAfter=0");
+    assert.deepStrictEqual(u.json.logins["netrun-piece7"], { up: 90, down: 900, conns: 1, kind: "piece" });
+    assert.strictEqual(u.json.status.pieces.lists, 1);
+    assert.deepStrictEqual(u.json.status.pieces.journal, { refs: 1, nets: 1 });
+    assert.ok(!u.json.localBlocks.some((b) => b.accountId === 70));
+    assert.strictEqual((await pergb.ctl.call("local_block", { accountId: 70, blocked: true })).ignored, "piece");
+    // a delta that claims the piece's /64 for another piece is refused, the piece keeps it
+    r = await call("PATCH", "/pergb/state", { body: { baseSeq: 20, seq: 21, accounts: [], lists: [PIECE_LIST(9, pieceNet)] } });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.deepStrictEqual(r.json.pieces.rejected.map((x) => [x.id, x.error, x.heldBy]), [[9, "piece_net_duplicate", 7]]);
+    // explicit nets through the route (restoring a known reservation): idempotent
+    r = await call("POST", "/pergb/reserve_nets", { body: { owner: "perpiece", ref: "piece:order_77", nets: [pieceNet] } });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.deepStrictEqual([r.json.subnetIds, r.json.restored], [[pieceNet], 0]);
+    r = await call("POST", "/pergb/reserve_nets", { body: { owner: "perpiece", ref: "piece:order_78", nets: [pieceNet] } });
+    assert.strictEqual(r.status, 409);
+    assert.strictEqual(r.json.error, "net_unavailable");
+  });
+
   await t.test("a RADIUS restart with a lost DB: the next watch pushes facts and excluded again", async () => {
     await radius.stop();
     fs.rmSync(path.join(dir, "radius"), { recursive: true, force: true });
@@ -425,6 +494,15 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     const status = await call("GET", "/pergb/status");
     assert.strictEqual(status.json.radius.epoch, st1.epoch);
     assert.ok(status.json.events.some((e) => e.type === "pergb_radius_epoch_changed"));
+    // A13-I: the piece's /64 is reserved again from the journal, under its ref
+    const res = await pergb.ctl.call("reserved", {});
+    assert.deepStrictEqual(res.nets, [[pieceNet, "piece:order_77"]]);
+    assert.ok(status.json.events.some((e) => e.type === "pergb_reservations_restored" && e.restored === 1));
+    assert.strictEqual(status.json.pieces.restore.restored, 1);
+    // so the orchestrator's full snapshot after the epoch change installs the piece again, same address
+    const r = await call("PUT", "/pergb/state?snapshotId=p2&page=1&pages=1&seq=1", { body: { accounts: [ACCOUNT(10), PIECE_ACCOUNT], lists: [LIST(1, "netrun-aaaa1", 10), PIECE_LIST(7, pieceNet)], static: [] } });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.deepStrictEqual([r.json.pieces.accepted, r.json.pieces.rejected, r.json.pieces.addrs["7"]], [1, [], pieceAddr]);
   });
 
   await t.test("body limit 2 MiB → 413; certificate renewal picked up without a restart", async () => {
@@ -456,6 +534,7 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     const st = await pergb.ctl.call("status", {});
     assert.deepStrictEqual(st.facts.egressIpv4s, ipv4s);
     assert.strictEqual(st.facts.egressIpv4, ipv4s[0]);
+    assert.strictEqual(st.facts.primaryIpv4, EGRESS, "A9 / A13-I: the primary IPv4 stays with per-piece");
     // the same addresses again: nothing added, the guard is not touched
     const again = run.calls.length;
     const r2 = await request(port, "POST", "/pergb/enable", { body: { ...ENABLE, ipv4s }, ca: fs.readFileSync(c1.crt, "utf-8") });
@@ -533,4 +612,110 @@ test("the per-piece /64 scan (excluded): cfg variants, lists and their temps, th
   fs.writeFileSync(path.join(dir, "egress_state.json"), "{broken");
   assert.strictEqual(stateLib.scanPerPieceNets({ proxyRoot: dir, prefixBase: base }).complete, false, "an unreadable source makes the scan incomplete (add-only in RADIUS)");
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("A13-I reservation journal: kept across agent restarts, restored exactly after a lost RADIUS DB, skipped / retried / corrected", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pgj-"));
+  const poolFile = path.join(dir, "pergb-pool.conf");
+  fs.writeFileSync(poolFile, stateLib.poolText(PREFIX, "0000-fffe"));
+  // a RADIUS model: reserved = Map net -> ref
+  const R = { features: ["pieces", "reserveExact", "reserved"], reserved: new Map(), next: 0x100, fail: null };
+  const handlers = {
+    status: () => ({ epoch: 4294967296, seq: 0, ready: true, features: R.features, uptimeSec: 5 }),
+    logins: { lists: [] },
+    accounts: { accounts: [] },
+    reserved: () => ({ nets: [...R.reserved.entries()].sort((a, b) => a[0] - b[0]), count: R.reserved.size }),
+    reserve_nets: (b) => {
+      if (R.fail) throw Object.assign(new Error(R.fail), { code: R.fail });
+      if (b.nets) {
+        const bad = b.nets.filter((n) => R.reserved.has(n) && R.reserved.get(n) !== b.ref);
+        if (bad.length) throw Object.assign(new Error("net_unavailable"), { code: "net_unavailable", reply: { nets: bad.map((n) => ({ net: n, why: "reserved" })) } });
+        let restored = 0;
+        for (const n of b.nets) if (R.reserved.get(n) !== b.ref) (R.reserved.set(n, b.ref), (restored += 1));
+        return { nets: b.nets, ref: b.ref, restored };
+      }
+      const nets = [];
+      for (let i = 0; i < b.count; i += 1) {
+        R.reserved.set(R.next, b.ref);
+        nets.push(R.next++);
+      }
+      return { nets, ref: b.ref };
+    },
+    release_nets: (b) => {
+      let n = 0;
+      for (const id of b.nets) if (R.reserved.delete(id)) n += 1;
+      return { released: n, coolDownUntil: null };
+    },
+  };
+  const ctl = T.fakeCtl(handlers);
+  const mk = () =>
+    stateLib.createPergb({
+      env: {},
+      log: QUIET,
+      ctl,
+      run: T.fakeRun({ sockets: [] }),
+      runtimeSettings: rtLib.readSettings({ NETRUN_PERGB_ETC_DIR: path.join(dir, "etc"), NETRUN_PERGB_LOG_DIR: path.join(dir, "log") }),
+      settings: { poolFile, stateDir: path.join(dir, "state"), proxyRoot: path.join(dir, "proxy"), loops: false },
+    });
+  try {
+    const p1 = mk();
+    await p1.radiusWatch(false);
+    let r = await p1.reserveNets({ count: 2, owner: "perpiece", ref: "piece:order_1" });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    const [a, b] = r.body.subnetIds;
+    r = await p1.reserveNets({ count: 1, ref: "gen:20000:c1" });
+    const g = r.body.subnetIds[0];
+    assert.deepStrictEqual(p1._journal().refs, { "piece:order_1": [a, b], "gen:20000:c1": [g] });
+    r = await p1.releaseNets({ nets: [a, g], ref: "rel:1" });
+    assert.strictEqual(r.body.released, 2);
+    assert.deepStrictEqual(p1._journal().refs, { "piece:order_1": [b] }, "released /64s leave the journal");
+    // an agent restart keeps the journal (a 0600 file in the state dir)
+    const p2 = mk();
+    assert.deepStrictEqual(p2._journal().refs, { "piece:order_1": [b] });
+    assert.strictEqual(fs.statSync(path.join(dir, "state", "reservations.json")).mode & 0o777, 0o600);
+    // RADIUS lost its DB: the exact /64 comes back under its ref
+    R.reserved.clear();
+    await p2.radiusWatch(false);
+    const before = ctl.calls.length;
+    let info = await p2.restoreReservations("radius_epoch");
+    assert.deepStrictEqual([info.refs, info.restored, info.failures], [1, 1, []]);
+    assert.deepStrictEqual(ctl.calls.slice(before).map((c) => c.body), [{ owner: "perpiece", ref: "piece:order_1", nets: [b], count: 1 }]);
+    assert.strictEqual(R.reserved.get(b), "piece:order_1");
+    assert.ok(p2._excluded().has(b));
+    // idempotent
+    info = await p2.restoreReservations("start");
+    assert.deepStrictEqual([info.restored, info.failures.length], [0, 0]);
+    // a RADIUS without exact reserves is never asked (it would hand out new /64s)
+    R.features = ["pieces"];
+    await p2.radiusWatch(false);
+    const n0 = ctl.calls.length;
+    info = await p2.restoreReservations("start");
+    assert.strictEqual(info.skipped, "radius_without_reserve_exact");
+    assert.ok(!ctl.calls.slice(n0).some((c) => c.op === "reserve_nets"));
+    r = await p2.reserveNets({ ref: "piece:order_1", nets: [b] });
+    assert.deepStrictEqual([r.status, r.body.error], [501, "radius_unsupported"]);
+    R.features = ["pieces", "reserveExact", "reserved"];
+    await p2.radiusWatch(false);
+    // a transient failure stays pending; a conflict is reported
+    R.fail = "radius_unavailable";
+    info = await p2.restoreReservations("radius_epoch");
+    assert.strictEqual(info.failures[0].error, "radius_unavailable");
+    assert.strictEqual((await p2.status()).pieces.restore.pending, true);
+    R.fail = null;
+    R.reserved.set(b, "piece:order_9");
+    info = await p2.restoreReservations("retry");
+    assert.deepStrictEqual(info.failures.map((f) => [f.ref, f.error]), [["piece:order_1", "net_unavailable"]]);
+    assert.strictEqual((await p2.status()).pieces.restore.pending, false);
+    // RADIUS is authoritative for the nets it holds: the journal follows it (and learns new ones)
+    R.reserved.set(0x900, "gen:20000:c7");
+    const rr = await p2.refreshReserved();
+    assert.strictEqual(rr.journalChanged, 2);
+    assert.deepStrictEqual(p2._journal().refs, { "piece:order_9": [b], "gen:20000:c7": [0x900] });
+    // ... and never forgets a net when RADIUS answers an empty list (a lost DB)
+    R.reserved.clear();
+    await p2.refreshReserved();
+    assert.deepStrictEqual(p2._journal().refs, { "piece:order_9": [b], "gen:20000:c7": [0x900] });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

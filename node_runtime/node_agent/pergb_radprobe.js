@@ -117,7 +117,19 @@ function replyAttrs(reply) {
   return out;
 }
 
-// One probe. -> { ok, verdict: "accept"|"reject"|"timeout"|"bad_reply"|"error", ms, framed }
+// The Framed address of an Accept as text (IPv4 for type 8, IPv6 for 168), or null.
+function framedText(attr) {
+  const v = attr && attr.value;
+  if (attr.type === 8 && v.length === 4) return [...v].join(".");
+  if (attr.type === 168 && v.length === 16) {
+    const groups = [];
+    for (let i = 0; i < 16; i += 2) groups.push(v.readUInt16BE(i));
+    return require("./pergb_tag.js").bigToIpv6(groups.reduce((acc, g) => (acc << 16n) | BigInt(g), 0n));
+  }
+  return null;
+}
+
+// One probe. -> { ok, verdict: "accept"|"reject"|"timeout"|"bad_reply"|"error", ms, framed, framedAddr }
 function probeOnce({ server = "127.0.0.1", port = 1812, secret, username = "netrun-svcprobe", password, nasPort, dst, dstPort, timeoutMs = 2000, socketFactory = () => dgram.createSocket("udp4") }) {
   return new Promise((resolve) => {
     const t0 = process.hrtime.bigint();
@@ -152,7 +164,7 @@ function probeOnce({ server = "127.0.0.1", port = 1812, secret, username = "netr
       }
       if (msg[0] === ACCESS_ACCEPT) {
         const framed = replyAttrs(msg).filter((a) => a.type === 8 || a.type === 168);
-        finish({ ok: framed.length === 1, verdict: "accept", framed: framed.length });
+        finish({ ok: framed.length === 1, verdict: "accept", framed: framed.length, framedAddr: framed.length === 1 ? framedText(framed[0]) : null });
       } else if (msg[0] === ACCESS_REJECT) finish({ ok: false, verdict: "reject" });
       else finish({ ok: false, verdict: "bad_reply" });
     });

@@ -297,3 +297,32 @@ test("an account the orchestrator blocked: its sessions are killed on every tick
   assert.deepStrictEqual(killer.kills, [{ accountId: 20 }, { accountId: 20 }]);
   assert.strictEqual(ctl.calls.filter((c) => c.op === "local_block").length, 0);
 });
+
+test("A13-I: a piece account has no limit — never near, never blocked; expiry and its state still kill", async () => {
+  const meter = fakeMeter();
+  const killer = fakeKiller();
+  const now = clock();
+  const ctl = T.fakeCtl({ near_stats: { accounts: {} } });
+  const e = enforcerLib.createEnforcer({ ctl, meter, killer, now, log: QUIET, logdumpBytes: () => LOGDUMP });
+  e.setLists([...LISTS, { id: 7, login: "netrun-piece7", accountId: 70, status: "active", pwRev: 1, kind: "piece" }]);
+  // a limit sent with a piece account (it should not be) is ignored here as in RADIUS
+  e.setAccounts([{ id: 70, kind: "piece", state: "active", expiresAt: now() / 1000 + 5, limit: { epoch: meter.epoch, bytes: 1, allowance: 0, full: true } }]);
+  meter.add("netrun-piece7", 50 * 1024 * MiB, 50 * 1024 * MiB);
+  let r = await e.tick();
+  assert.deepStrictEqual([r.near, r.blocked], [[], []]);
+  assert.ok(!ctl.calls.some((c) => c.op === "local_block"));
+  assert.deepStrictEqual(r.heartbeat, {}, "never in the heartbeat's near map");
+  assert.strictEqual(e._accounts.get(70).limit, null);
+  assert.strictEqual(e.accountView(70).limit, null);
+  // expiry: killed once
+  now.advance(6000);
+  r = await e.tick();
+  assert.deepStrictEqual(r.killed.map((k) => [k.accountId, k.why]), [[70, "expired"]]);
+  await e.tick();
+  assert.strictEqual(killer.kills.length, 1);
+  // refund / end of order: the state kills every tick
+  e.setAccounts([{ id: 70, kind: "piece", state: "released", expiresAt: null }]);
+  await e.tick();
+  await e.tick();
+  assert.strictEqual(killer.kills.length, 3);
+});

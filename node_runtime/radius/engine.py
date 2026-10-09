@@ -11,7 +11,9 @@ Amendments applied here: A6 (release_nets without a cool-down), A7/A9 (several
 egress IPv4s: Framed-IP-Address per connection or per line, the IPv4 admission
 per address), A8 (a shared pool, deterministic static, no caps), A10 (list
 modes per_request / timer / link / static, link epochs, TTL 30 s .. 24 h),
-A11 (the «липкая сессия» pause), A12 (ctl op `avoid`, smart rotation picks).
+A11 (the «липкая сессия» pause), A12 (ctl op `avoid`, smart rotation picks),
+A13 / A13-I (per-piece proxies: list and account kind "piece", one reserved
+/64 per piece, a fixed address, no quota, IPv4 via the node's primary IPv4).
 """
 
 from __future__ import annotations
@@ -32,13 +34,19 @@ from array import array
 import proto
 import psl as psl_lib
 import username as uname
-from alloc import STATIC, Allocator, AllocError, CtlRefused
+from alloc import PIECE_REF, RESERVE_MAX, STATIC, Allocator, AllocError, CtlRefused
 from state import EVENT_RETENTION_SEC, Batch, log
 
 REASONS = ("bad_login", "bad_params", "list_off", "account_off", "quota", "capacity")
 ACCOUNT_STATES = ("active", "blocked", "released")
 LIST_STATUSES = ("active", "blocked", "deleted")
 FAMILIES = ("dualstack", "ipv6_only")
+PERGB = "pergb"  # the kind of per-GB lists and accounts (the default)
+PIECE = "piece"  # A13-I: a per-piece proxy (list) and its account
+KINDS = (PERGB, PIECE)
+PIECE_REJECTS_KEPT = 100
+# status.features: what this RADIUS speaks beyond I5 (the agent checks before using it)
+FEATURES = ("pieces", "reserveExact", "reserved", "avoid", "primaryIpv4")
 MAX_EGRESS_V4 = 64  # A7: 1..64 per-GB IPv4s per node
 STICKY_PAUSES = (5, 10)  # A11: the two pause buttons (other values 1..60 are accepted)
 MAX_LINE_EPOCHS = 20000
@@ -126,6 +134,9 @@ class Facts:
         "egress_v4_str",
         "egress_v4s",
         "egress_v4s_str",
+        "primary_v4",
+        "primary_v4_str",
+        "piece_v4",
         "prefix",
         "prefix_str",
         "lo",
@@ -186,6 +197,19 @@ class Facts:
         f.egress_v4s = tuple(ipaddress.IPv4Address(x).packed for x in v4s)
         if f.egress_v4 is None and f.egress_v4s:
             f.egress_v4, f.egress_v4_str = f.egress_v4s[0], f.egress_v4s_str[0]
+        # A9 / A13-I: the node's PRIMARY IPv4 stays with per-piece — the IPv4 egress of
+        # piece lists. Without the fact (an older agent) pieces use egressIpv4, which is
+        # the primary IPv4 in option A.
+        pv4 = d.get("primaryIpv4")
+        if pv4:
+            try:
+                a = ipaddress.IPv4Address(pv4)
+            except (ipaddress.AddressValueError, ValueError, TypeError):
+                raise _bad("primaryIpv4") from None
+            f.primary_v4, f.primary_v4_str = a.packed, str(a)
+        else:
+            f.primary_v4, f.primary_v4_str = None, None
+        f.piece_v4 = f.primary_v4 if f.primary_v4 is not None else f.egress_v4
         try:
             net = ipaddress.IPv6Network(d.get("prefix"), strict=True)
         except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError, TypeError):
@@ -244,9 +268,13 @@ class Facts:
 
 
 class Account:
-    """I5 A. staticCap / stickyExclCap are accepted and ignored (A8: no caps)."""
+    """I5 A. staticCap / stickyExclCap are accepted and ignored (A8: no caps).
 
-    __slots__ = ("id", "state", "expires_at", "limit", "trial", "local_blocked")
+    kind "pergb" (default) or "piece" (A13-I): a piece account has no limit (a
+    limit sent anyway is dropped), is never quota-blocked (local_block is a no-op,
+    no near / deadman check) and is refused after expiresAt like any account."""
+
+    __slots__ = ("id", "state", "expires_at", "limit", "trial", "local_blocked", "kind")
 
     @classmethod
     def parse(cls, d) -> Account:
@@ -257,21 +285,25 @@ class Account:
         a.state = d.get("state")
         if a.state not in ACCOUNT_STATES:
             raise _bad("account state")
+        a.kind = d.get("kind") or PERGB
+        if a.kind not in KINDS:
+            raise _bad("account kind must be pergb or piece")
         a.expires_at = _num(d, "expiresAt")
         lim = d.get("limit")
         if lim is not None and not isinstance(lim, dict):
             raise _bad("account limit")
-        a.limit = lim
-        a.trial = _bool(d, "trial", False)
+        a.limit = None if a.kind == PIECE else lim
+        a.trial = False if a.kind == PIECE else _bool(d, "trial", False)
         a.local_blocked = False
         return a
 
     @classmethod
     def from_row(cls, row) -> Account:
         a = cls()
-        a.id, a.state, a.expires_at, limit_json, trial, lb = row
+        a.id, a.state, a.expires_at, limit_json, trial, lb, kind = row
         a.limit = json.loads(limit_json) if limit_json else None
         a.trial, a.local_blocked = bool(trial), bool(lb)
+        a.kind = kind or PERGB
         return a
 
     def row(self):
@@ -282,12 +314,14 @@ class Account:
             json.dumps(self.limit, sort_keys=True) if self.limit is not None else None,
             int(self.trial),
             int(self.local_blocked),
+            self.kind,
         )
 
     def view(self) -> dict:
         exp = self.expires_at
         return {
             "id": self.id,
+            "kind": self.kind,
             "state": self.state,
             "expiresAt": int(exp) if exp is not None and float(exp).is_integer() else exp,
             "limit": self.limit,
@@ -308,6 +342,10 @@ class PList:
     lineEpochs      {slot: n}: per-line change-IP counters (?line=N), slots "p<n>" / "s:s<5 digits>"
     stickyPauseSec  the «липкая сессия» pause (5 or 10; null/0 = off); per_request and
                     timer lists only
+
+    A13-I: kind "pergb" (default) or "piece". A piece list is ONE per-piece proxy:
+    mode "static" (or absent), lineCount 1 (or absent), pieceNet = the subnet id
+    (int, relative to the /48) of its own /64; the A10/A11 fields are ignored.
     """
 
     __slots__ = (
@@ -326,6 +364,8 @@ class PList:
         "link_epoch",
         "line_epochs",
         "pause",
+        "kind",
+        "piece_net",
     )
 
     @classmethod
@@ -356,6 +396,14 @@ class PList:
         p.status = d.get("status", "active")
         if p.status not in LIST_STATUSES:
             raise _bad("list status")
+        p.kind = d.get("kind") or PERGB
+        if p.kind not in KINDS:
+            raise _bad("list kind must be pergb or piece")
+        if p.kind == PIECE:
+            return cls._parse_piece(p, d)
+        if d.get("pieceNet") is not None:
+            raise _bad("pieceNet is for piece lists only (list %d)" % p.id)
+        p.piece_net = None
         try:
             p.mode = uname.list_mode(d.get("mode") or uname.PER_REQUEST)
         except ValueError:
@@ -380,6 +428,29 @@ class PList:
             p.pause = None  # A11: the pause exists for per_request and timer lists only
         return p
 
+    @staticmethod
+    def _parse_piece(p, d) -> PList:
+        """A13-I piece record: the shape is checked here (bad_request for the op);
+        whether its /64 may be used is checked per record by the engine."""
+        mode = d.get("mode") or uname.STATIC
+        if mode != uname.STATIC:
+            raise _bad("piece list %d: mode must be static" % p.id)
+        line_count = _int(d, "lineCount", required=False)
+        if line_count is not None and line_count != 1:
+            raise _bad("piece list %d: lineCount must be 1" % p.id)
+        if d.get("pieceNet") is None:
+            raise _bad("piece list %d: pieceNet is required" % p.id)
+        if isinstance(d.get("pieceNet"), str):
+            raise _bad("piece list %d: pieceNet must be an integer subnet id" % p.id)
+        p.piece_net = _int(d, "pieceNet", 0, 0xFFFF)
+        p.mode = uname.STATIC
+        p.ttl = None
+        p.anchor = 0.0
+        p.link_epoch = 0
+        p.line_epochs = {}
+        p.pause = None
+        return p
+
     @classmethod
     def from_row(cls, row) -> PList:
         p = cls()
@@ -397,7 +468,10 @@ class PList:
             p.link_epoch,
             line_epochs,
             p.pause,
+            kind,
+            p.piece_net,
         ) = row
+        p.kind = kind or PERGB
         p.mode = uname.LEGACY_MODES.get(p.mode, p.mode)
         p.anchor = anchor or 0.0
         p.line_epochs = json.loads(line_epochs) if line_epochs else {}
@@ -422,17 +496,23 @@ class PList:
             self.link_epoch,
             json.dumps(self.line_epochs, sort_keys=True) if self.line_epochs else None,
             self.pause,
+            self.kind,
+            self.piece_net,
         )
 
     def view(self) -> dict:
-        return {
+        v = {
             "id": self.id,
             "login": self.login,
             "accountId": self.account_id,
             "status": self.status,
             "pwRev": self.pw_rev,
             "mode": self.mode,
+            "kind": self.kind,
         }
+        if self.kind == PIECE:
+            v["pieceNet"] = self.piece_net
+        return v
 
 
 def _mode_key(p) -> tuple:
@@ -466,6 +546,9 @@ class Engine:
         self.lists = {}
         self.by_login = {}
         self.by_account = {}
+        self.n_pieces = 0  # A13: piece lists installed
+        self.piece_rejects = []  # A13-I: the records the last snapshot / apply refused (newest last)
+        self.piece_rejects_at = None
         self.epoch = 0
         self.seq = 0
         self.db_recovered = False
@@ -512,6 +595,8 @@ class Engine:
         data = self.store.open()
         now = self.clock()
         self.db_recovered = self.store.recovered
+        if getattr(self.store, "migrated", None):
+            log("state DB schema migrated %s (epoch and reservations kept)" % self.store.migrated)
         self.epoch, self.seq = data["epoch"], data["seq"]
         a = self.alloc
         for net, scan, ref, rat in data["nets"]:
@@ -568,6 +653,7 @@ class Engine:
 
     def _reindex(self):
         self.by_login, self.by_account = self._indexes(self.lists)
+        self.n_pieces = sum(1 for p in self.lists.values() if p.kind == PIECE)
 
     @staticmethod
     def _indexes(lists: dict):
@@ -679,6 +765,10 @@ class Engine:
         acct = self.accounts.get(lst.account_id)
         if acct is None or acct.state != "active" or (acct.expires_at is not None and now >= acct.expires_at):
             return self._reject("account_off", lst, now)
+        if acct.kind != lst.kind:
+            return self._reject("account_off", lst, now)  # a piece list needs a piece account and vice versa
+        if lst.kind == PIECE:
+            return self._authorize_piece(req, login, lst, acct, fam, now)
         if acct.local_blocked:
             return self._reject("quota", lst, now)
         aid = acct.id
@@ -732,6 +822,29 @@ class Engine:
             if fam == 4:
                 self.near_ipv4[aid] = self.near_ipv4.get(aid, 0) + 1
         return None, v6, v4
+
+    def _authorize_piece(self, req, login, lst, acct, fam, now):
+        """A13-I: one per-piece proxy. Its fixed address in its own /64; no quota, no
+        near/deadman check (the traffic is still logged under the login); none of the
+        per-GB modes, the pause or smart rotation; only -country-<cc> is allowed."""
+        if not uname.piece_params_ok(login):
+            return self._reject("bad_params", lst, now)
+        if not self.adm_open or acct.id in self.adm_soft:
+            return self._reject("capacity", lst, now)  # node protection applies to every login
+        a = self.alloc
+        net = lst.piece_net
+        if not a.is_piece_net(net):
+            # its /64 was released (or never reserved): never serve it from a shared /64
+            return self._reject("list_off", lst, now)
+        if fam == 4:
+            f = self.facts
+            v4 = f.piece_v4
+            if f.family == "ipv6_only" or v4 is None:
+                return self._reject("bad_params", lst, now)
+            if v4 in self.ipv4_closed or (not self.ipv4_open and v4 in f.egress_v4s):
+                return self._reject("capacity", lst, now)
+            return None, None, v4
+        return None, a.piece_addr(lst.id, net).to_bytes(16, "big"), None
 
     def _probe(self, req, password, fam, now):
         f = self.facts
@@ -907,6 +1020,7 @@ class Engine:
                 "epoch": self.epoch,
                 "seq": self.seq,
                 "dbRecovered": self.db_recovered,
+                "features": list(FEATURES),
                 "ready": self.facts is not None and self.alloc.configured,
                 "secretLoaded": bool(self.secret),
                 "counts": {
@@ -915,6 +1029,12 @@ class Engine:
                     "sticky": len(self.alloc.sticky),
                     "static": len(self.alloc.static),
                     "lines": len(self.alloc.mode),
+                    "pieces": self.n_pieces,
+                },
+                "pieces": {
+                    "lists": self.n_pieces,
+                    "lastRejected": list(self.piece_rejects[-20:]),
+                    "lastRejectedAt": self.piece_rejects_at,
                 },
                 "alloc": self.alloc.stats(now),
                 "smartRotation": self.alloc.avoid_stats(now),
@@ -946,6 +1066,7 @@ class Engine:
                 "family": f.family,
                 "egressIpv4": f.egress_v4_str,
                 "egressIpv4s": list(f.egress_v4s_str),
+                "primaryIpv4": f.primary_v4_str,
                 "prefix": f.prefix_str,
                 "subnets": [f.lo, f.hi],
             }
@@ -992,13 +1113,15 @@ class Engine:
         return {"ok": True, "excluded": count, "removed": removed}
 
     def op_reserve_nets(self, req):
-        count = _int(req, "count", 1, 5000)
         ref = req.get("ref")
         if not isinstance(ref, str) or not 1 <= len(ref) <= 200:
             raise _bad("ref must be a string of 1..200 chars")
         owner = req.get("owner", "perpiece")
         if owner != "perpiece":
             raise _bad("owner must be perpiece")
+        if req.get("nets") is not None:
+            return self._reserve_exact(req, ref)
+        count = _int(req, "count", 1, RESERVE_MAX)
         force = _bool(req, "force", False)
         with self.ctl_lock:
             with self.lock:
@@ -1006,6 +1129,37 @@ class Engine:
                 nets = self.alloc.reserve(count, ref, self.clock(), min_free, force)
             self._durable()
         return {"nets": nets, "ref": ref}
+
+    def _reserve_exact(self, req, ref):
+        """reserve_nets {ref, nets:[subnet id…], count?}: ensure exactly these /64s are
+        reserved under ref (restoring known reservations, e.g. after a lost DB)."""
+        raw = req.get("nets")
+        if not isinstance(raw, list) or not 1 <= len(raw) <= RESERVE_MAX:
+            raise _bad("nets must be a list of 1..%d subnet ids" % RESERVE_MAX)
+        nets = []
+        seen = set()
+        for v in raw:
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise _bad("nets are integer subnet ids")
+            n = _subnet_id(v)
+            if n not in seen:
+                seen.add(n)
+                nets.append(n)
+        count = _int(req, "count", 1, RESERVE_MAX, required=False)
+        if count is not None and count != len(nets):
+            raise _bad("count must equal the number of nets")
+        with self.ctl_lock:
+            with self.lock:
+                nets, new = self.alloc.reserve_exact(nets, ref, self.clock())
+            self._durable()
+        return {"nets": nets, "ref": ref, "restored": new}
+
+    def op_reserved(self, req):
+        """Every reserved /64 with its ref: [[net, ref], …] (the agent's excluded set
+        after its own restart; per-piece /64s carry "piece:" refs)."""
+        with self.lock:
+            items = sorted(self.alloc.reserved.items())
+        return {"nets": [[n, r] for n, r in items], "count": len(items)}
 
     def op_release_nets(self, req):
         nets = req.get("nets")
@@ -1051,6 +1205,86 @@ class Engine:
                 static.append((lid, slot, addr))
         return accs, lsts, static
 
+    def _check_lists(self, lsts, account_of, kept_nets: dict, incumbent: dict) -> list:
+        """A13-I per-record checks of the non-deleted list records of one snapshot / apply
+        (the caller holds ctl_lock, so the reservations cannot change meanwhile).
+
+        account_of(id) -> the Account after the op, or None; kept_nets: {net: list id} of
+        the piece lists the op leaves as they are; incumbent: {list id: net} of the piece
+        lists installed now. Returns the refused records [{id, login, kind, pieceNet?,
+        error}]; errors:
+          account_kind_mismatch    the list's kind differs from its account's;
+          piece_net_outside_pool   pieceNet is not a /64 of the pool (or ffff);
+          piece_net_not_reserved   pieceNet was not handed out by reserve_nets;
+          piece_net_not_piece      it is reserved, but not under a "piece:" ref (a 3proxy batch's);
+          piece_net_duplicate      another piece list holds (or claims) the same /64.
+        The reservation is required only for a piece that can serve (list active and its
+        account active or not sent yet); a pieceNet is unique among all piece lists."""
+        a = self.alloc
+        out = []
+
+        def refuse(p, error, **extra):
+            r = {"id": p.id, "login": p.login, "kind": p.kind, "error": error}
+            if p.kind == PIECE:
+                r["pieceNet"] = p.piece_net
+            r.update(extra)
+            out.append(r)
+
+        claims = {}
+        for p in lsts:
+            acct = account_of(p.account_id)
+            if acct is not None and acct.kind != p.kind:
+                refuse(p, "account_kind_mismatch", accountKind=acct.kind)
+                continue
+            if p.kind != PIECE:
+                continue
+            net = p.piece_net
+            if not a.in_pool(net):
+                refuse(p, "piece_net_outside_pool")
+                continue
+            if p.status == "active" and (acct is None or acct.state == "active"):
+                ref = a.reserved.get(net)
+                if ref is None:
+                    refuse(p, "piece_net_not_reserved")
+                    continue
+                if not ref.startswith(PIECE_REF):
+                    refuse(p, "piece_net_not_piece", ref=ref)
+                    continue
+            holder = kept_nets.get(net)
+            if holder is not None and holder != p.id:
+                refuse(p, "piece_net_duplicate", heldBy=holder)
+                continue
+            claims.setdefault(net, []).append(p)
+        for net, ps in claims.items():
+            if len(ps) < 2:
+                continue
+            keep = [p for p in ps if incumbent.get(p.id) == net]
+            keep = keep[0] if len(keep) == 1 else None
+            for p in ps:
+                if p is not keep:
+                    refuse(p, "piece_net_duplicate", heldBy=keep.id if keep is not None else None)
+        return out
+
+    def _note_piece_rejects(self, rejected: list, now: float):
+        if rejected:
+            self.piece_rejects = (self.piece_rejects + rejected)[-PIECE_REJECTS_KEPT:]
+            self.piece_rejects_at = now
+            log("refused %d list record(s): %s" % (len(rejected), json.dumps(rejected[:5])))
+
+    def _piece_addrs(self, accepted, old_lists: dict) -> dict:
+        """{list id: address} of the accepted piece records that are new or moved."""
+        a = self.alloc
+        if not a.configured:
+            return {}
+        out = {}
+        for p in accepted:
+            if p.kind != PIECE:
+                continue
+            old = old_lists.get(p.id)
+            if old is None or old.kind != PIECE or old.piece_net != p.piece_net:
+                out[str(p.id)] = _addr_str(a.piece_addr(p.id, p.piece_net))
+        return out
+
     def _account_transition(self, old, new, out):
         if new.state != "active" and (old is None or old.state != new.state):
             out["accounts"].append({"id": new.id, "why": new.state})
@@ -1081,6 +1315,12 @@ class Engine:
             # Only ctl ops (serialised by ctl_lock) change accounts and lists, so the
             # O(n) diff runs without the engine lock; the UDP thread keeps serving.
             old_accounts, old_lists = self.accounts, self.lists
+            # A13-I: refused records are not installed (a list that had been is removed)
+            incumbent = {p.id: p.piece_net for p in old_lists.values() if p.kind == PIECE}
+            rejected = self._check_lists(list(new_lists.values()), new_accounts.get, {}, incumbent)
+            rejected_ids = {r["id"] for r in rejected}
+            for lid in rejected_ids:
+                new_lists.pop(lid, None)
             t = {"accounts": [], "lists": []}
             dirty_accounts, dirty_lists = {}, {}
             for a in new_accounts.values():
@@ -1096,23 +1336,31 @@ class Engine:
                     if old.state != "released":
                         t["accounts"].append({"id": aid, "why": "released"})
             mode_changed = []
+            kind_changed = []
             for p in new_lists.values():
                 old = old_lists.get(p.id)
                 self._list_transition(old, p, t)
                 if old is None or old.row() != p.row():
                     dirty_lists[p.id] = p
-                    if old is not None and _mode_key(old) != _mode_key(p):
+                    if old is not None and old.kind != p.kind:
+                        kind_changed.append(p.id)
+                    elif old is not None and _mode_key(old) != _mode_key(p):
                         mode_changed.append(p.id)
             gone = [lid for lid in old_lists if lid not in new_lists]
             for lid in gone:
                 dirty_lists[lid] = None
-                t["lists"].append({"id": lid, "why": "deleted"})
+                t["lists"].append({"id": lid, "why": "rejected" if lid in rejected_ids else "deleted"})
             by_login, by_account = self._indexes(new_lists)
+            n_pieces = sum(1 for p in new_lists.values() if p.kind == PIECE)
             with self.lock:
                 now = self.clock()
                 a = self.alloc
+                self._note_piece_rejects(rejected, now)
+                addrs = self._piece_addrs(new_lists.values(), old_lists)
                 for lid in [lid for lid in a.by_list if lid not in new_lists]:
                     a.release_list(lid, "list_deleted", now)
+                for lid in kind_changed:
+                    a.release_list(lid, "kind_changed", now)
                 for lid in gone:
                     if self.rejects.pop(lid, None) is not None:
                         self.dirty_rejects.add(lid)
@@ -1120,6 +1368,7 @@ class Engine:
                 self.dirty_lists.update(dirty_lists)
                 self.accounts, self.lists = new_accounts, new_lists
                 self.by_login, self.by_account = by_login, by_account
+                self.n_pieces = n_pieces
                 # A8: a released account keeps nothing reserved and loses nothing either:
                 # its lines' static addresses are derived and come back with a top-up
                 for lid in mode_changed:
@@ -1130,6 +1379,8 @@ class Engine:
                     p = new_lists.get(lid)
                     if p is None:
                         r = "no_list"
+                    elif p.kind == PIECE:
+                        r = "piece"  # a piece's address is fixed by its pieceNet
                     elif not a.configured:
                         r = "not_ready"
                     else:
@@ -1149,6 +1400,7 @@ class Engine:
             "seq": seq,
             "transitions": t,
             "static": {"adopted": adopted, "kept": kept, "refused": refused},
+            "pieces": {"accepted": n_pieces, "rejected": rejected, "addrs": addrs},
         }
 
     def _forget_accounts(self, ids):
@@ -1174,6 +1426,28 @@ class Engine:
                 if (holder is not None and holder.id != p.id) or batch_logins.get(p.login, p.id) != p.id:
                     raise _bad("duplicate login %s" % p.login)
                 batch_logins[p.login] = p.id
+            # A13-I per-record checks: a refused record changes nothing (the list keeps
+            # its previous record, if any)
+            delta_accounts = {a.id: a for a in accs}
+
+            def account_of(aid):
+                return delta_accounts[aid] if aid in delta_accounts else self.accounts.get(aid)
+
+            live = [p for p in lsts if p.status != "deleted"]
+            kept_nets, incumbent = {}, {}
+            if any(p.kind == PIECE for p in live):
+                op_ids = {p.id for p in lsts}
+                for q in self.lists.values():
+                    if q.kind == PIECE:
+                        if q.id in op_ids:
+                            incumbent[q.id] = q.piece_net
+                        else:
+                            kept_nets[q.piece_net] = q.id
+            rejected = self._check_lists(live, account_of, kept_nets, incumbent)
+            if rejected:
+                rejected_ids = {r["id"] for r in rejected}
+                lsts = [p for p in lsts if p.status == "deleted" or p.id not in rejected_ids]
+            accepted_lists = [p for p in lsts if p.status != "deleted"]
             t = {"accounts": [], "lists": []}
             for a in accs:
                 old = self.accounts.get(a.id)
@@ -1189,6 +1463,8 @@ class Engine:
                     self._list_transition(old, p, t)
             with self.lock:
                 now = self.clock()
+                self._note_piece_rejects(rejected, now)
+                addrs = self._piece_addrs(accepted_lists, self.lists)
                 for a in accs:
                     old = self.accounts.get(a.id)
                     self.accounts[a.id] = a
@@ -1196,6 +1472,10 @@ class Engine:
                         self.dirty_accounts[a.id] = a
                 for p in lsts:
                     old = self.lists.get(p.id)
+                    if old is not None and old.kind == PIECE:
+                        self.n_pieces -= 1
+                    if p.status != "deleted" and p.kind == PIECE:
+                        self.n_pieces += 1
                     if old is not None:
                         if self.by_login.get(old.login) is old:
                             del self.by_login[old.login]
@@ -1217,12 +1497,23 @@ class Engine:
                     self.by_account.setdefault(p.account_id, set()).add(p.id)
                     if old is None or old.row() != p.row():
                         self.dirty_lists[p.id] = p
-                        if old is not None and _mode_key(old) != _mode_key(p):
+                        if old is not None and old.kind != p.kind:
+                            self.alloc.release_list(p.id, "kind_changed", now)
+                        elif old is not None and _mode_key(old) != _mode_key(p):
                             self.alloc.forget_mode_lines(p.id)
                 self.seq = seq
                 self.dirty_meta["seq"] = str(seq)
             self._durable()
-        return {"epoch": self.epoch, "seq": seq, "transitions": t}
+        return {
+            "epoch": self.epoch,
+            "seq": seq,
+            "transitions": t,
+            "pieces": {
+                "accepted": sum(1 for p in accepted_lists if p.kind == PIECE),
+                "rejected": rejected,
+                "addrs": addrs,
+            },
+        }
 
     def op_heartbeat(self, req):
         at = _num(req, "at")
@@ -1285,6 +1576,8 @@ class Engine:
                 acct = self.accounts.get(aid)
                 if acct is None:
                     raise CtlRefused("unknown_account", accountId=aid)
+                if acct.kind == PIECE:
+                    return {"ok": True, "ignored": "piece"}  # A13-I: never quota-blocked
                 if acct.local_blocked != blocked:
                     acct.local_blocked = blocked
                     self.dirty_accounts[aid] = acct
@@ -1404,6 +1697,7 @@ class Engine:
         "rejects": op_rejects,
         "reserve_nets": op_reserve_nets,
         "release_nets": op_release_nets,
+        "reserved": op_reserved,
         "avoid": op_avoid,
     }
 

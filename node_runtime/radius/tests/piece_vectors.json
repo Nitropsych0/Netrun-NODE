@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "derivation": [
+    "addr = prefix48 | (pieceNet << 64) | iid",
+    "iid = I3 tag (tag.encrypt) of (listId, r16), the first j = 0, 1, ... with iid >= 2^32",
+    "r16 = HMAC_SHA256(key, 'netrun-pergb-pick-r' 00 'piece' 00 listId(4 bytes, big) 00 00 j(4 bytes, big))[0:2]"
+  ],
+  "cases": [
+    {
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "prefix": "2001:db8:aa::/48",
+      "vectors": [
+        {
+          "listId": 1,
+          "pieceNet": 0,
+          "j": 0,
+          "r16": 38493,
+          "iid": "e6beae479d61eabd",
+          "addr": "2001:db8:aa:0:e6be:ae47:9d61:eabd"
+        },
+        {
+          "listId": 2,
+          "pieceNet": 1,
+          "j": 0,
+          "r16": 42169,
+          "iid": "bdbfa13b022b455e",
+          "addr": "2001:db8:aa:1:bdbf:a13b:22b:455e"
+        },
+        {
+          "listId": 77,
+          "pieceNet": 35391,
+          "j": 0,
+          "r16": 42265,
+          "iid": "6f967b53db1755d4",
+          "addr": "2001:db8:aa:8a3f:6f96:7b53:db17:55d4"
+        },
+        {
+          "listId": 4096,
+          "pieceNet": 65534,
+          "j": 0,
+          "r16": 16357,
+          "iid": "6b7324a28dcc7587",
+          "addr": "2001:db8:aa:fffe:6b73:24a2:8dcc:7587"
+        },
+        {
+          "listId": 4294967295,
+          "pieceNet": 4660,
+          "j": 0,
+          "r16": 35752,
+          "iid": "db6e3eff3cab745e",
+          "addr": "2001:db8:aa:1234:db6e:3eff:3cab:745e"
+        },
+        {
+          "listId": 123456,
+          "pieceNet": 66,
+          "j": 0,
+          "r16": 22595,
+          "iid": "fff2bbbf318f863f",
+          "addr": "2001:db8:aa:42:fff2:bbbf:318f:863f"
+        }
+      ]
+    },
+    {
+      "key": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+      "prefix": "2602:f2dc:a9::/48",
+      "vectors": [
+        {
+          "listId": 1,
+          "pieceNet": 0,
+          "j": 0,
+          "r16": 26574,
+          "iid": "c95e2f08cfbaf5e4",
+          "addr": "2602:f2dc:a9:0:c95e:2f08:cfba:f5e4"
+        },
+        {
+          "listId": 2,
+          "pieceNet": 1,
+          "j": 0,
+          "r16": 2824,
+          "iid": "0d5e4f430ac0e212",
+          "addr": "2602:f2dc:a9:1:d5e:4f43:ac0:e212"
+        },
+        {
+          "listId": 77,
+          "pieceNet": 35391,
+          "j": 0,
+          "r16": 26267,
+          "iid": "9dc69747f7cf8b70",
+          "addr": "2602:f2dc:a9:8a3f:9dc6:9747:f7cf:8b70"
+        },
+        {
+          "listId": 4096,
+          "pieceNet": 65534,
+          "j": 0,
+          "r16": 42396,
+          "iid": "0da96adad26f033d",
+          "addr": "2602:f2dc:a9:fffe:da9:6ada:d26f:33d"
+        },
+        {
+          "listId": 4294967295,
+          "pieceNet": 4660,
+          "j": 0,
+          "r16": 42106,
+          "iid": "5298be5dba035c70",
+          "addr": "2602:f2dc:a9:1234:5298:be5d:ba03:5c70"
+        },
+        {
+          "listId": 123456,
+          "pieceNet": 66,
+          "j": 0,
+          "r16": 9719,
+          "iid": "c87be11e43049d6e",
+          "addr": "2602:f2dc:a9:42:c87b:e11e:4304:9d6e"
+        }
+      ]
+    }
+  ]
+}
