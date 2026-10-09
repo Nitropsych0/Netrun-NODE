@@ -503,7 +503,7 @@ rc="$(NORM_DIR="$ND" run_tool "$R" --apply --only fingerprint)"
 cmp -s "$REPO_ROOT/deploy/node/99-zz-netrun-tcp.conf" "$R/etc/sysctl.d/99-zz-netrun-tcp.conf" || fail "TCP signature file"
 ! grep -qE 'tcp_timestamps|tcp_rmem' "$R/etc/sysctl.conf" || fail "pinned keys left in /etc/sysctl.conf"
 grep -qx 'net.ipv4.icmp_echo_ignore_all = 1' "$R/etc/sysctl.conf" && grep -qx 'vm.swappiness = 10' "$R/etc/sysctl.conf" || fail "unrelated sysctl.conf lines removed"
-ls "$R/etc/" | grep -q '^sysctl.conf.bak-fingerprint-' || fail "no sysctl.conf backup"
+compgen -G "$R/etc/sysctl.conf.bak-fingerprint-*" > /dev/null || fail "no sysctl.conf backup"
 grep -qx "sysctl -p $R/etc/sysctl.d/99-zz-netrun-tcp.conf" "$CALLS" || fail "pins not applied at runtime"
 # The empty table (and its chains) stays even though the deployed generator
 # no longer mentions it: a rollback to a pre-N2 generator needs it.
