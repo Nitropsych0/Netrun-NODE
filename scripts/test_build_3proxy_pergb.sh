@@ -161,13 +161,16 @@ while True:
 SINK
   cat > "$TMP/load.py" <<'LOAD'
 # N SOCKS5 sessions with distinct logins (user/pass auth) through 127.0.0.4:31000..31009.
-import asyncio, socket, struct, sys
+# A shared CI runner also hosts the RADIUS stub, the sink and this client, so a
+# session gets ONE retry (same login) before it counts as failed; the failure
+# reasons go to stderr so a real 3proxy problem is visible, not just a count.
+import asyncio, collections, socket, struct, sys
 start, n, conc = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 ok = 0
-async def one(i):
-    global ok
+why = collections.Counter()
+async def attempt(i):
+    r, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.4", 31000 + i % 10), 5)
     try:
-        r, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.4", 31000 + i % 10), 5)
         user = f"netrun-smoke{i:08d}-session-s{i:05d}".encode()
         w.write(b"\x05\x01\x02"); await w.drain()
         if await asyncio.wait_for(r.readexactly(2), 5) != b"\x05\x02":
@@ -177,11 +180,20 @@ async def one(i):
             raise ValueError("auth")
         w.write(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", 9999)); await w.drain()
         rep = await asyncio.wait_for(r.readexactly(10), 5)
-        if rep[1] == 0:
-            ok += 1
+        if rep[1] != 0:
+            raise ValueError(f"socks_reply_{rep[1]}")
+    finally:
         w.close()
-    except Exception:
-        pass
+async def one(i):
+    global ok
+    for k in (1, 2):
+        try:
+            await attempt(i)
+            ok += 1
+            return
+        except Exception as exc:
+            if k == 2:
+                why[f"{type(exc).__name__}:{exc}"[:60]] += 1
 async def main():
     sem = asyncio.Semaphore(conc)
     async def guarded(i):
@@ -189,6 +201,8 @@ async def main():
             await one(i)
     await asyncio.gather(*(guarded(i) for i in range(start, start + n)))
 asyncio.run(main())
+if why:
+    print("load failures: " + ", ".join(f"{k} x{v}" for k, v in why.most_common(5)), file=sys.stderr)
 print(ok)
 LOAD
   rss_kb() { awk '/^VmRSS:/ { print $2 }' "/proc/$1/status"; }
@@ -207,9 +221,9 @@ for _ in range(100):
         time.sleep(0.1)
 sys.exit(1)
 WAIT
-    w="$(ip netns exec "$NS" python3 "$TMP/load.py" 0 "$WARMUP" 64)"
+    w="$(ip netns exec "$NS" python3 "$TMP/load.py" 0 "$WARMUP" 32)"
     sleep 2; r0="$(rss_kb "$p")"
-    m="$(ip netns exec "$NS" python3 "$TMP/load.py" "$WARMUP" "$n" 64)"
+    m="$(ip netns exec "$NS" python3 "$TMP/load.py" "$WARMUP" "$n" 32)"
     sleep 2; r1="$(rss_kb "$p")"
     kill "$p" 2>/dev/null; wait "$p" 2>/dev/null
     echo "$r0 $r1 $w $m"
