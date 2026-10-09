@@ -777,8 +777,8 @@ per_request / timer / link / static with link epochs (A10), the «липкая
 (A7/A9) and `release_nets` without a cool-down (A6).
 
 Deploying a RADIUS change: `/opt/netrun/radius` is a copy made by
-`deploy/node/install_pergb.sh` (re-run it alone after the checkout moved;
-it restarts nothing), then `systemctl restart netrun-radius.service` (the
+`deploy/node/install_pergb.sh` (re-run it alone after the checkout moved; it
+enables and starts nothing), then `systemctl restart netrun-radius.service` (the
 socket keeps the queue). The state DB is schema 2: a schema-1 file is moved
 aside like a corrupt one (new epoch, the orchestrator re-pushes everything).
 
