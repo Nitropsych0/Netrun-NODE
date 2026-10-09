@@ -12,8 +12,14 @@
 #                          {ok:true} (the agent fails closed since 2026-10-08;
 #                          install_node_v2.sh generates a key). 3proxy is NOT
 #                          restarted (KillMode=process).
-#   agent-firewall <ip>    A3: 8085 reachable only from the orchestrator <ip>
-#                          and localhost. Persisted to /etc/nftables.conf.
+#   agent-firewall <ip> [--dry-run]
+#                          A3: the agent's ports — 8085 (plain) and 8086 (the
+#                          pay-per-GB TLS listener, plan D16) — reachable only
+#                          from the orchestrator <ip> and localhost; one atomic
+#                          `nft -f`, persisted to /etc/nftables.conf. Without
+#                          <ip>: re-applied with the IP the live table already
+#                          allows (a node guarded before 8086 existed).
+#                          --dry-run prints the ruleset and changes nothing.
 #   drop-ssh-key <comment> A6: remove authorized_keys lines ending in <comment>.
 #
 #   Audit 2026-10-08 (all idempotent; nothing restarts 3proxy):
@@ -42,8 +48,10 @@
 #                          test lookup; a failed lookup puts the old config back.
 #   secure                 all of the above for a node: netrun-nft-persist
 #                          install (atomic ruleset saves, boot fallback),
-#                          netrun-proxy-guard apply, perms, ssh, dns-egress.
-#                          Called by install_node_v2.sh and node_followup_v2.sh.
+#                          netrun-proxy-guard apply, perms, ssh, dns-egress;
+#                          a live agent guard that misses 8086 is re-applied
+#                          for the IP it allows. Called by install_node_v2.sh
+#                          and node_followup_v2.sh.
 #
 # Why A1/A2: 3proxy's `users` list is GLOBAL — `flush` resets the ACLs, not the
 # users — so the old per-proxy `allow * *` let every login of a batch file in
@@ -180,7 +188,11 @@ cmd_status() {
   for f in $(cfg_files); do total=$((total + 1)); cfg_is_open "$f" && open=$((open + 1)); done
   log "A1/A2 3proxy configs: $open of $total still open"
   if [ -f "$AGENT_KEY_FILE" ]; then log "A3 agent key: set"; else log "A3 agent key: NOT set"; fi
-  if nft list table inet "$NFT_GUARD_TABLE" >/dev/null 2>&1; then log "A3 8085 firewall: on"; else log "A3 8085 firewall: OFF"; fi
+  if nft list table inet "$NFT_GUARD_TABLE" >/dev/null 2>&1; then
+    if agent_guard_covers_all; then log "A3 agent firewall ($AGENT_PORTS): on"; else log "A3 agent firewall: on, but not for every agent port ($AGENT_PORTS) — rerun: netrun-harden agent-firewall"; fi
+  else
+    log "A3 agent firewall ($AGENT_PORTS): OFF"
+  fi
   log "A6 authorized_keys comments: $(awk '{print $NF}' /root/.ssh/authorized_keys 2>/dev/null | tr '\n' ' ')"
   log "2026-10-08 credential files readable by others: $(open_cred_paths | wc -l | tr -d ' ')"
   if grep -q "meta skuid 65535 jump" <<< "$(nft list table inet netrun_proxy_guard 2>/dev/null)"; then log "2026-10-08 3proxy egress guard: on"; else log "2026-10-08 3proxy egress guard: OFF (or the old skuid != form)"; fi
@@ -237,22 +249,71 @@ cmd_agent_key() {
   [ "$open" = "401" ] && [ "$locked" = "200" ] || die "agent key check failed"
 }
 
-cmd_agent_firewall() {
-  local ip="${1:-}"
-  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "usage: agent-firewall <orchestrator IPv4>"
-  nft delete table inet "$NFT_GUARD_TABLE" 2>/dev/null || true
-  nft -f - <<NFT
+# The agent's TCP ports the guard covers: 8085 (plain HTTP) and 8086 (the
+# pay-per-GB TLS listener: /pergb/* for the orchestrator only, plan D16).
+AGENT_PORTS="8085, 8086"
+
+# The guard table for orchestrator IPv4 $1, as ONE nft transaction: the
+# add + delete + definition idiom replaces whatever table is there (or none)
+# without a moment in which the agent ports are open to everyone.
+agent_guard_nft() {
+  cat <<NFT
+table inet $NFT_GUARD_TABLE
+delete table inet $NFT_GUARD_TABLE
 table inet $NFT_GUARD_TABLE {
   chain input {
     type filter hook input priority -5; policy accept;
     iifname "lo" accept
-    tcp dport 8085 ip saddr $ip accept
-    tcp dport 8085 drop
+    tcp dport { $AGENT_PORTS } ip saddr $1 accept
+    tcp dport { $AGENT_PORTS } drop
   }
 }
 NFT
+}
+
+# 0 for a dotted-quad IPv4 (every octet 0..255).
+is_ipv4() {
+  local IFS=. o
+  [[ "${1:-}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  for o in $1; do [ "$((10#$o))" -le 255 ] || return 1; done
+}
+
+# The orchestrator IPv4 the live guard table lets in, or nothing.
+# (no `producer | head` under pipefail: the whole listing is read first)
+agent_guard_ip() {
+  local t
+  t="$(nft list table inet "$NFT_GUARD_TABLE" 2>/dev/null)" || return 0
+  sed -n 's/.*ip saddr \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\) accept.*/\1/p' <<< "$t" | sed -n 1p
+}
+
+# 0 when the live guard table drops every agent port (8086 included).
+agent_guard_covers_all() {
+  local t
+  t="$(nft list table inet "$NFT_GUARD_TABLE" 2>/dev/null)" || return 1
+  grep -q 'dport { 8085, 8086 } drop' <<< "$t" || grep -q 'dport { 8085-8086 } drop' <<< "$t"
+}
+
+cmd_agent_firewall() {
+  local ip="" dry=0 a
+  for a in "$@"; do
+    case "$a" in
+      --dry-run) dry=1 ;;
+      *) ip="$a" ;;
+    esac
+  done
+  if [ -z "$ip" ]; then
+    ip="$(agent_guard_ip)"
+    [ -n "$ip" ] || die "usage: agent-firewall <orchestrator IPv4> [--dry-run] (no live guard table to take the IP from)"
+    log "agent-firewall: re-applying for $ip (the IP the live table allows)"
+  fi
+  is_ipv4 "$ip" || die "usage: agent-firewall <orchestrator IPv4> [--dry-run]"
+  if [ "$dry" = 1 ]; then
+    agent_guard_nft "$ip"
+    return 0
+  fi
+  agent_guard_nft "$ip" | nft -f - || die "agent-firewall: nft refused the guard table (nothing changed)"
   nft_persist || log "WARNING: the ruleset was not persisted (rerun: netrun-nft-persist save)"
-  log "8085 now open only to $ip and localhost (persisted to /etc/nftables.conf)"
+  log "agent ports ($AGENT_PORTS) now open only to $ip and localhost (persisted to /etc/nftables.conf)"
 }
 
 # KEY DEFAULT -> the environment wins, then $NETRUN_ENV (KEY=VALUE lines).
@@ -445,6 +506,10 @@ cmd_secure() {
   ( cmd_perms ) || rc=1
   ( cmd_ssh ) || rc=1
   ( cmd_dns_egress ) || rc=1
+  # a node guarded before the pay-per-GB TLS port existed: 8086 joins 8085
+  if [ -n "$(agent_guard_ip)" ] && ! agent_guard_covers_all; then
+    ( cmd_agent_firewall ) || rc=1
+  fi
   nft_persist || { log "WARNING: the ruleset was not persisted (the previous /etc/nftables.conf is kept)"; rc=1; }
   return "$rc"
 }
@@ -472,5 +537,5 @@ case "${1:-}" in
   dns-egress) cmd_dns_egress ;;
   secure) cmd_secure ;;
   rewrite-preview) shift; rewrite_cfg "$1" ;;   # test hook: print the rewrite of one cfg
-  *) sed -n '2,52p' "$0"; exit 2 ;;
+  *) sed -n '2,59p' "$0"; exit 2 ;;
 esac

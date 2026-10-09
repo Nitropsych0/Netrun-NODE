@@ -34,7 +34,9 @@
 #   1. outside the sync lock, under the ACME lock (/run/netrun/https-acme.lock,
 #      also taken by the IP renewal: one HTTP-01 client on :80 at a time): every
 #      listed name whose A record (the node's own resolver) is exactly the
-#      public IPv4 gets `lego run` (default profile, LEGO_DIR kept, so a renewal
+#      public IPv4 — or, with pay-per-GB option B, exactly the dedicated per-GB
+#      IPv4 of /etc/netrun-pergb/enable.json (its host names point there; its
+#      :80 answers HTTP-01 too) — gets `lego run` (default profile, LEGO_DIR kept, so a renewal
 #      is `run` again) once its certificate is missing or within
 #      NETRUN_HTTPS_HOST_RENEW_DAYS (30) of expiry. A name that does not point
 #      here is skipped and never sent to the CA (failed validations count
@@ -152,6 +154,36 @@ nft_persist() {
 
 public_ipv4() {
   ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}'
+}
+
+# Pay-per-GB v2, option B (plan §3.9, lane L9) — the dedicated per-GB IPv4
+# of ${NETRUN_PERGB_ENABLE_FILE:-/etc/netrun-pergb/enable.json} when it is
+# not the public one ($1); nothing otherwise (no per-GB, option A, unreadable).
+# Same fields, same order as the agent's pergb_shield.js.
+pergb_ipv4() {
+  local f="${NETRUN_PERGB_ENABLE_FILE:-/etc/netrun-pergb/enable.json}"
+  [ -r "$f" ] || return 0
+  python3 -I - "$f" "${1:-}" <<'PY' 2>/dev/null || true
+import ipaddress, json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        e = json.load(fh)
+except Exception:
+    sys.exit()
+if not isinstance(e, dict) or e.get("enabled") is False:
+    sys.exit()
+for k in ("pergbIpv4", "dedicatedIpv4", "pergb_ipv4", "ipv4", "egressIpv4", "egress_ipv4"):
+    v = e.get(k)
+    if not isinstance(v, str):
+        continue
+    try:
+        a = str(ipaddress.IPv4Address(v.strip()))
+    except ValueError:
+        continue
+    if a != sys.argv[2]:
+        print(a)
+    sys.exit()
+PY
 }
 
 # ── certificate ───────────────────────────────────────────────────
@@ -272,16 +304,18 @@ file_sha256() {
 # lego 5 `run` decides about a renewal itself: what happened is read from the
 # certificate file (sha256 before / after), never assumed.
 certs_obtain() {
-  local ip="$1" h addrs days crt errf rc failed=0 before after msg
+  local ip="$1" h addrs days crt errf rc failed=0 before after msg pergb
   [ -n "$ip" ] || { log "ERROR: cannot detect the public IPv4 — no hostname certificate"; return 1; }
   days="$(netrun_setting NETRUN_HTTPS_HOST_RENEW_DAYS 30)"
   case "$days" in ''|*[!0-9]*) days=30 ;; esac
+  # pay-per-GB option B: a name may point at the dedicated per-GB IPv4 instead
+  pergb="$(pergb_ipv4 "$ip")"
   for h in $(https_hostnames); do
     addrs="$(resolve_ipv4 "$h" | tr '\n' ' ')"
     addrs="${addrs% }"
-    if [ "$addrs" != "$ip" ]; then
-      log "skip $h: its A record is ${addrs:-missing}, not $ip — not sent to the CA"
-      host_note "$h" "dns: A ${addrs:-missing}, not $ip"
+    if [ "$addrs" != "$ip" ] && { [ -z "$pergb" ] || [ "$addrs" != "$pergb" ]; }; then
+      log "skip $h: its A record is ${addrs:-missing}, not $ip${pergb:+ or $pergb (per-GB)} — not sent to the CA"
+      host_note "$h" "dns: A ${addrs:-missing}, not $ip${pergb:+ or $pergb}"
       continue
     fi
     crt="$LEGO_DIR/certificates/$h.crt"

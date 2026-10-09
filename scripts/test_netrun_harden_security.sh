@@ -3,7 +3,9 @@
 # files root-only), ssh (keys only, never without a root key, sshd -t),
 # dns-egress (unbound recursion from the node's own last /64 of the routed
 # prefix, IPv4 unchanged, verified with a lookup, put back on failure),
-# agent-firewall persisting through netrun-nft-persist. ip / nft / systemctl /
+# agent-firewall persisting through netrun-nft-persist and covering the
+# pay-per-GB TLS port 8086 (one atomic nft -f; --dry-run; re-apply with the
+# live table's IP; `secure` adds 8086 to an older guard). ip / nft / systemctl /
 # unbound-checkconf / dig / sshd are stubs on PATH; python3 is real. No root.
 #   bash scripts/test_netrun_harden_security.sh
 set -uo pipefail
@@ -58,6 +60,11 @@ EOF
 cat > "$STUB/nft" <<'EOF'
 #!/usr/bin/env bash
 echo "nft $*" >> "$STUB_LOG"
+case "$*" in
+  "-f -") cat > "$TMP_FLAGS/nft_stdin" ;;
+  "list table inet netrun_agent_guard") [ -f "$TMP_FLAGS/guard_table" ] && cat "$TMP_FLAGS/guard_table" || exit 1 ;;
+esac
+exit 0
 EOF
 chmod +x "$STUB"/*
 export TMP_FLAGS="$TMP/flags"; mkdir -p "$TMP_FLAGS"
@@ -156,5 +163,34 @@ out="$(run agent-firewall 95.217.98.125)" || fail "agent-firewall: $out"
 grep -qx 'nft-persist save' "$STUB_LOG" || fail "agent-firewall did not persist through netrun-nft-persist: $(cat "$STUB_LOG")"
 grep -q 'list ruleset' "$STUB_LOG" && fail "agent-firewall dumped the ruleset itself"
 ok "agent-firewall: persisted through netrun-nft-persist"
+
+# ── 5. pay-per-GB: the agent guard covers 8086 (plan D16) ─────────
+grep -q 'tcp dport { 8085, 8086 } ip saddr 95.217.98.125 accept' "$TMP_FLAGS/nft_stdin" \
+  && grep -q 'tcp dport { 8085, 8086 } drop' "$TMP_FLAGS/nft_stdin" || fail "applied guard: $(cat "$TMP_FLAGS/nft_stdin")"
+grep -qx 'table inet netrun_agent_guard|delete table inet netrun_agent_guard|' <<< "$(head -n2 "$TMP_FLAGS/nft_stdin" | tr '\n' '|')" \
+  || fail "the guard is not replaced in one transaction: $(head -n3 "$TMP_FLAGS/nft_stdin")"
+grep -q '^nft delete table' "$STUB_LOG" && fail "a separate delete leaves the agent open between two nft calls"
+: > "$STUB_LOG"; rm -f "$TMP_FLAGS/nft_stdin"
+out="$(run agent-firewall 95.217.98.125 --dry-run)" || fail "dry-run: $out"
+echo "$out" | grep -q 'tcp dport { 8085, 8086 } ip saddr 95.217.98.125 accept' && echo "$out" | grep -q 'tcp dport { 8085, 8086 } drop' \
+  || fail "dry-run text: $out"
+echo "$out" | grep -q 'iifname "lo" accept' || fail "dry-run: localhost (the generator's reserve_nets call) must stay open"
+[ ! -s "$STUB_LOG" ] && [ ! -e "$TMP_FLAGS/nft_stdin" ] || fail "dry-run changed something: $(cat "$STUB_LOG")"
+run agent-firewall 999.1.2.3 >/dev/null 2>&1 && fail "a bad IPv4 accepted"
+run agent-firewall >/dev/null 2>&1 && fail "no IP and no live table: must refuse"
+# an older guard (8085 only): `agent-firewall` without an IP re-applies with its IP; `status` and `secure` notice
+printf 'table inet netrun_agent_guard {\n\tchain input {\n\t\ttcp dport 8085 ip saddr 95.217.98.125 accept\n\t\ttcp dport 8085 drop\n\t}\n}\n' > "$TMP_FLAGS/guard_table"
+out="$(run status 2>&1)"; echo "$out" | grep -q 'not for every agent port' || fail "status on an 8085-only guard: $out"
+: > "$STUB_LOG"
+out="$(run agent-firewall)" || fail "refresh: $out"
+grep -q 'ip saddr 95.217.98.125 accept' "$TMP_FLAGS/nft_stdin" && grep -q '8086' "$TMP_FLAGS/nft_stdin" || fail "refresh: $(cat "$TMP_FLAGS/nft_stdin")"
+rm -f "$TMP_FLAGS/nft_stdin"
+grep -qx REFRESH <<< "$(NETRUN_HARDEN_SOURCED=1 bash -c 'source <(sed "/^case \"\${1:-}\" in/,\$d" "$1"); if [ -n "$(agent_guard_ip)" ] && ! agent_guard_covers_all; then echo REFRESH; fi' _ "$H")" \
+  || fail "secure's check: an 8085-only guard must be refreshed"
+printf 'table inet netrun_agent_guard {\n\tchain input {\n\t\ttcp dport { 8085, 8086 } ip saddr 95.217.98.125 accept\n\t\ttcp dport { 8085, 8086 } drop\n\t}\n}\n' > "$TMP_FLAGS/guard_table"
+grep -qx COVERED <<< "$(NETRUN_HARDEN_SOURCED=1 bash -c 'source <(sed "/^case \"\${1:-}\" in/,\$d" "$1"); agent_guard_covers_all && echo COVERED' _ "$H")" \
+  || fail "a guard with 8086 counts as covered"
+rm -f "$TMP_FLAGS/guard_table"
+ok "agent-firewall: 8085 + 8086 only from the orchestrator (one transaction, --dry-run, refresh from the live table, secure upgrades an 8085-only guard)"
 
 echo "PASS ($PASS)"
