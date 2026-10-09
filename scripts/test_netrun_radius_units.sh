@@ -85,7 +85,8 @@ systemctl start netrun-radius.socket
 [[ "$(systemctl is-active netrun-radius.service)" != active ]] && ok "service idle until the first datagram"
 radclient --user netrun-nobody --password x --nas-port 31000 --count 1 >/dev/null || true
 if wait_active; then ok "first datagram starts netrun-radius.service"; else bad "socket activation"; fi
-[[ "$(ps -o user= -p "$(mainpid)")" == netrun-radius ]] && ok "runs as netrun-radius" || bad "user"
+# ps -o user= truncates names over 8 characters: compare uids
+[[ "$(ps -o uid= -p "$(mainpid)" | tr -d ' ')" == "$(id -u netrun-radius)" ]] && ok "runs as netrun-radius" || bad "user"
 ms="$(ready_ms)"; echo "info READY (empty state): ${ms} ms"
 [[ $ms -le $((1000 * SLACK)) ]] && ok "READY <= 1 s (empty state)" || bad "READY ${ms} ms"
 [[ "$(stat -c %a /run/netrun-radius/ctl.sock)" == 600 ]] && ok "ctl.sock is 0600" || bad "ctl.sock mode"

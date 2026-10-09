@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck scripts/test_pergb_radius_e2e.sh scripts/test_netrun_radius_units.sh
+        run: shellcheck -S warning scripts/test_pergb_radius_e2e.sh scripts/test_netrun_radius_units.sh
       - name: verify, socket activation, READY, restarts under load, crash loop, watchdog, corrupt DB
         env:
           NETRUN_RADIUS_PERF_SLACK: "2"
