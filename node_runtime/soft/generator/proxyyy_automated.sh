@@ -37,6 +37,13 @@ function netrun_setting() {
   printf '%s' "${v:-$def}"
 }
 
+# Pay-per-GB v2, AMENDMENT A1 — the per-GB pool helpers (scripts/lib/
+# pergb_pool.sh; routed_ipv6_addresses). A node without the lib is fine while
+# it has no pool file; with one, routed_ipv6_addresses refuses (fail closed).
+PERGB_POOL_LIB="${NETRUN_PERGB_POOL_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)/../../../scripts/lib/pergb_pool.sh}"
+# shellcheck source=../../../scripts/lib/pergb_pool.sh
+if [ -f "$PERGB_POOL_LIB" ]; then . "$PERGB_POOL_LIB"; fi
+
 # Program help info for users
 function usage() { echo "Usage: $0 [-s | --subnet <16|32|48|64|80|96|112> proxy subnet (default 64)] 
                           [-c | --proxy-count <number> count of proxies] 
@@ -388,7 +395,8 @@ function create_random_string() {
 }
 
 function kill_3proxy() {
-  ps -ef | awk '/[3]proxy/{print $2}' | while read -r pid; do
+  # never the pay-per-GB 3proxy (its own binary 3proxy-pergb, own units)
+  ps -ef | awk '/[3]proxy/ && !/3proxy-pergb/ {print $2}' | while read -r pid; do
     kill $pid
   done;
 }
@@ -680,17 +688,27 @@ function random_ipv6_suffixes() {
 # /64, so two proxies in one /64 look like one client) and never the node's own
 # last /64 of the prefix, the low 64 bits random.
 # Exit 1 when the prefix has fewer free /64s than COUNT.
+#
+# Pay-per-GB v2, AMENDMENT A1 — on a per-GB node (the pool file
+# ${NETRUN_PERGB_POOL_FILE:-/etc/netrun/pergb-pool.conf}, scripts/lib/
+# pergb_pool.sh) the /48 is one pool owned by netrun-radius: a /64 inside its
+# POOL range is taken ONLY from the agent's reserve_nets (one per address,
+# ref gen:<start port>:<job>), never picked here; /64s of PREFIX outside POOL
+# (none with the default 0000-fffe) are picked here as before. When the
+# reservation fails (or the pool file / the helpers are unusable) the batch
+# fails: no blind pick, the orchestrator's refill retries later.
 function routed_ipv6_addresses() {
-  local prefix="$1" count="$2" dir="$3" own="$4"
-  python3 - "$prefix" "$count" "$dir" "$own" <<'PY'
-import glob, ipaddress, json, os, random, sys
+  local prefix="$1" count="$2" dir="$3" own="$4" pool_prefix="" pool_range="" need=0 reserved="" rc=0 ref py
+  py="$(cat <<'PY'
+import glob, ipaddress, json, os, random, re, sys
 
-prefix = ipaddress.IPv6Network(sys.argv[1], strict=True)
-count, own = int(sys.argv[2]), os.path.abspath(sys.argv[4])
+mode, prefix_s, count_s, d, own_s, pool_prefix_s, pool_range_s, reserved_path = sys.argv[1:9]
+prefix = ipaddress.IPv6Network(prefix_s, strict=True)
+count, own = int(count_s), os.path.abspath(own_s)
 if not 32 <= prefix.prefixlen <= 64:
     sys.exit("routed prefix must be /32 .. /64")
 used = set()
-for path in glob.glob(os.path.join(sys.argv[3], "ipv6_*.list")):
+for path in glob.glob(os.path.join(d, "ipv6_*.list")):
     if os.path.abspath(path) == own:
         continue
     with open(path) as f:
@@ -702,14 +720,14 @@ for path in glob.glob(os.path.join(sys.argv[3], "ipv6_*.list")):
             if addr in prefix:
                 used.add(int(addr) >> 64)
 try:
-    with open(os.path.join(sys.argv[3], "egress_state.json")) as f:
+    with open(os.path.join(d, "egress_state.json")) as f:
         st = json.load(f)
 except (OSError, ValueError):
     st = {}
 st = st if isinstance(st, dict) else {}
 taken = [e.get("current") for e in (st.get("ports") or {}).values() if isinstance(e, dict)]
 taken += list(st.get("pool") or [])
-taken += [d.get("addr") for d in (st.get("draining") or []) if isinstance(d, dict)]
+taken += [x.get("addr") for x in (st.get("draining") or []) if isinstance(x, dict)]
 for raw in taken:
     try:
         addr = ipaddress.IPv6Address(str(raw))
@@ -723,20 +741,121 @@ base, nets = int(prefix.network_address) >> 64, 1 << (64 - prefix.prefixlen)
 # self-check leave from it (README, "Node's own /64"). Same rule: egress.js.
 if nets > 1:
     used.add(base + nets - 1)
-if nets - len(used) < count:
-    sys.exit(f"routed prefix {prefix}: {nets - len(used)} free /64 left, {count} needed")
+
+# AMENDMENT A1 — the per-GB pool: [plo, phi] absolute /64 keys (none = off).
+plo = phi = None
+if pool_prefix_s:
+    try:
+        pp = ipaddress.IPv6Network(pool_prefix_s.strip(), strict=False)
+    except ValueError:
+        sys.exit("per-GB pool: bad PREFIX %r" % pool_prefix_s)
+    if not 16 <= pp.prefixlen <= 63:
+        sys.exit("per-GB pool: PREFIX %s must be /16 .. /63" % pp)
+    pbase, pnets = int(pp.network_address) >> 64, 1 << (64 - pp.prefixlen)
+    lo, hi = 0, pnets - 2
+    if pool_range_s.strip():
+        m = re.fullmatch(r"\s*([0-9a-fA-F]{1,16})\s*-\s*([0-9a-fA-F]{1,16})\s*", pool_range_s)
+        if not m:
+            sys.exit("per-GB pool: bad POOL %r" % pool_range_s)
+        lo, hi = int(m.group(1), 16), int(m.group(2), 16)
+        if lo > hi or hi >= pnets:
+            sys.exit("per-GB pool: POOL %s is outside %s" % (pool_range_s, pp))
+        hi = min(hi, pnets - 2)
+    plo, phi = pbase + lo, pbase + hi
+in_pool = (lambda k: plo <= k <= phi) if plo is not None else (lambda k: False)
+
+# /64s of the prefix outside the pool and free: counted without walking a /32
+end = base + nets - 1
+inside = max(0, min(phi, end) - max(plo, base) + 1) if plo is not None else 0
+free_outside = nets - inside - len([k for k in used if base <= k <= end and not in_pool(k)])
+local_count = min(count, max(0, free_outside))
+need = count - local_count
+if mode == "need":
+    print(need)
+    sys.exit(0)
+
+lent = []
+if need:
+    if plo is None:
+        sys.exit("routed prefix %s: %d free /64 left, %d needed" % (prefix, free_outside, count))
+    with open(reserved_path) as f:
+        rows = [l.strip() for l in f if l.strip()]
+    for row in rows:
+        try:
+            # pergb_reserve_nets: decimal = a subnet id, 0x<hex> = a subnet
+            # id, anything with ':' = an address / "<net>/64"
+            if ":" in row:
+                k = int(ipaddress.IPv6Address(row.split("/")[0])) >> 64
+            elif re.fullmatch(r"\d+", row):
+                k = pbase + int(row)
+            elif re.fullmatch(r"0x[0-9a-f]{1,16}", row):
+                k = pbase + int(row[2:], 16)
+            else:
+                raise ValueError(row)
+        except ValueError:
+            sys.exit("per-GB pool: reserve_nets lent %r, not a /64" % row)
+        if not base <= k <= end:
+            sys.exit("per-GB pool: reserve_nets lent %s, outside %s" % (ipaddress.IPv6Network((k << 64, 64)), prefix))
+        if k == end and nets > 1:
+            sys.exit("per-GB pool: reserve_nets lent the node's own /64 %s — refusing" % ipaddress.IPv6Network((k << 64, 64)))
+        if k in used or k in lent:
+            sys.exit("per-GB pool: reserve_nets lent %s, which per-piece already uses (RADIUS's excluded set is behind) — refusing" % ipaddress.IPv6Network((k << 64, 64)))
+        lent.append(k)
+    if len(lent) != need:
+        sys.exit("per-GB pool: reserve_nets lent %d /64(s) for %d needed" % (len(lent), need))
 rng = random.SystemRandom()
-if nets <= 1 << 20:
-    picked = rng.sample([base + i for i in range(nets) if base + i not in used], count)
-else:
-    picked = set()
-    while len(picked) < count:
-        net = base + rng.randrange(nets)
-        if net not in used:
-            picked.add(net)
-for net in picked:
+picked = []
+if local_count:
+    if nets <= 1 << 20:
+        free = [k for k in range(base, end + 1) if k not in used and not in_pool(k)]
+        picked = rng.sample(free, local_count)
+    else:
+        got = set()
+        while len(got) < local_count:
+            k = base + rng.randrange(nets)
+            if k not in used and not in_pool(k):
+                got.add(k)
+        picked = list(got)
+for net in picked + lent:
     print(ipaddress.IPv6Address((net << 64) | rng.randrange(1, 1 << 64)))
 PY
+)"
+  local pool_file="${NETRUN_PERGB_POOL_FILE:-/etc/netrun/pergb-pool.conf}"
+  if [ -e "$pool_file" ]; then
+    if ! declare -F pergb_pool_state >/dev/null || ! declare -F pergb_reserve_nets >/dev/null; then
+      echo "routed prefix $prefix: per-GB pool file $pool_file present but scripts/lib/pergb_pool.sh is not loaded — refusing to pick /64s" >&2
+      return 1
+    fi
+    case "$(pergb_pool_state)" in
+      on)
+        pool_prefix="$(pergb_pool_value PREFIX)"
+        pool_range="$(pergb_pool_value POOL)"
+        if [ -z "$pool_prefix" ]; then
+          echo "routed prefix $prefix: per-GB pool file $pool_file has no PREFIX — refusing to pick /64s" >&2
+          return 1
+        fi ;;
+      off) ;;
+      *)
+        echo "routed prefix $prefix: per-GB pool file $pool_file is unreadable — refusing to pick /64s" >&2
+        return 1 ;;
+    esac
+  fi
+  if [ -n "$pool_prefix" ]; then
+    need="$(python3 -c "$py" need "$prefix" "$count" "$dir" "$own" "$pool_prefix" "$pool_range" /dev/null)" || return 1
+    if [ "${need:-0}" -gt 0 ]; then
+      ref="$(basename "$own" .list)"
+      ref="gen:${ref#ipv6_}:$(printf '%s' "${NODE_AGENT_JOB_ID:-${JOB_ID:-$(date +%s)-$RANDOM}}" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-64)"
+      reserved="$(mktemp)" || return 1
+      if ! pergb_reserve_nets "$need" "$ref" > "$reserved"; then
+        rm -f "$reserved"
+        echo "routed prefix $prefix: the per-GB pool did not lend $need /64(s) (reserve_nets, ref $ref) — the batch is refused, nothing is picked blind" >&2
+        return 1
+      fi
+    fi
+  fi
+  python3 -c "$py" pick "$prefix" "$count" "$dir" "$own" "$pool_prefix" "$pool_range" "${reserved:-/dev/null}" || rc=$?
+  [ -n "$reserved" ] && rm -f "$reserved"
+  return "$rc"
 }
 
 # Every non-empty line of LIST is an address inside PREFIX (exit 0), else 1.

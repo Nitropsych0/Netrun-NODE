@@ -14,7 +14,13 @@
 #      and ONE `ip -6 addr` snapshot per batch (was one per address);
 #   5. the start-up script spawns through the spawn helper, refuses a missing
 #      address list, and NETRUN_ANCHOR_DEPRECATE=0 / off / OFF (env or
-#      netrun.env) drops preferred_lft 0.
+#      netrun.env) drops preferred_lft 0;
+#   6. pay-per-GB v2, AMENDMENT A1 — with the per-GB pool file a /64 of the
+#      pool comes ONLY from the agent's reserve_nets (a fake curl): never a
+#      blind pick, not even when the per-piece part of the prefix is nearly
+#      full; a failed / short / conflicting reservation fails the batch; the
+#      agent key travels in a 0600 header file, never on curl's argv; no pool
+#      file (or ENABLED=0) = the allocator as before.
 #   bash scripts/test_generator_flags.sh
 set -uo pipefail
 
@@ -247,5 +253,128 @@ rm -f "$TMP/batch"
 PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$TMP/hfalse/proxyserver/proxy-startup_18100.sh" >/dev/null 2>&1
 grep -qx 'address add 2001:db8:0:1::a/128 dev eth9 nodad' "$TMP/batch" || fail "NETRUN_ANCHOR_DEPRECATE=False: $(cat "$TMP/batch" 2>/dev/null)"
 ok "start-up script: spawn helper with the cfg (0600, umask 077), refuses a missing address list, NETRUN_ANCHOR_DEPRECATE=0/off/OFF/False adds preferred anchors"
+
+# ── 6. per-GB pool (AMENDMENT A1): reserve_nets only, fail closed ──
+eval "$(extract routed_ipv6_addresses)"
+# shellcheck source=lib/pergb_pool.sh
+. "$ROOT_DIR/scripts/lib/pergb_pool.sh"
+P6="$TMP/pergb"; mkdir -p "$P6/dir" "$P6/bin" "$P6/tmp"
+export NETRUN_PERGB_POOL_FILE="$P6/pergb-pool.conf" NETRUN_AGENT_KEY_FILE="$P6/20-api-key.conf"
+export CURL_LOG="$P6/curl.argv" CURL_BODIES="$P6/curl.bodies" CURL_SEEN="$P6/curl.seen" FAKE_REPLY="$P6/reply.json"
+printf '[Service]\nEnvironment=NODE_AGENT_API_KEY=k3y-from-dropin\n' > "$NETRUN_AGENT_KEY_FILE"
+cat > "$P6/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+# fake curl: the agent's POST /pergb/reserve_nets
+printf '%s\n' "$*" >> "$CURL_LOG"
+out=""; hdr=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    --write-out|--max-time|--data-binary) shift 2 ;;
+    -H) hdr="${2#@}"; shift 2 ;;
+    --silent|--show-error) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+cat >> "$CURL_BODIES"; echo >> "$CURL_BODIES"
+mode="$(stat -f %Lp "$hdr" 2>/dev/null || stat -c %a "$hdr")"
+printf 'url=%s mode=%s hdr=%s\n' "$url" "$mode" "$(tr '\n' '|' < "$hdr")" >> "$CURL_SEEN"
+cat "$FAKE_REPLY" > "$out"
+printf '%s' "${FAKE_CODE:-200}"
+CURL
+chmod +x "$P6/bin/curl"
+nets_of6() { python3 -c '
+import ipaddress, sys
+for l in open(sys.argv[1]):
+    l = l.strip()
+    if l: print("%x" % ((int(ipaddress.IPv6Address(l)) >> 64) & 0xff))' "$1"; }
+gen6() { # count list-name [VAR=value...] -> addresses on stdout
+  local n="$1" own="$2"; shift 2
+  env PATH="$P6/bin:$PATH" TMPDIR="$P6/tmp" "$@" bash -c '
+    eval "$1"; . "$2"
+    routed_ipv6_addresses 2001:db8:a9::/56 "$3" "$4" "$4/$5"' _ \
+    "$(extract routed_ipv6_addresses)" "$ROOT_DIR/scripts/lib/pergb_pool.sh" "$n" "$P6/dir" "$own"
+}
+# A /56 (256 /64s): per-GB POOL=80-fe, per-piece keeps 00-7f; ff is the node's own.
+# Another batch's list holds 00-7d: the per-piece part has 7e and 7f left.
+python3 -c '
+for i in range(0x7e): print("2001:db8:a9:%x::1" % i)' > "$P6/dir/ipv6_17000.list"
+printf 'PREFIX=2001:db8:a9::/56\nPOOL=80-fe\nENABLED=1\n' > "$NETRUN_PERGB_POOL_FILE"
+printf '{"nets":[144,145,146],"ref":"x"}' > "$FAKE_REPLY"
+gen6 5 ipv6_18100.list NODE_AGENT_JOB_ID=job-1 > "$P6/got.list" || fail "pool path: 5 addresses (2 local + 3 lent) failed"
+[ "$(nets_of6 "$P6/got.list" | sort | tr '\n' ' ')" = "7e 7f 90 91 92 " ] \
+  || fail "picked /64s: $(nets_of6 "$P6/got.list" | tr '\n' ' ') (want 7e 7f local + 90 91 92 lent)"
+grep -qx '{"count":3,"owner":"perpiece","ref":"gen:18100:job-1"}' "$CURL_BODIES" || fail "reserve body: $(cat "$CURL_BODIES")"
+grep -q 'url=http://127.0.0.1:8085/pergb/reserve_nets mode=600 hdr=X-API-KEY: k3y-from-dropin|Content-Type: application/json|' "$CURL_SEEN" \
+  || fail "header file: $(cat "$CURL_SEEN")"
+! grep -q 'k3y-from-dropin' "$CURL_LOG" || fail "the agent key is on curl's argv: $(cat "$CURL_LOG")"
+[ -z "$(ls -A "$P6/tmp")" ] || fail "header / reply temp files left: $(ls -A "$P6/tmp")"
+ok "per-GB pool: the nearly full per-piece part gives its last 2 /64s, the 3 others are lent by reserve_nets (key in a 0600 header file, never argv)"
+
+# the default POOL (the whole prefix but the node's own /64): every /64 is lent
+printf 'PREFIX=2001:db8:a9::/56\nENABLED=1\n' > "$NETRUN_PERGB_POOL_FILE"
+: > "$CURL_BODIES"; : > "$CURL_SEEN"
+printf '{"nets":["2001:db8:a9:c1::/64","c2"]}' > "$FAKE_REPLY"
+gen6 2 ipv6_18200.list NODE_AGENT_API_KEY=k3y-env NODE_AGENT_JOB_ID=job-2 > "$P6/got.list" || fail "default pool: 2 lent /64s failed"
+[ "$(nets_of6 "$P6/got.list" | sort | tr '\n' ' ')" = "c1 c2 " ] || fail "default pool picked $(nets_of6 "$P6/got.list" | tr '\n' ' ')"
+grep -qx '{"count":2,"owner":"perpiece","ref":"gen:18200:job-2"}' "$CURL_BODIES" || fail "default pool body: $(cat "$CURL_BODIES")"
+grep -q 'hdr=X-API-KEY: k3y-env|' "$CURL_SEEN" || fail "NODE_AGENT_API_KEY (the agent's environment) must win over the drop-in: $(cat "$CURL_SEEN")"
+ok "per-GB pool, default POOL: every /64 is lent (an address and a hex subnet id both accepted)"
+
+# failures: the batch is refused, nothing printed, no blind pick
+refuse() { # label stderr-fragment count [VAR=value...]
+  local label="$1" frag="$2" n="$3"; shift 3
+  if gen6 "$n" ipv6_18300.list "$@" > "$P6/out" 2> "$P6/err"; then fail "$label: allocation succeeded: $(cat "$P6/out")"; fi
+  [ ! -s "$P6/out" ] || fail "$label: printed addresses: $(cat "$P6/out")"
+  grep -q -- "$frag" "$P6/err" || fail "$label: stderr: $(cat "$P6/err")"
+}
+printf 'PREFIX=2001:db8:a9::/56\nPOOL=80-fe\n' > "$NETRUN_PERGB_POOL_FILE"
+printf '{"error":"radius_unavailable"}' > "$FAKE_REPLY"
+refuse "agent 503" "did not lend 3" 5 FAKE_CODE=503
+printf '{"nets":[144]}' > "$FAKE_REPLY"
+refuse "short reservation" "did not lend" 5
+printf '{"nets":[144,144,145]}' > "$FAKE_REPLY"
+refuse "the same /64 twice" "did not lend" 5
+printf '{"nets":[144,145,5]}' > "$FAKE_REPLY"
+refuse "a lent /64 per-piece uses" "which per-piece already uses" 5
+printf '{"nets":[144,145,255]}' > "$FAKE_REPLY"
+refuse "the node's own /64 lent" "the node's own /64" 5
+printf '{"nets":[144,145,146]}' > "$FAKE_REPLY"
+mv "$P6/bin/curl" "$P6/bin/curl.off"
+printf '#!/bin/sh\nexit 7\n' > "$P6/bin/curl"; chmod +x "$P6/bin/curl"
+refuse "agent unreachable" "did not lend" 5
+mv -f "$P6/bin/curl.off" "$P6/bin/curl"
+printf 'PREFIX=bogus\n' > "$NETRUN_PERGB_POOL_FILE"
+refuse "bad PREFIX" "bad PREFIX" 5
+printf 'POOL=80-fe\n' > "$NETRUN_PERGB_POOL_FILE"
+refuse "no PREFIX" "has no PREFIX" 5
+printf 'PREFIX=2001:db8:a9::/56\nPOOL=80-fe\n' > "$NETRUN_PERGB_POOL_FILE"
+if PATH="$P6/bin:$PATH" bash -c 'eval "$1"; routed_ipv6_addresses 2001:db8:a9::/56 1 "$2" "$2/ipv6_18300.list"' _ \
+     "$(extract routed_ipv6_addresses)" "$P6/dir" > "$P6/out" 2> "$P6/err"; then
+  fail "lib not loaded: allocation succeeded"
+fi
+grep -q "pergb_pool.sh is not loaded" "$P6/err" || fail "lib not loaded: $(cat "$P6/err")"
+if [ "$(id -u)" != 0 ]; then
+  chmod 000 "$NETRUN_PERGB_POOL_FILE"
+  refuse "unreadable pool file" "is unreadable" 1
+  chmod 600 "$NETRUN_PERGB_POOL_FILE"
+fi
+: > "$CURL_LOG"
+gen6 2 ipv6_18400.list > "$P6/got.list" || fail "2 local /64s need no reservation"
+[ "$(nets_of6 "$P6/got.list" | sort | tr '\n' ' ')" = "7e 7f " ] && [ ! -s "$CURL_LOG" ] \
+  || fail "local-only batch: $(nets_of6 "$P6/got.list" | tr '\n' ' '), curl: $(cat "$CURL_LOG")"
+ok "per-GB pool: an agent error, a short / duplicate / conflicting reservation, no agent, a bad / unreadable pool file or a missing lib refuse the batch; a batch the per-piece part covers asks nothing"
+
+# ENABLED=0 / no pool file: the allocator as before (no agent call, the pool range is per-piece's again)
+for conf in off none; do
+  if [ "$conf" = none ]; then rm -f "$NETRUN_PERGB_POOL_FILE"; else printf 'PREFIX=2001:db8:a9::/56\nPOOL=80-fe\nENABLED=0\n' > "$NETRUN_PERGB_POOL_FILE"; fi
+  : > "$CURL_LOG"
+  gen6 100 ipv6_18500.list > "$P6/got.list" || fail "pool $conf: 100 local /64s"
+  [ "$(nets_of6 "$P6/got.list" | sort -u | wc -l | tr -d ' ')" = 100 ] && [ ! -s "$CURL_LOG" ] || fail "pool $conf: not 100 local /64s / an agent call"
+  ! grep -qx ff <<< "$(nets_of6 "$P6/got.list")" || fail "pool $conf: the node's own /64 was handed out"
+  grep -q '^[89a-f]' <<< "$(nets_of6 "$P6/got.list")" || fail "pool $conf: the former pool range is per-piece's again"
+done
+ok "per-GB pool off (no file / ENABLED=0): the allocator as before, no agent call"
+unset NETRUN_PERGB_POOL_FILE NETRUN_AGENT_KEY_FILE CURL_LOG CURL_BODIES CURL_SEEN FAKE_REPLY
 
 echo "test_generator_flags.sh — all $PASS checks passed"

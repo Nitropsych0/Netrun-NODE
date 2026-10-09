@@ -915,3 +915,48 @@ test("generateRoutedAddresses: a `never` /64 is skipped, also when every other /
   assert.ok(addrs.every((a) => eg.net64Of(a) !== eg.net64Of("2602:f2dc:a9:3::1")), addrs.join());
   assert.strictEqual(shared, 9, "3 free /64s, 9 shared");
 });
+
+// ── pay-per-GB v2, AMENDMENT A1 ──────────────────────────────────────────
+
+test("pickOutsidePool: only /64s outside the per-GB pool range, never used / never; no sharing when they run out", () => {
+  const key = (a) => eg.net64Of(a);
+  const base = key("2602:f2dc:a9::1");
+  // a /48 whose pool is 8000-fffe: the per-piece part is 0000-7fff
+  const pool = { lo: base + 0x8000n, hi: base + 0xfffen };
+  const never = new Set([base + 0xffffn]);
+  const used = new Set();
+  for (let i = 0n; i < 0x7ffdn; i += 1n) used.add(base + i); // per-piece part nearly full: 7ffd 7ffe 7fff left
+  const got = eg.pickOutsidePool("2602:f2dc:a9::/48", 5, used, never, pool);
+  assert.deepStrictEqual(got.map((k) => Number(k - base)).sort((a, b) => a - b), [0x7ffd, 0x7ffe, 0x7fff],
+    "the 3 free per-piece /64s and nothing else — never a pool /64, never shared");
+  // the default pool (everything but the node's own /64): nothing to pick here
+  assert.deepStrictEqual(eg.pickOutsidePool("2602:f2dc:a9::/48", 3, new Set(), never, { lo: base, hi: base + 0xfffen }), []);
+  // a rotation prefix that lies outside the pool entirely: picked as usual
+  const other = eg.pickOutsidePool("2602:f2dc:b0::/56", 4, new Set(), new Set(), pool);
+  assert.strictEqual(new Set(other.map(String)).size, 4);
+  assert.ok(other.every((k) => (k >> 8n) === (key("2602:f2dc:b0::1") >> 8n)));
+  // a sparse /32 with the pool inside it: random draws, never inside the pool range
+  const wide = eg.pickOutsidePool("2602:f2dc::/32", 50, new Set(), new Set(), pool);
+  assert.strictEqual(wide.length, 50);
+  assert.ok(wide.every((k) => k < pool.lo || k > pool.hi));
+});
+
+test("sanitizeState: pergb_held records survive a load (normalised, deduplicated, bad ones dropped); absent when empty", () => {
+  const s = eg.sanitizeState({
+    ...eg.emptyState(),
+    pergb_held: [
+      { net: "2602:F2DC:A9:0100::/64", ref: "egress:abc" },
+      { net: "2602:f2dc:a9:100::/64", ref: "egress:dup" },
+      { net: "2602:f2dc:a9:101::/64" },
+      { net: "2602:f2dc:a9:102::/48", ref: "x" },
+      { net: "nope", ref: "x" },
+      "junk",
+    ],
+  });
+  assert.deepStrictEqual(s.pergb_held, [
+    { net: "2602:f2dc:a9:100::/64", ref: "egress:dup" },
+    { net: "2602:f2dc:a9:101::/64", ref: "egress" },
+  ]);
+  assert.ok(!("pergb_held" in eg.sanitizeState(eg.emptyState())), "a node without per-GB keeps its old file shape");
+  assert.ok(!("pergb_held" in eg.sanitizeState({ ...eg.emptyState(), pergb_held: [] })));
+});

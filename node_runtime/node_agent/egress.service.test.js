@@ -380,7 +380,7 @@ function deterministicRandom() {
 
 const quiet = { log() {}, error() {} };
 
-function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07T12:00:00.000Z") }, writeState, findBin, randomBytes } = {}) {
+function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07T12:00:00.000Z") }, writeState, findBin, randomBytes, pergb } = {}) {
   const svc = eg.createEgressService({
     env: {
       NODE_AGENT_PROXY_ROOT: root,
@@ -399,6 +399,7 @@ function makeService(host, root, { env = {}, clock = { t: Date.parse("2026-10-07
     log: quiet,
     ...(writeState ? { writeState } : {}),
     ...(findBin ? { findBin } : {}),
+    ...(pergb ? { pergb } : {}),
   });
   return { svc, clock };
 }
@@ -1748,4 +1749,236 @@ test("a new address is never one on the NIC or another proxy entry; foreign entr
   assert.deepStrictEqual(await svc.gcTick(), { deleted: 1 });
   assert.ok(host.proxies.has(draw(k + 1)) && host.addrs.has(draw(k)));
   assertConsistent(host, svc, root, "unique", { foreign: new Set([draw(k + 1)]) });
+});
+
+// ── pay-per-GB v2, AMENDMENT A1: the per-GB address pool ──────────────────
+// On a per-GB node (/etc/netrun/pergb-pool.conf) a /64 of the pool comes
+// ONLY from RADIUS reserve_nets; /64s of the rotation prefix outside POOL are
+// picked locally first; nothing is ever shared; reservations are journaled
+// (pergb_held) before use and handed back (release_nets) once drained.
+
+const pergbPool = require(path.resolve(__dirname, "pergb_pool.js"));
+
+function poolFile(root, text) {
+  const f = path.join(root, "pergb-pool.conf");
+  fs.writeFileSync(f, text);
+  return f;
+}
+
+// A pool access whose reserve / release are recorded; reserve lends subnet
+// ids from `lend` (queued) else counts up from `next` (relative to PREFIX).
+function fakePool(file, { next = 0x100 } = {}) {
+  const read = pergbPool.createPoolReader({ env: { NETRUN_PERGB_POOL_FILE: file } });
+  const fp = { calls: { reserve: [], release: [] }, failReserve: null, failRelease: null, lend: [], next, state: read };
+  fp.reserve = async ({ count, ref }) => {
+    fp.calls.reserve.push({ count, ref });
+    if (fp.failReserve) throw Object.assign(new Error(`radius_ctl: ${fp.failReserve}`), { code: fp.failReserve });
+    const st = read();
+    const nets = [];
+    for (let i = 0; i < count; i += 1) nets.push(st.pool.base + BigInt(fp.lend.length ? fp.lend.shift() : fp.next++));
+    return { nets, ref };
+  };
+  fp.release = async ({ nets, ref }) => {
+    fp.calls.release.push({ nets: nets.map((k) => pergbPool.net64Text(k)), ref });
+    if (fp.failRelease) throw Object.assign(new Error(`radius_ctl: ${fp.failRelease}`), { code: fp.failRelease });
+    return { released: nets.length };
+  };
+  return fp;
+}
+
+const sub48 = (a) => Number(eg.net64Of(a) & 0xffffn);
+
+test("per-GB pool (A1): rotate and the per-connection pool take every /64 from reserve_nets, journaled before use", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  const fp = fakePool(poolFile(root, `PREFIX=${R48}\nPOOL=0000-fffe\nENABLED=1\n`));
+  const { svc } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48 }, pergb: fp });
+  await svc.init();
+
+  const r = await svc.rotate([30000, 30001]);
+  assert.strictEqual(r.ok, true, JSON.stringify(r.items));
+  const got = r.items.map((it) => it.new_ipv6);
+  assert.deepStrictEqual(got.map(sub48), [0x100, 0x101], "the lent /64s, nothing picked here");
+  assert.deepStrictEqual(fp.calls.reserve.map((c) => c.count), [2], "one reservation for the call");
+  assert.match(fp.calls.reserve[0].ref, /^egress:[0-9a-f]{12}$/);
+  const held = svc.snapshot().pergb_held;
+  assert.deepStrictEqual(held.map((h) => h.net), ["2602:f2dc:a9:100::/64", "2602:f2dc:a9:101::/64"]);
+  assert.ok(held.every((h) => h.ref === fp.calls.reserve[0].ref));
+  assertConsistent(host, svc, root, "pool rotate");
+
+  await svc.setMode([30002], "per_connection");
+  assert.deepStrictEqual(svc.snapshot().pool.map(sub48), [0x102, 0x103, 0x104, 0x105]);
+  assert.strictEqual(svc.snapshot().pergb_held.length, 6);
+  assertConsistent(host, svc, root, "pool per_connection");
+
+  // a restart keeps the records (they are in egress_state.json)
+  const { svc: again } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48 }, pergb: fp });
+  await again.init();
+  assert.deepStrictEqual(again.snapshot().pergb_held, svc.snapshot().pergb_held);
+});
+
+test("per-GB pool (A1): reserve_nets failing or an unusable pool file → address_add_failed; nothing picked blind, nothing journaled", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  const file = poolFile(root, `PREFIX=${R48}\nPOOL=0000-fffe\n`);
+  const fp = fakePool(file);
+  const { svc } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48 }, pergb: fp });
+  await svc.init();
+  fp.failReserve = "radius_unavailable";
+  const before = svc.snapshot();
+  const r = await svc.rotate([30000, 30001]);
+  assert.strictEqual(r.ok, false);
+  assert.deepStrictEqual(r.items.map((it) => it.error), ["address_add_failed", "address_add_failed"]);
+  assert.deepStrictEqual(svc.snapshot().ports, before.ports);
+  assert.strictEqual(svc.snapshot().pergb_held, undefined);
+  const m = await svc.setMode([30002], "per_connection");
+  assert.strictEqual(m.items[0].error, "address_add_failed");
+  assert.deepStrictEqual(svc.snapshot().pool, []);
+  assertConsistent(host, svc, root, "reserve failed");
+
+  // a pool file that cannot be parsed: not even a reservation is tried
+  fp.failReserve = null;
+  fs.writeFileSync(file, "PREFIX=bogus\n");
+  const n = fp.calls.reserve.length;
+  const r2 = await svc.rotate([30000]);
+  assert.strictEqual(r2.items[0].error, "address_add_failed");
+  assert.strictEqual(fp.calls.reserve.length, n);
+  // the file fixed: served again
+  fs.writeFileSync(file, `PREFIX=${R48}\n`);
+  assert.strictEqual((await svc.rotate([30000])).ok, true);
+});
+
+test("per-GB pool (A1): /64s outside POOL first; once they are gone nothing is shared — lent by RADIUS or the port fails", async () => {
+  const host = fakeHost();
+  const R62 = "2602:f2dc:a9:fffc::/62"; // fffc fffd | fffe = POOL | ffff = the node's own
+  host.localRoutes = [R62];
+  const root = makeRoot();
+  const file = poolFile(root, `PREFIX=${R62}\nPOOL=2-2\n`);
+  const fp = fakePool(file, { next: 2 });
+  // a /48 batch's anchor holds fffc
+  fs.writeFileSync(path.join(root, "3proxy", "3proxy_50000.cfg"), `daemon\nauth strong\n${block(50000, "2602:f2dc:a9:fffc::5").join("\n")}\n`);
+  const { svc } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R62 }, pergb: fp });
+  await svc.init();
+  const a = (await svc.rotate([30000])).items[0].new_ipv6;
+  assert.ok(a.startsWith("2602:f2dc:a9:fffd:"), `the free per-piece /64: ${a}`);
+  assert.strictEqual(fp.calls.reserve.length, 0, "no reservation while the per-piece part has room");
+  const b = (await svc.rotate([30001])).items[0].new_ipv6;
+  assert.ok(b.startsWith("2602:f2dc:a9:fffe:"), `lent: ${b}`);
+  assert.deepStrictEqual(fp.calls.reserve.map((c) => c.count), [1]);
+  // the pool is empty too (RADIUS refuses with capacity): the port fails, nothing shared
+  fp.failReserve = "capacity";
+  const c = await svc.rotate([30002]);
+  assert.strictEqual(c.items[0].error, "address_add_failed");
+  assert.strictEqual(svc.snapshot().ports[30002], undefined);
+  assertConsistent(host, svc, root, "exhausted");
+  // contrast: without the pool file the old exhaustion fallback shares a /64 (never the node's own)
+  fs.rmSync(file);
+  const d = (await svc.rotate([30002])).items[0].new_ipv6;
+  assert.ok(/^2602:f2dc:a9:fff[cde]:/.test(d), `shared: ${d}`);
+});
+
+test("per-GB pool (A1): a lent /64 per-piece already uses stays reserved and unused; one more reservation covers the shortfall", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  const fp = fakePool(poolFile(root, `PREFIX=${R48}\n`));
+  fs.writeFileSync(path.join(root, "3proxy", "3proxy_50000.cfg"), `daemon\nauth strong\n${block(50000, "2602:f2dc:a9:77::5").join("\n")}\n`);
+  fs.writeFileSync(path.join(root, "ipv6_51000.list.tmp"), "2602:f2dc:a9:78::9\n");
+  const { svc } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48 }, pergb: fp });
+  await svc.init();
+  // the first reservation lends the anchor's and the .tmp list's /64s
+  fp.lend = [0x77, 0x78, 0x79, 0x7a];
+  const r = await svc.rotate([30000, 30001]);
+  assert.strictEqual(r.ok, true, JSON.stringify(r.items));
+  assert.deepStrictEqual(r.items.map((it) => sub48(it.new_ipv6)), [0x79, 0x7a]);
+  assert.deepStrictEqual(fp.calls.reserve.map((c) => c.count), [2, 2]);
+  // still conflicting after the second try: what is missing fails, nothing shared
+  fp.lend = [0x77, 0x78];
+  const again = await svc.rotate([30002]);
+  assert.strictEqual(again.items[0].error, "address_add_failed");
+  assert.deepStrictEqual(fp.calls.reserve.map((c) => c.count), [2, 2, 1, 1]);
+  assert.deepStrictEqual(svc.snapshot().pergb_held.map((h) => h.net), ["2602:f2dc:a9:79::/64", "2602:f2dc:a9:7a::/64"],
+    "the conflicting /64s are not this module's to hand back");
+  fs.rmSync(path.join(root, "ipv6_51000.list.tmp")); // (assertConsistent: no temp files)
+  assertConsistent(host, svc, root, "conflicts");
+});
+
+test("per-GB pool (A1): the GC hands a drained /64 back by its ref; a failed release is retried; one a list names now is just forgotten", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  const fp = fakePool(poolFile(root, `PREFIX=${R48}\n`));
+  const { svc, clock } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48 }, pergb: fp });
+  await svc.init();
+  await svc.rotate([30000]);
+  const ref0 = fp.calls.reserve[0].ref;
+  await svc.rotate([30000], { drainSec: 0 }); // 0x100 drains now, 0x101 current
+  clock.t += 1000;
+  const out = await svc.gcTick();
+  assert.strictEqual(out.pergbReleased, 1);
+  assert.deepStrictEqual(fp.calls.release, [{ nets: ["2602:f2dc:a9:100::/64"], ref: ref0 }]);
+  assert.deepStrictEqual(svc.snapshot().pergb_held.map((h) => h.net), ["2602:f2dc:a9:101::/64"]);
+  assertConsistent(host, svc, root, "released");
+
+  // RADIUS down: the record stays, the next tick retries
+  await svc.rotate([30000], { drainSec: 0 }); // 0x101 drains, 0x102 current
+  clock.t += 1000;
+  fp.failRelease = "radius_unavailable";
+  await svc.gcTick();
+  assert.deepStrictEqual(svc.snapshot().pergb_held.map((h) => h.net), ["2602:f2dc:a9:101::/64", "2602:f2dc:a9:102::/64"]);
+  fp.failRelease = null;
+  await svc.gcTick();
+  assert.deepStrictEqual(fp.calls.release.at(-1).nets, ["2602:f2dc:a9:101::/64"]);
+  assert.deepStrictEqual(svc.snapshot().pergb_held.map((h) => h.net), ["2602:f2dc:a9:102::/64"]);
+
+  // a list names 0x102 now (it is per-piece's): its record goes, no release
+  await svc.rotate([30000], { drainSec: 0 }); // 0x102 drains, 0x103 current
+  fs.writeFileSync(path.join(root, "ipv6_52000.list"), "2602:f2dc:a9:102::7\n");
+  clock.t += 1000;
+  const calls = fp.calls.release.length;
+  await svc.gcTick();
+  assert.strictEqual(fp.calls.release.length, calls, "never handed back while per-piece names it");
+  assert.deepStrictEqual(svc.snapshot().pergb_held.map((h) => h.net), ["2602:f2dc:a9:103::/64"]);
+
+  // the pool file gone (per-GB disabled): records kept, nothing called
+  fs.rmSync(path.join(root, "pergb-pool.conf"));
+  await svc.reset([30000], { drainSec: 0 });
+  clock.t += 1000;
+  await svc.gcTick();
+  assert.strictEqual(fp.calls.release.length, calls);
+  assert.deepStrictEqual(svc.snapshot().pergb_held.map((h) => h.net), ["2602:f2dc:a9:103::/64"]);
+  assertConsistent(host, svc, root, "pool off");
+});
+
+test("per-GB pool (A1): pergbExcludedNets — anchors (.disabled / .failed too), lists and .tmp lists, the state and its holds, inside [lo, hi]", async () => {
+  const host = fakeHost();
+  host.localRoutes = [R48];
+  const root = makeRoot();
+  const fp = fakePool(poolFile(root, `PREFIX=${R48}\n`));
+  const d = path.join(root, "3proxy");
+  fs.writeFileSync(path.join(d, "3proxy_50000.cfg"), `daemon\n${block(50000, "2602:f2dc:a9:77::5").join("\n")}\n`);
+  fs.writeFileSync(path.join(d, "3proxy_51000.cfg.failed"), `daemon\n${block(51000, "2602:f2dc:a9:88::5").join("\n")}\n`);
+  fs.writeFileSync(path.join(d, "3proxy_52000.cfg.disabled"), `daemon\n${block(52000, "2602:f2dc:a9:8a::5").join("\n")}\n`);
+  fs.writeFileSync(path.join(root, "ipv6_53000.list.tmp"), "2602:f2dc:a9:99::1\nnot-an-address\n2001:db8:1:2::77\n");
+  const { svc } = makeService(host, root, { env: { NETRUN_IPV6_ROUTED_PREFIX: R48 }, pergb: fp });
+  await svc.init();
+  await svc.rotate([30000]); // lent 0x100
+  const all = svc.pergbExcludedNets(0, 0xfffe);
+  assert.deepStrictEqual(all.nets, [0x77, 0x88, 0x8a, 0x99, 0x100]);
+  assert.strictEqual(all.complete, true);
+  assert.strictEqual(all.prefix, R48);
+  assert.deepStrictEqual(svc.pergbExcludedNets(0x80, 0xff).nets, [0x88, 0x8a, 0x99]);
+  assert.strictEqual(typeof eg.pergbExcludedNets, "function", "exported for the agent's excluded push");
+  if (process.getuid && process.getuid() !== 0) {
+    fs.chmodSync(path.join(d, "3proxy_50000.cfg"), 0o000);
+    const part = svc.pergbExcludedNets(0, 0xfffe);
+    assert.strictEqual(part.complete, false, "an unreadable cfg: an incomplete scan (add-only)");
+    fs.chmodSync(path.join(d, "3proxy_50000.cfg"), 0o600);
+  }
+  // no pool file and no prefix asked for: nothing to say
+  fs.rmSync(path.join(root, "pergb-pool.conf"));
+  assert.deepStrictEqual(svc.pergbExcludedNets(0, 0xfffe).nets, []);
+  assert.deepStrictEqual(svc.pergbExcludedNets(0x70, 0x80, { prefix: R48 }).nets, [0x77]);
 });
