@@ -5,7 +5,7 @@ name: pergb-linux
 
 on:
   push:
-    branches: ["feat/pergb2-*"]
+    branches: ["feat/pergb2", "feat/pergb2-*"]
   workflow_dispatch:
 
 permissions:
