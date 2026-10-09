@@ -45,6 +45,8 @@ PERGB = "pergb"  # the kind of per-GB lists and accounts (the default)
 PIECE = "piece"  # A13-I: a per-piece proxy (list) and its account
 KINDS = (PERGB, PIECE)
 PIECE_REJECTS_KEPT = 100
+# status.features: what this RADIUS speaks beyond I5 (the agent checks before using it)
+FEATURES = ("pieces", "reserveExact", "reserved", "avoid", "primaryIpv4")
 MAX_EGRESS_V4 = 64  # A7: 1..64 per-GB IPv4s per node
 STICKY_PAUSES = (5, 10)  # A11: the two pause buttons (other values 1..60 are accepted)
 MAX_LINE_EPOCHS = 20000
@@ -1018,6 +1020,7 @@ class Engine:
                 "epoch": self.epoch,
                 "seq": self.seq,
                 "dbRecovered": self.db_recovered,
+                "features": list(FEATURES),
                 "ready": self.facts is not None and self.alloc.configured,
                 "secretLoaded": bool(self.secret),
                 "counts": {

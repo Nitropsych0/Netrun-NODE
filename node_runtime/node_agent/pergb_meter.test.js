@@ -509,3 +509,26 @@ test("the proxy-owned log directory cannot steer the agent: symlinked logs are s
   assert.deepStrictEqual(fs.readdirSync(elsewhere), [], "no archive written through the symlink");
   assert.ok(fs.existsSync(logFile(dir, "p31500.log.2026.10.09-13")), "the finished file stays until it can be archived");
 });
+
+test("A13-I: a per-piece login is counted under its login and marked kind piece (reported, never charged)", () => {
+  const dir = tmpdir("piece");
+  const now = clock();
+  const m = newMeter(dir, now);
+  m.setLogins([...LISTS, { id: 7, login: "netrun-piece7", accountId: 70, kind: "piece" }]);
+  m.tick(); // a fresh state (no logs yet)
+  fs.writeFileSync(
+    logFile(dir, "p31000.log.2026.10.09-14"),
+    `${rec({ user: "netrun-piece7-country-us", i: 4000, o: 100 })}\n${rec({ user: "netrun-abc12", i: 10, o: 1 })}\n`
+  );
+  m.tick();
+  const u = m.usage({ since: 0 });
+  assert.deepStrictEqual(u.logins["netrun-piece7"], { up: 100, down: 4000, conns: 1, kind: "piece" });
+  assert.deepStrictEqual(u.logins["netrun-abc12"], { up: 1, down: 10, conns: 1 });
+  assert.strictEqual(m.status().pieceLogins, 1);
+  // deleted from RADIUS: its last records are still reported as a piece's for an hour
+  m.setLogins(LISTS);
+  fs.appendFileSync(logFile(dir, "p31000.log.2026.10.09-14"), `${rec({ user: "netrun-piece7", i: 1, o: 1 })}\n`);
+  m.tick();
+  assert.strictEqual(m.usage({ since: 0 }).logins["netrun-piece7"].kind, "piece");
+  fs.rmSync(dir, { recursive: true, force: true });
+});

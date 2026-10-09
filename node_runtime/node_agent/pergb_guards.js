@@ -14,7 +14,9 @@
 // - IPv4 local ports on the egress IPv4(s): distinct local ports of every
 //   TCP socket (all states, TIME_WAIT included) inside ip_local_port_range;
 //   RADIUS refuses new IPv4-destination connections at ≥ 60 % and takes them
-//   again at ≤ 50 %;
+//   again at ≤ 50 %; the node's primary IPv4 — the IPv4 egress of per-piece
+//   proxies on RADIUS (A13-I) — is measured the same way (extraIpv4s) and
+//   pushed per address only: it never closes per-GB IPv4;
 // - the RADIUS probe every 5 s (an Access-Request for netrun-svcprobe
 //   towards a canary destination); on 2 failures in a row:
 //   `systemctl reset-failed netrun-radius.socket netrun-radius.service` and
@@ -89,7 +91,8 @@ function readNumber(text) {
 
 // deps: { ctl, run, now, log, readFile(path) -> text, statfs(path) -> {bavail,
 // bsize, blocks}, settings: { cgroupRoot, sliceCgroup, logDir, portRangeFile },
-// enable() -> enable.json | null, egressIpv4s() -> [ip], meterLagSec() ->
+// enable() -> enable.json | null, egressIpv4s() -> [ip], extraIpv4s() -> [ip]
+// (measured and pushed per address, not part of the per-GB verdict), meterLagSec() ->
 // number, liveSessions() -> Promise<Map accountId -> n>, probe() ->
 // Promise<{ok, verdict, ms}> | null (not configured), radiusStatus() ->
 // Promise<object> }
@@ -119,7 +122,8 @@ function createGuards(deps) {
     softAccounts: [],
     ipv4Open: true,
     ipv4PortsPct: null,
-    ipv4AddrOpen: new Map(), // ip -> open (hysteresis per egress IPv4, A7)
+    ipv4AddrOpen: new Map(), // ip -> open (hysteresis per egress IPv4, A7; and the extra ones)
+    ipv4Extra: new Set(), // the extra IPv4s measured last tick (A13-I: the primary, for pieces)
     ipv4: [],
     radiusAlive: null,
     probe: { last: null, failures: 0, ok: 0, fail: 0, lastOkAt: null, recoveries: 0, lastRecoverAt: null },
@@ -167,18 +171,21 @@ function createGuards(deps) {
 
   async function ipv4PortsPct() {
     const ips = deps.egressIpv4s ? deps.egressIpv4s() : [];
+    const extra = (deps.extraIpv4s ? deps.extraIpv4s() : []).filter((ip) => ip && !ips.includes(ip));
+    st.ipv4Extra = new Set(extra);
+    const all = [...ips, ...extra];
     let range = null;
     try {
       range = parsePortRange(readFile(settings.portRangeFile));
     } catch {}
-    if (!range || !ips.length) {
+    if (!range || !all.length) {
       st.ipv4 = [];
       return null;
     }
     const [lo, hi] = range;
     const size = hi - lo + 1;
     const per = [];
-    for (const ip of ips) {
+    for (const ip of all) {
       const r = await deps.run("ss", ["-Htan", "src", ip, "and", "sport", "ge", `:${lo}`, "and", "sport", "le", `:${hi}`], { timeoutMs: 15000 });
       if (r.code !== 0) {
         per.push({ ip, ports: null, pct: null, error: String(r.stderr || "").trim().slice(0, 120) });
@@ -191,9 +198,9 @@ function createGuards(deps) {
       const prev = st.ipv4AddrOpen.has(p.ip) ? st.ipv4AddrOpen.get(p.ip) : true;
       st.ipv4AddrOpen.set(p.ip, nextIpv4Open(prev, p.pct));
     }
-    for (const ip of [...st.ipv4AddrOpen.keys()]) if (!ips.includes(ip)) st.ipv4AddrOpen.delete(ip);
-    st.ipv4 = per.map((p) => ({ ...p, range: [lo, hi], open: st.ipv4AddrOpen.get(p.ip) }));
-    const pcts = per.map((p) => p.pct).filter((v) => v !== null);
+    for (const ip of [...st.ipv4AddrOpen.keys()]) if (!all.includes(ip)) st.ipv4AddrOpen.delete(ip);
+    st.ipv4 = per.map((p) => ({ ...p, range: [lo, hi], open: st.ipv4AddrOpen.get(p.ip), role: st.ipv4Extra.has(p.ip) ? "piece" : "pergb" }));
+    const pcts = per.filter((p) => !st.ipv4Extra.has(p.ip)).map((p) => p.pct).filter((v) => v !== null);
     return pcts.length ? Math.max(...pcts) : null;
   }
 
@@ -244,7 +251,8 @@ function createGuards(deps) {
     const wasOpen = st.ipv4Open;
     // open while any egress IPv4 has ports left; RADIUS gets the per-address
     // verdicts too (addrs) to pick only among the open ones (A7)
-    st.ipv4Open = st.ipv4AddrOpen.size ? [...st.ipv4AddrOpen.values()].some(Boolean) : nextIpv4Open(st.ipv4Open, st.ipv4PortsPct);
+    const pergbOpen = [...st.ipv4AddrOpen.entries()].filter(([ip]) => !st.ipv4Extra.has(ip)).map(([, v]) => v);
+    st.ipv4Open = pergbOpen.length ? pergbOpen.some(Boolean) : nextIpv4Open(st.ipv4Open, st.ipv4PortsPct);
     if (wasOpen !== st.ipv4Open) log.log(`[pergb-guards] IPv4 admission ${st.ipv4Open ? "reopened" : "closed"} (${st.ipv4PortsPct} % of local ports)`);
     try {
       await clock();

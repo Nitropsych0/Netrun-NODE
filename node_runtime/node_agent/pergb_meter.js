@@ -13,7 +13,9 @@
 // a record.
 //
 // Counting: key = the base login (the first two dash tokens of the
-// lowercased user, `netrun-<id>`); only base logins RADIUS knows are counted
+// lowercased user, `netrun-<id>`); per-piece logins on RADIUS (A13-I) are
+// counted the same way and reported under their login with kind "piece"
+// (logged for abuse / attribution, never charged); only base logins RADIUS knows are counted
 // (up = %O, down = %I, conns = final records); records of unknown logins go
 // to one unknownBytes counter (plus a capped sample of names), the probe
 // login and zero-byte records (failed auths) are skipped — unauthenticated
@@ -347,7 +349,7 @@ function createMeter(opts = {}) {
     return state;
   }
 
-  // logins: iterable of { login, id (listId), accountId } (RADIUS `logins`).
+  // logins: iterable of { login, id (listId), accountId, kind } (RADIUS `logins`).
   // A login removed from RADIUS stays known for an hour: its last records
   // (written before the delete, read after it) are still billed.
   const gone = new Map(); // login -> { info, until }
@@ -356,7 +358,7 @@ function createMeter(opts = {}) {
     for (const l of lists || []) {
       const login = baseLogin(l && l.login);
       if (!login) continue;
-      next.set(login, { listId: Number(l.id), accountId: Number(l.accountId) });
+      next.set(login, { listId: Number(l.id), accountId: Number(l.accountId), kind: l.kind === "piece" ? "piece" : "pergb" });
     }
     const t = now();
     if (known) {
@@ -748,12 +750,18 @@ function createMeter(opts = {}) {
   // ── readers ─────────────────────────────────────────────────────────────
 
   // Cumulative counters of the logins changed after `since` (all with 0).
+  // A per-piece login (A13-I) carries kind: "piece" — its traffic is reported,
+  // never charged.
   function usage({ since = 0 } = {}) {
     ensureLoaded();
     const s = Number(since) || 0;
     const logins = {};
     for (const [login, c] of Object.entries(state.logins)) {
-      if (c.seq > s) logins[login] = { up: c.up, down: c.down, conns: c.conns };
+      if (c.seq > s) {
+        logins[login] = { up: c.up, down: c.down, conns: c.conns };
+        const info = loginInfo(login);
+        if (info && info.kind === "piece") logins[login].kind = "piece";
+      }
     }
     return { epoch: state.epoch, seq: state.seq, asOf: new Date(lastTickOkAt || now()).toISOString(), logins };
   }
@@ -787,6 +795,7 @@ function createMeter(opts = {}) {
       pendingFiles: pending,
       logins: Object.keys(state.logins).length,
       loginsKnown: known ? known.size : null,
+      pieceLogins: known ? [...known.values()].filter((v) => v.kind === "piece").length : null,
       skipped: state.skipped,
       tuples: tuples.size,
       persistFailures,

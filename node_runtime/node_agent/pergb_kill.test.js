@@ -154,3 +154,71 @@ test("classify: the sockets view the enforcer and guards share", () => {
   assert.deepStrictEqual(v.v4.map((s) => s.accountId).sort(), [10, 20]);
   assert.strictEqual(v.loopUnknown, 1);
 });
+
+// A13-I: per-piece proxies on RADIUS — list 7 (account 70) owns /64 0x77.
+function pieceWorld() {
+  const t = T.tagger();
+  const w = world();
+  const PIECE = t.pieceAddress(0x77, 7);
+  const FOREIGN = t.address(0x77, 1, 500); // list 1's tag inside the piece's /64: not the piece's
+  w.sockets.push(
+    { local: PIECE, lport: 40100, peer: "2606:4700::1", pport: 443, sent: 5, received: 5, cgroup: T.CG(T.UNIT_A) },
+    { local: PIECE, lport: 40101, peer: "2606:4700::2", pport: 443, sent: 5, received: 5, cgroup: T.CG(T.UNIT_B) },
+    { local: FOREIGN, lport: 40102, peer: "2606:4700::1", pport: 443, sent: 5, received: 5, cgroup: T.CG(T.UNIT_A) },
+    { local: "127.0.0.4", lport: 31007, peer: "127.0.0.1", pport: 50070, sent: 1, received: 1, cgroup: T.CG(T.UNIT_A) } // the piece's IPv4 session
+  );
+  w.addrs.PIECE = PIECE;
+  w.addrs.FOREIGN = FOREIGN;
+  return w;
+}
+
+function pieceKiller(w) {
+  const lists = new Map([...LISTS, [7, { accountId: 70, login: "netrun-piece7" }]]);
+  const tuples = new Map([...TUPLES, ["127.0.0.4:31007<127.0.0.1:50070", "netrun-piece7"]]);
+  return killLib.createKiller({
+    run: T.fakeRun(w),
+    log: QUIET,
+    units: () => [T.UNIT_A, T.UNIT_B].map((u) => ({ unit: u, cgroup: T.CG(u) })),
+    fallbackFilter: () => ["(", "src", T.PREFIX, "or", "src", "127.0.0.3", "or", "src", "127.0.0.4", ")"],
+    ctx: () => ({
+      tagger: T.tagger(),
+      excluded: new Set([0x99, 0x77]), // piece /64s are in the excluded set as well
+      pieceOf: (net) => (net === 0x77 ? { listId: 7, accountId: 70 } : null),
+      tupleLogin: (key) => tuples.get(key) || null,
+      listAccount: (id) => (lists.get(id) || {}).accountId ?? null,
+      loginAccount: (login) => {
+        for (const l of lists.values()) if (l.login === login) return l.accountId;
+        return null;
+      },
+    }),
+  });
+}
+
+for (const mode of ["cgroup", "fallback"]) {
+  test(`A13-I [${mode}]: a piece's sockets are its own — killed by its account or list, never by another kill`, async () => {
+    let w = pieceWorld();
+    w.cgroupSupport = mode === "cgroup";
+    let k = pieceKiller(w);
+    const v = await k.snapshot();
+    const pieceSocks = v.v6.filter((s) => s.piece);
+    assert.deepStrictEqual(pieceSocks.map((s) => [s.listId, s.accountId, s.subnetId]), [[7, 70, 0x77], [7, 70, 0x77]]);
+    assert.ok(!v.v6.some((s) => s.local === w.addrs.FOREIGN), "another list's tag in a piece /64 is not attributed");
+    // a per-GB account kill never touches the piece
+    await k.kill({ accountId: 10 });
+    assert.ok(!w.killed.some((s) => s.local === w.addrs.PIECE || s.lport === 31007));
+    // the piece's account: both IPv6 sockets and its IPv4 tuple
+    let r = await k.kill({ accountId: 70 });
+    assert.deepStrictEqual([r.killed6, r.killed4], [2, 1]);
+    assert.ok(w.sockets.some((s) => s.local === w.addrs.FOREIGN), "the foreign socket stays");
+    // the piece's list (its login)
+    w = pieceWorld();
+    w.cgroupSupport = mode === "cgroup";
+    k = pieceKiller(w);
+    r = await k.kill({ listId: 7, logins: new Set(["netrun-piece7"]) });
+    assert.deepStrictEqual([r.killed6, r.killed4], [2, 1]);
+    assert.deepStrictEqual(
+      w.killed.map((s) => s.lport).sort((a, b) => a - b),
+      [31007, 40100, 40101]
+    );
+  });
+}

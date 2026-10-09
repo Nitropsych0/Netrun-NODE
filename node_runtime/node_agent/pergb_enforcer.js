@@ -28,6 +28,8 @@
 // Expiry: an account whose expiresAt passed is killed once (RADIUS already
 // refuses new connections). The heartbeat goes out every tick, near or not:
 // it is RADIUS's deadman signal (plan §3.4).
+// Per-piece accounts (kind "piece", A13-I) have no limit: never near, never
+// locally blocked; their state transitions and their expiry kill as above.
 
 const MIN_H = 256 * 1024 * 1024;
 const H_SECONDS = 30;
@@ -96,12 +98,14 @@ function createEnforcer(deps) {
       const id = Number(a.id);
       seen.add(id);
       const old = accounts.get(id);
-      const limitKey = JSON.stringify(a.limit || null);
+      const limitKey = JSON.stringify(a.kind === "piece" ? null : a.limit || null);
+      const piece = a.kind === "piece";
       const entry = {
         id,
+        kind: piece ? "piece" : "pergb",
         state: a.state,
         expiresAt: a.expiresAt === null || a.expiresAt === undefined ? null : Number(a.expiresAt),
-        limit: a.limit || null,
+        limit: piece ? null : a.limit || null,
         localBlocked: Boolean(a.localBlocked),
         limitKey,
         cumAtReceipt: old ? old.cumAtReceipt : null,

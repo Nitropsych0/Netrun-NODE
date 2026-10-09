@@ -17,6 +17,12 @@
 //   job, every 10 min), canary refresh (10 min), RADIUS watch (a new epoch
 //   or a recovered DB → facts and excluded again).
 // - readers: status, usage, attribution, port_check, the /health block.
+// - per-piece proxies on RADIUS (A13, contract A13-I): their /64s (pieceNet of
+//   the RADIUS logins) are per-piece for kills, attribution and smart
+//   rotation; every reserve_nets / release_nets answer is kept in a journal
+//   (<stateDir>/reservations.json) and re-reserved exactly (reserve_nets
+//   {ref, nets}) when RADIUS comes back with a lost DB, so a piece never
+//   loses its /64; facts carry the primary IPv4 (pieces' IPv4 egress).
 
 const crypto = require("crypto");
 const dns = require("dns");
@@ -46,6 +52,9 @@ const REF_RE = /^[A-Za-z0-9:._-]{1,128}$/;
 const POOL_RE = /^([0-9a-fA-F]{1,4})-([0-9a-fA-F]{1,4})$/;
 const SNAPSHOT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const DEFAULT_POOL = "0000-fffe";
+const PRIMARY_TTL_MS = 10 * 60 * 1000;
+const JOURNAL_VERSION = 1;
+const RESERVE_MAX = 5000;
 
 function readSettings(env = process.env) {
   return {
@@ -250,8 +259,15 @@ function createPergb(deps = {}) {
   let enableDoc = null; // enable.json
   let pool = null; // parsed pool file (on)
   let tagger = null;
-  let excludedSet = new Set(); // per-piece /64s: the last scan ∪ reservedLocal
+  let excludedSet = new Set(); // per-piece /64s: scan ∪ reservedLocal ∪ RADIUS reserved ∪ piece nets
+  let scanNets = new Set(); // the last accepted per-piece scan (a refused shrink keeps the union)
   const reservedLocal = new Set(); // reserve_nets answers since start (until released)
+  let radiusReserved = new Set(); // RADIUS `reserved` (after a start / an epoch change)
+  let pieceNets = new Map(); // A13-I: pieceNet -> { listId, accountId, login } of the RADIUS piece lists
+  let primaryCache = { ip: null, at: 0 };
+  let journal = null; // { version, refs: { ref: [subnet id] } } — every reservation this node made
+  let restorePending = false;
+  const restoreInfo = { at: null, reason: null, refs: 0, restored: 0, failures: [], skipped: null };
   const excludedInfo = { at: null, count: null, complete: null, error: null, pushes: 0, reason: null };
   let canary = null; // [[ip, port]] in use
   const radius = { epoch: null, seq: null, ready: null, dbRecovered: null, last: null, error: null, at: null };
@@ -285,6 +301,184 @@ function createPergb(deps = {}) {
     const p = params();
     const list = Array.isArray(p.ipv4s) && p.ipv4s.length ? p.ipv4s : enableDoc && enableDoc.egressIpv4 ? [enableDoc.egressIpv4] : [];
     return list.filter((ip) => net.isIPv4(String(ip)));
+  }
+
+  function rebuildExcluded() {
+    excludedSet = new Set([...scanNets, ...reservedLocal, ...radiusReserved, ...pieceNets.keys()]);
+  }
+
+  // The node's primary IPv4 (A9 / A13-I: the IPv4 egress of per-piece
+  // proxies): option A's entry address, else the default route's source.
+  async function primaryIpv4() {
+    const e = enableDoc;
+    if (e && !e.dedicatedIpv4 && e.egressIpv4 && net.isIPv4(String(e.egressIpv4))) return String(e.egressIpv4);
+    if (primaryCache.ip && now() - primaryCache.at < PRIMARY_TTL_MS) return primaryCache.ip;
+    let ip = null;
+    try {
+      ip = await rt.detectPrimaryIpv4({ run });
+    } catch {}
+    if (ip && egressIpv4s().includes(ip)) {
+      log.error(`[pergb] the default route's source ${ip} is a per-GB IPv4: no primary IPv4 for pieces`);
+      ip = null;
+    }
+    if (ip) primaryCache = { ip, at: now() };
+    return ip || primaryCache.ip;
+  }
+
+  function primaryKnown() {
+    const e = enableDoc;
+    if (e && !e.dedicatedIpv4 && e.egressIpv4 && net.isIPv4(String(e.egressIpv4))) return String(e.egressIpv4);
+    return primaryCache.ip;
+  }
+
+  // ── the reservation journal (A13-I) ─────────────────────────────────────
+
+  function journalPath() {
+    return path.join(settings.stateDir, "reservations.json");
+  }
+
+  function loadJournal() {
+    if (journal) return journal;
+    journal = { version: JOURNAL_VERSION, refs: {} };
+    let raw;
+    try {
+      raw = JSON.parse(fs.readFileSync(journalPath(), "utf-8"));
+    } catch (e) {
+      if (e && e.code !== "ENOENT") log.error(`[pergb] ${journalPath()} unreadable (${e.message || e}); starting a new one`);
+      return journal;
+    }
+    if (raw && raw.version === JOURNAL_VERSION && raw.refs && typeof raw.refs === "object") {
+      for (const [ref, ids] of Object.entries(raw.refs)) {
+        if (!REF_RE.test(ref) || !Array.isArray(ids)) continue;
+        const ok = ids.filter((n) => Number.isInteger(n) && n >= 0 && n < 0xffff);
+        if (ok.length) journal.refs[ref] = [...new Set(ok)];
+      }
+    }
+    return journal;
+  }
+
+  function saveJournal() {
+    const j = loadJournal();
+    try {
+      fs.mkdirSync(settings.stateDir, { recursive: true });
+      const tmp = `${journalPath()}.tmp`;
+      const fd = fs.openSync(tmp, "w", 0o600);
+      try {
+        fs.writeSync(fd, JSON.stringify(j));
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(tmp, journalPath());
+      return true;
+    } catch (e) {
+      log.error(`[pergb] reservation journal: ${e.message || e}`);
+      event("pergb_journal_write_failed", { error: String(e.message || e).slice(0, 200) });
+      return false;
+    }
+  }
+
+  function journalAdd(ref, ids) {
+    const j = loadJournal();
+    const set = new Set(ids);
+    for (const [r, nets] of Object.entries(j.refs)) {
+      if (r === ref) continue;
+      const left = nets.filter((n) => !set.has(n));
+      if (left.length !== nets.length) {
+        if (left.length) j.refs[r] = left;
+        else delete j.refs[r];
+      }
+    }
+    j.refs[ref] = [...new Set([...(j.refs[ref] || []), ...ids])];
+    saveJournal();
+  }
+
+  function journalRelease(ids) {
+    const j = loadJournal();
+    const set = new Set(ids);
+    let changed = false;
+    for (const [r, nets] of Object.entries(j.refs)) {
+      const left = nets.filter((n) => !set.has(n));
+      if (left.length !== nets.length) {
+        changed = true;
+        if (left.length) j.refs[r] = left;
+        else delete j.refs[r];
+      }
+    }
+    if (changed) saveJournal();
+  }
+
+  // RADIUS `reserved` [[net, ref]] -> radiusReserved; the journal learns what it
+  // lacks (reservations made before it existed) and RADIUS's ref of every net it
+  // holds. Never removes a net from the journal: a RADIUS that lost its DB
+  // answers an empty list.
+  async function refreshReserved() {
+    let r;
+    try {
+      r = await ctl.call("reserved", {});
+    } catch (e) {
+      if (e.code !== "unknown_op") log.error(`[pergb] reserved from RADIUS: ${e.code || e.message}`);
+      return null;
+    }
+    const items = (Array.isArray(r && r.nets) ? r.nets : []).filter((x) => Array.isArray(x) && Number.isInteger(x[0]) && REF_RE.test(String(x[1])));
+    radiusReserved = new Set(items.map((x) => x[0]));
+    const j = loadJournal();
+    const refOf = new Map();
+    for (const [ref, nets] of Object.entries(j.refs)) for (const n of nets) refOf.set(n, ref);
+    let changed = 0;
+    for (const [n, ref] of items) {
+      const cur = refOf.get(n);
+      if (cur === ref) continue;
+      if (cur !== undefined) {
+        const left = j.refs[cur].filter((x) => x !== n);
+        if (left.length) j.refs[cur] = left;
+        else delete j.refs[cur];
+      }
+      (j.refs[ref] = j.refs[ref] || []).push(n);
+      changed += 1;
+    }
+    if (changed) saveJournal();
+    rebuildExcluded();
+    return { reserved: radiusReserved.size, journalChanged: changed };
+  }
+
+  // Re-reserve every journal entry exactly (RADIUS lost its DB, or a start).
+  async function restoreReservations(reason) {
+    const st = radius.last;
+    const features = st && Array.isArray(st.features) ? st.features : [];
+    const j = loadJournal();
+    const refs = Object.entries(j.refs);
+    Object.assign(restoreInfo, { at: new Date(now()).toISOString(), reason, refs: refs.length, restored: 0, failures: [], skipped: null });
+    if (!refs.length) {
+      restorePending = false;
+      return { ...restoreInfo };
+    }
+    if (!features.includes("reserveExact")) {
+      // an older RADIUS would read the call as a count-based reserve (new nets)
+      restoreInfo.skipped = "radius_without_reserve_exact";
+      restorePending = false;
+      return { ...restoreInfo };
+    }
+    let transient = false;
+    for (const [ref, ids] of refs) {
+      const nets = ids.slice(0, RESERVE_MAX);
+      try {
+        const r = await ctl.call("reserve_nets", { owner: "perpiece", ref, nets, count: nets.length }, { timeoutMs: 30000 });
+        restoreInfo.restored += Number(r.restored) || 0;
+        for (const n of nets) radiusReserved.add(n);
+      } catch (e) {
+        const code = e.code || e.message;
+        if (["radius_unavailable", "db_write_failed", "not_ready"].includes(code)) transient = true;
+        if (restoreInfo.failures.length < 50) restoreInfo.failures.push({ ref, error: code, nets: e.reply && e.reply.nets ? e.reply.nets.slice(0, 10) : undefined });
+      }
+    }
+    restorePending = transient;
+    rebuildExcluded();
+    if (restoreInfo.restored || restoreInfo.failures.length) {
+      event("pergb_reservations_restored", { reason, refs: refs.length, restored: restoreInfo.restored, failures: restoreInfo.failures.length });
+      if (restoreInfo.failures.length) log.error(`[pergb] restoring ${restoreInfo.failures.length} reservation(s) failed: ${JSON.stringify(restoreInfo.failures.slice(0, 3))}`);
+    }
+    return { ...restoreInfo };
   }
 
   function units() {
@@ -343,6 +537,7 @@ function createPergb(deps = {}) {
     ctx: () => ({
       tagger,
       excluded: excludedSet,
+      pieceOf: (subnetId) => pieceNets.get(subnetId) || null,
       tupleLogin: (k) => meter.tupleLogin(k),
       listAccount: (id) => enforcer.listAccount(id),
       loginAccount: (login) => enforcer.loginAccount(login),
@@ -390,6 +585,11 @@ function createPergb(deps = {}) {
     statfs: deps.statfs,
     enable: () => enableDoc,
     egressIpv4s,
+    // A13-I: the primary IPv4 carries the pieces' IPv4 (in option A it is the egress already)
+    extraIpv4s: () => {
+      const ip = primaryKnown();
+      return ip ? [ip] : [];
+    },
     meterLagSec: () => meter.status().meterLagSec,
     liveSessions: async () => {
       const v = await socketView(1000);
@@ -434,7 +634,10 @@ function createPergb(deps = {}) {
 
   async function pushFacts() {
     if (!enableDoc || !pool) return { ok: false, error: "pergb_off" };
-    await ctl.call("facts", { facts: buildFacts() });
+    const facts = buildFacts();
+    const p4 = await primaryIpv4();
+    if (p4) facts.primaryIpv4 = p4;
+    await ctl.call("facts", { facts });
     return { ok: true };
   }
 
@@ -447,13 +650,15 @@ function createPergb(deps = {}) {
     lastExcludedAt = now();
     try {
       const r = await ctl.call("excluded", { nets, complete: scan.complete, scanId });
-      excludedSet = new Set([...scan.nets, ...reservedLocal]);
+      scanNets = new Set(scan.nets);
+      rebuildExcluded();
       Object.assign(excludedInfo, { at: new Date(now()).toISOString(), count: r.excluded, scanned: nets.length, complete: scan.complete, error: null });
       excludedInfo.pushes += 1;
       return { ok: true, excluded: r.excluded, scanned: nets.length, complete: scan.complete };
     } catch (e) {
       // a refused shrink keeps its additions in RADIUS; locally the union stays
-      for (const id of scan.nets) excludedSet.add(id);
+      for (const id of scan.nets) scanNets.add(id);
+      rebuildExcluded();
       Object.assign(excludedInfo, { at: new Date(now()).toISOString(), error: e.code || e.message, complete: scan.complete });
       if (e.code === "excluded_shrink") event("pergb_excluded_shrink_refused", { wouldRemove: e.reply && e.reply.wouldRemove, limit: e.reply && e.reply.limit });
       log.error(`[pergb] excluded push (${reason}) failed: ${e.code || e.message}`);
@@ -467,7 +672,15 @@ function createPergb(deps = {}) {
     meter.setLogins(lists);
     enforcer.setLists(lists);
     enforcer.setAccounts((a && a.accounts) || []);
-    return { lists: lists.length, accounts: ((a && a.accounts) || []).length };
+    const pieces = new Map();
+    for (const x of lists) {
+      if (x && x.kind === "piece" && Number.isInteger(Number(x.pieceNet))) {
+        pieces.set(Number(x.pieceNet), { listId: Number(x.id), accountId: Number(x.accountId), login: String(x.login || "") });
+      }
+    }
+    pieceNets = pieces;
+    rebuildExcluded();
+    return { lists: lists.length, accounts: ((a && a.accounts) || []).length, pieces: pieces.size };
   }
 
   async function radiusWatch(force = false) {
@@ -492,13 +705,19 @@ function createPergb(deps = {}) {
     Object.assign(radius, { epoch: st.epoch, seq: st.seq, ready: st.ready, dbRecovered: st.dbRecovered, last: st, error: null, at: new Date(now()).toISOString() });
     if (enableDoc && enableDoc.enabled && pool && (force || epochChanged || st.ready === false)) {
       if (epochChanged) event("pergb_radius_epoch_changed", { epoch: st.epoch, dbRecovered: st.dbRecovered });
+      const reason = epochChanged ? "radius_epoch" : force ? "start" : "radius_not_ready";
       try {
         await pushFacts();
-        await pushExcluded(epochChanged ? "radius_epoch" : force ? "start" : "radius_not_ready");
+        await pushExcluded(reason);
         smart.onRadiusEpoch();
+        // A13-I: a lost DB lost the reservations — the pieces' /64s first
+        await restoreReservations(reason);
+        await refreshReserved();
       } catch (e) {
         log.error(`[pergb] re-push to RADIUS failed: ${e.code || e.message}`);
       }
+    } else if (restorePending && enableDoc && enableDoc.enabled && pool) {
+      await restoreReservations("retry").catch(() => null);
     }
     if (force || epochChanged || seqChanged || !meter.loginsReady()) {
       try {
@@ -977,6 +1196,7 @@ function createPergb(deps = {}) {
     }
     stagingBytes -= s.bytes;
     staging.delete(id);
+    if (restorePending) await restoreReservations("before_snapshot").catch(() => null);
     let reply;
     try {
       reply = await ctl.call("snapshot", { seq, accounts, lists, static: stat });
@@ -992,7 +1212,7 @@ function createPergb(deps = {}) {
     } catch (e) {
       log.error(`[pergb] refresh after snapshot: ${e.code || e.message}`);
     }
-    return { status: 200, body: { success: true, epoch: reply.epoch, seq: reply.seq, transitions: reply.transitions, static: reply.static || null, killed } };
+    return { status: 200, body: { success: true, epoch: reply.epoch, seq: reply.seq, transitions: reply.transitions, static: reply.static || null, pieces: reply.pieces || null, killed } };
   }
 
   async function patchState(body) {
@@ -1000,6 +1220,7 @@ function createPergb(deps = {}) {
     const b = body || {};
     if (!Number.isSafeInteger(Number(b.baseSeq)) || !Number.isSafeInteger(Number(b.seq))) return bad("bad_request", "baseSeq and seq are integers");
     for (const k of ["accounts", "lists"]) if (b[k] !== undefined && !Array.isArray(b[k])) return bad("bad_request", `${k} must be a list`);
+    if (restorePending) await restoreReservations("before_apply").catch(() => null);
     let reply;
     try {
       reply = await ctl.call("apply", { baseSeq: Number(b.baseSeq), seq: Number(b.seq), accounts: b.accounts || [], lists: b.lists || [] });
@@ -1015,21 +1236,39 @@ function createPergb(deps = {}) {
     } catch (e) {
       log.error(`[pergb] refresh after apply: ${e.code || e.message}`);
     }
-    return { status: 200, body: { success: true, epoch: reply.epoch, seq: reply.seq, transitions: reply.transitions, killed } };
+    return { status: 200, body: { success: true, epoch: reply.epoch, seq: reply.seq, transitions: reply.transitions, pieces: reply.pieces || null, killed } };
   }
 
   // ── A1: per-piece takes /64s of the pool through RADIUS ─────────────────
 
+  // {count, owner, ref, force?} — or, A13-I, {ref, nets: [/64…], owner?, count?}:
+  // exactly these /64s (restoring known reservations; 409 net_unavailable).
   async function reserveNets(body) {
     const p = readPool();
     if (p.state !== "on") return { status: 404, body: { success: false, error: "pergb_off" } };
     const b = body || {};
-    const count = Number(b.count);
-    if (!Number.isInteger(count) || count < 1 || count > 5000) return bad("bad_request", "count must be 1..5000");
     if (!REF_RE.test(String(b.ref || ""))) return bad("bad_request", "ref must match [A-Za-z0-9:._-]{1,128}");
     if (b.owner !== undefined && b.owner !== "perpiece") return bad("bad_request", "owner must be perpiece");
-    const req = { count, owner: "perpiece", ref: String(b.ref) };
-    if (b.force === true) req.force = true;
+    const req = { owner: "perpiece", ref: String(b.ref) };
+    if (b.nets !== undefined && b.nets !== null) {
+      if (!Array.isArray(b.nets) || b.nets.length < 1 || b.nets.length > RESERVE_MAX) return bad("bad_request", `nets must be a list of 1..${RESERVE_MAX} /64s`);
+      const ids = [];
+      for (const n of b.nets) {
+        const id = subnetIdOf(p.prefixBase, n);
+        if (id === null) return bad("bad_request", `not a /64 of ${p.prefix}: ${JSON.stringify(n)}`);
+        if (!ids.includes(id)) ids.push(id);
+      }
+      if (b.count !== undefined && Number(b.count) !== ids.length) return bad("bad_request", "count must equal the number of nets");
+      const features = radius.last && Array.isArray(radius.last.features) ? radius.last.features : null;
+      if (features && !features.includes("reserveExact")) return { status: 501, body: { success: false, error: "radius_unsupported", op: "reserve_nets.nets" } };
+      req.nets = ids;
+      req.count = ids.length;
+    } else {
+      const count = Number(b.count);
+      if (!Number.isInteger(count) || count < 1 || count > RESERVE_MAX) return bad("bad_request", `count must be 1..${RESERVE_MAX}`);
+      req.count = count;
+      if (b.force === true) req.force = true;
+    }
     let reply;
     try {
       reply = await ctl.call("reserve_nets", req, { timeoutMs: 30000 });
@@ -1041,8 +1280,12 @@ function createPergb(deps = {}) {
     for (const id of ids) {
       excludedSet.add(id);
       reservedLocal.add(id);
+      radiusReserved.add(id);
     }
-    return { status: 200, body: { success: true, ref: reply.ref || req.ref, nets: ids.map((id) => netText(p.prefixBase, id)), subnetIds: ids, prefix: p.prefix } };
+    journalAdd(req.ref, ids);
+    const out = { success: true, ref: reply.ref || req.ref, nets: ids.map((id) => netText(p.prefixBase, id)), subnetIds: ids, prefix: p.prefix };
+    if (reply.restored !== undefined) out.restored = reply.restored;
+    return { status: 200, body: out };
   }
 
   async function releaseNets(body) {
@@ -1065,7 +1308,12 @@ function createPergb(deps = {}) {
       const h = httpError(e);
       return { status: h.status, body: h.body };
     }
-    for (const id of ids) reservedLocal.delete(id);
+    for (const id of ids) {
+      reservedLocal.delete(id);
+      radiusReserved.delete(id);
+    }
+    journalRelease(ids);
+    rebuildExcluded();
     return { status: 200, body: { success: true, released: reply.released, coolDownUntil: reply.coolDownUntil === undefined ? null : reply.coolDownUntil } };
   }
 
@@ -1181,6 +1429,17 @@ function createPergb(deps = {}) {
       enforcer: enforcer.status(),
       kill: killer.status(),
       excluded: { ...excludedInfo, local: excludedSet.size },
+      pieces: {
+        lists: pieceNets.size,
+        primaryIpv4: primaryKnown(),
+        reservedRadius: radiusReserved.size,
+        journal: (() => {
+          const j = loadJournal();
+          return { refs: Object.keys(j.refs).length, nets: Object.values(j.refs).reduce((n, x) => n + x.length, 0) };
+        })(),
+        restore: { ...restoreInfo, pending: restorePending },
+        lastRejected: st && st.pieces ? st.pieces.lastRejected : null,
+      },
       smartRotation: smart.status(st && st.smartRotation ? st.smartRotation : null),
       events: events.slice(-20),
     };
@@ -1309,12 +1568,25 @@ function createPergb(deps = {}) {
     let listId = null;
     let tagValid = false;
     let subnet = null;
+    let kind = null;
+    let piece = null;
     if (net.isIPv6(addr) && tagger) {
       const d = tagger.decodeAddress(addr);
       if (d) {
         subnet = d.subnetId;
-        tagValid = d.valid && !excludedSet.has(d.subnetId);
-        listId = tagValid ? d.listId : null;
+        const pc = pieceNets.get(d.subnetId);
+        if (pc) {
+          // A13-I: a piece's /64 is its own; its address is fixed
+          const exact = tagger.pieceAddress(d.subnetId, pc.listId) === tagLib.bigToIpv6(tagLib.ipv6ToBig(addr));
+          tagValid = d.valid && d.listId === pc.listId;
+          listId = tagValid ? pc.listId : null;
+          kind = "piece";
+          piece = { listId: pc.listId, accountId: pc.accountId, login: pc.login, exact };
+        } else {
+          tagValid = d.valid && !excludedSet.has(d.subnetId);
+          listId = tagValid ? d.listId : null;
+          kind = tagValid ? "pergb" : excludedSet.has(d.subnetId) ? "perpiece" : null;
+        }
       }
     }
     const want = net.isIPv6(addr) ? tagLib.ipv6ToBig(addr) : addr;
@@ -1343,7 +1615,7 @@ function createPergb(deps = {}) {
     const found = await haproxyClients(keys);
     // I6: clients = the "ip:port" of the real clients; the matched log lines alongside
     const clients = [...new Set(found.map((c) => c.client))];
-    return { status: 200, body: { success: true, addr, from: new Date(from).toISOString(), to: new Date(to).toISOString(), listId, tagValid, subnet, records, clients, clientsDetail: found } };
+    return { status: 200, body: { success: true, addr, from: new Date(from).toISOString(), to: new Date(to).toISOString(), listId, tagValid, subnet, kind, piece, records, clients, clientsDetail: found } };
   }
 
   // The compact /health block (plain listener; no secrets).
@@ -1353,6 +1625,7 @@ function createPergb(deps = {}) {
     return {
       enabled: Boolean(enableDoc && enableDoc.enabled === true),
       pool: pool ? { prefix: pool.prefix, pool: pool.pool } : null,
+      pieces: pieceNets.size,
       radiusAlive: g.radiusAlive,
       live: sockCache ? sockCache.view.v4.length + sockCache.view.loopUnknown : null,
       guards: {
@@ -1423,6 +1696,8 @@ function createPergb(deps = {}) {
     probeTick,
     pushExcluded,
     pushFacts,
+    restoreReservations,
+    refreshReserved,
     refreshCanary,
     radiusWatch,
     meter,
@@ -1436,6 +1711,8 @@ function createPergb(deps = {}) {
     _staging: staging,
     _tagger: () => tagger,
     _excluded: () => excludedSet,
+    _pieceNets: () => pieceNets,
+    _journal: () => loadJournal(),
   };
 }
 

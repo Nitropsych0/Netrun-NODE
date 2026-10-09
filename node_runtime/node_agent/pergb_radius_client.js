@@ -12,7 +12,7 @@
 //   err.code = "radius_unavailable"  the socket is missing / refused, the
 //                                    reply timed out, was cut or was not JSON
 //   err.code = <the RADIUS error>    bad_request, unknown_op, seq_mismatch,
-//                                    excluded_shrink, capacity, ref_conflict,
+//                                    excluded_shrink, capacity, ref_conflict, net_unavailable,
 //                                    unknown_account, not_ready,
 //                                    db_write_failed, internal
 //   err.reply = the RADIUS reply (seq_mismatch carries epoch and seq)
@@ -142,6 +142,7 @@ function httpError(err) {
     case "excluded_shrink":
     case "capacity":
     case "ref_conflict":
+    case "net_unavailable":
       return { status: 409, body: { success: false, error: code, ...stripError(reply) } };
     case "bad_request":
       return { status: 400, body: { success: false, error: "bad_request", detail: reply.detail || null } };

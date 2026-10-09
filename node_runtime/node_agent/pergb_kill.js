@@ -13,7 +13,9 @@
 // Attribution:
 //   - IPv6: the outbound socket's local address -> its /64 must not be a
 //     per-piece one (excluded) -> the tag MAC must be valid -> decode -> list
-//     -> account;
+//     -> account. A per-piece proxy on RADIUS (A13-I) has a /64 of its own
+//     (pieceOf): a socket there belongs to that piece list only when its tag
+//     decodes to that list; kills of a piece target only its sockets;
 //   - IPv4: the loopback tuple of the accepted socket -> the base login the
 //     meter saw in that session's records (pergb_meter sessions) -> account.
 //     A session without any record yet holds < 2·L' and is killed on the
@@ -102,8 +104,9 @@ function tupleFilter(socks) {
 
 // Classify sockets (one unit's or the fallback listing).
 //   ctx: { tagger (pergb_tag createTagger | null), excluded (Set of subnet
-//   ids), tupleLogin(key) -> base login | null, listAccount(listId) ->
-//   accountId | null, loginAccount(login) -> accountId | null }
+//   ids), pieceOf(subnetId) -> { listId, accountId } | null (A13-I: the /64s
+//   of per-piece proxies on RADIUS), tupleLogin(key) -> base login | null,
+//   listAccount(listId) -> accountId | null, loginAccount(login) -> accountId | null }
 // -> { v6: [...], v4: [...], loopUnknown: n, other: n }
 function classify(socks, ctx) {
   const v6 = [];
@@ -126,6 +129,18 @@ function classify(socks, ctx) {
       const d = ctx.tagger.decodeAddress(s.local);
       if (!d) {
         other += 1;
+        continue;
+      }
+      const piece = ctx.pieceOf ? ctx.pieceOf(d.subnetId) : null;
+      if (piece) {
+        // a piece's /64 is exclusive: only its own tagged address is its socket
+        if (!d.valid || d.listId !== piece.listId) {
+          other += 1;
+          continue;
+        }
+        const listAcct = ctx.listAccount ? ctx.listAccount(d.listId) : null;
+        const accountId = listAcct === null || listAcct === undefined ? (piece.accountId === undefined ? null : piece.accountId) : listAcct;
+        v6.push({ ...s, listId: d.listId, subnetId: d.subnetId, accountId, piece: true });
         continue;
       }
       if (ctx.excluded && ctx.excluded.has(d.subnetId)) {

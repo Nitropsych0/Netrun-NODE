@@ -44,7 +44,7 @@ test("countLocalPorts: distinct local ports of the address inside the range, any
   assert.strictEqual(guardsLib.countLocalPorts(text, "203.0.113.5", 1024, 8000), 2);
 });
 
-function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessions = new Map(), probe = null, ips = ["203.0.113.5"], portsByIp = null } = {}) {
+function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessions = new Map(), probe = null, ips = ["203.0.113.5"], portsByIp = null, extraIps = null } = {}) {
   const files = {};
   const set = (m, p) => {
     files[path.join("/cg", SLICE, "memory.current")] = String(Math.round(m * 10 * 1024 * 1024));
@@ -85,6 +85,7 @@ function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessio
     settings: { cgroupRoot: "/cg", sliceCgroup: SLICE, logDir: "/logs", portRangeFile: "/proc/range" },
     enable: () => ({ sliceMemMax: 1200 * 1024 * 1024 }),
     egressIpv4s: () => ips,
+    ...(extraIps ? { extraIpv4s: () => extraIps } : {}),
     meterLagSec: () => st.lag,
     liveSessions: async () => sessions,
     probe,
@@ -199,4 +200,21 @@ test("A7: several egress IPv4s — the guard works per address; IPv4 stays open 
   push = e.ctl.calls.filter((c) => c.op === "ipv4_admission").pop().body;
   assert.deepStrictEqual(push, { open: true, addrs: { "198.51.100.1": true, "198.51.100.2": false } });
   assert.strictEqual(s.ipv4.length, 2);
+});
+
+test("A13-I: the primary IPv4 (pieces) is measured and pushed per address, never part of the per-GB verdict", async () => {
+  const size = 8000 - 1024 + 1;
+  const e = env({ ips: ["198.51.100.1", "198.51.100.2"], extraIps: ["203.0.113.10", "198.51.100.1"], portsByIp: { "198.51.100.1": 10, "198.51.100.2": 10, "203.0.113.10": Math.ceil(size * 0.7) } });
+  let s = await e.g.tick();
+  assert.strictEqual(s.ipv4AdmissionOpen, true, "per-GB open although the primary is full");
+  let push = e.ctl.calls.filter((c) => c.op === "ipv4_admission").pop().body;
+  assert.deepStrictEqual(push, { open: true, addrs: { "198.51.100.1": true, "198.51.100.2": true, "203.0.113.10": false } });
+  assert.deepStrictEqual(s.ipv4.map((x) => [x.ip, x.role]), [["198.51.100.1", "pergb"], ["198.51.100.2", "pergb"], ["203.0.113.10", "piece"]]);
+  assert.ok(s.ipv4PortsPct < 1, "the per-GB figure ignores the primary");
+  // per-GB full, the primary free: per-GB closed, the primary open
+  e.st.portsByIp = { "198.51.100.1": Math.ceil(size * 0.7), "198.51.100.2": Math.ceil(size * 0.7), "203.0.113.10": 5 };
+  s = await e.g.tick();
+  push = e.ctl.calls.filter((c) => c.op === "ipv4_admission").pop().body;
+  assert.deepStrictEqual([push.open, push.addrs["203.0.113.10"]], [false, true]);
+  assert.strictEqual(s.ipv4AdmissionOpen, false);
 });
