@@ -486,6 +486,19 @@ class Configure(unittest.TestCase):
         self.assertEqual([(e[0], e[4]) for e in a.events], [("release", "prefix_changed")])
         a.check_invariants(clock())
 
+    def test_same_facts_again_keep_every_line(self):
+        a, clock = mk()
+        st = static(a, clock, 1, "p1")
+        se = sticky(a, clock, 1, "s:k")
+        pz = a.pause_line(1, "p2", 1, 5, clock())
+        a.events.clear()
+        a.configure(rtest.PREFIX_INT, rtest.PREFIX, 0, 0xFFFE, rtest.KEY, clock())
+        self.assertIs(a.static[(1, "p1")], st)
+        self.assertIs(a.sticky[(1, "s:k")], se)
+        self.assertIs(a.mode[(1, "p2")], pz)  # a facts re-push (agent restart) keeps the pause state
+        self.assertEqual(a.events, [])
+        a.check_invariants(clock())
+
     def test_smaller_pool_drops_the_outside_lines(self):
         a, clock = mk()
         lines = [static(a, clock, 1, "p%d" % i) for i in range(50)]

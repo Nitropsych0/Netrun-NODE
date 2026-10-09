@@ -271,14 +271,15 @@ class Allocator:
         self.prefix = prefix
         self.prefix_str = prefix_str
         self.tagger = Tagger(key) if (self.tagger is None or self.tagger.key != key) else self.tagger
+        range_changed = (self.lo, self.hi) != (lo, hi)
         self.lo, self.hi = lo, hi
-        for ln in list(self.static.values()) + list(self.sticky.values()):
-            if not lo <= ln.net <= hi:
-                self.release(ln, "pool_changed", now)
-        self.mode.clear()
-        for kinds in self.by_list.values():
-            for k in [k for k in kinds if k[0] == "mode"]:
-                kinds.discard(k)
+        if range_changed:
+            # derived addresses depend on the range: everything derived is recomputed
+            for ln in list(self.static.values()) + list(self.sticky.values()):
+                if not lo <= ln.net <= hi:
+                    self.release(ln, "pool_changed", now)
+            for ln in list(self.mode.values()):
+                self._drop(ln)
         self.rebuild(now)
 
     def _forget_all(self, reason: str, now: float):
