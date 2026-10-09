@@ -416,6 +416,27 @@ class ReserveRelease(unittest.TestCase):
         for n in nets:
             self.assertIn(n, a.free)
 
+    def test_release_never_touches_a_per_gb_64(self):
+        a, clock = mk()
+        b = static(a, clock, 1, "p1")
+        count, _ = a.release_nets([b.net, 4321], "oops", clock())
+        self.assertEqual(count, 1)
+        self.assertIn((1, "p1"), a.bindings)
+        self.assertNotIn(b.net, a.cooldown)
+        a.check_invariants(clock())
+
+    def test_reserve_when_most_64s_were_just_rotated(self):
+        a, clock = mk(lo=0, hi=999)
+        for n in range(1000):
+            a.last_used[n] = int(clock()) if n >= 30 else int(clock()) - 3600 + n
+        nets = a.reserve(20, "busy", clock(), min_free=0)
+        self.assertEqual(len(set(nets)), 20)
+        self.assertTrue(set(nets) <= set(range(30)), nets)  # only /64s unused for > 60 s
+        with self.assertRaises(CtlRefused) as cm:
+            a.reserve(20, "busy2", clock(), min_free=0)
+        self.assertEqual(cm.exception.code, "capacity")
+        self.assertEqual(cm.exception.extra["eligible"], 10)
+
     def test_release_of_a_scan_found_net_still_cools_down(self):
         a, clock = mk()
         a.apply_scan([77], True, "a", clock())

@@ -343,11 +343,9 @@ class Allocator:
         too_recent = now - RESERVE_ROTATED_MIN_AGE
         last_used = self.last_used
         free = self.free
-        for _ in range(count):
+        while len(picked) < count:
             best = None
             for _try in range(BEST_OF * 8):
-                if len(free) <= len(chosen):
-                    break
                 n = free.pick(self.rng)
                 if n in chosen or last_used[n] > too_recent:
                     continue
@@ -356,13 +354,16 @@ class Allocator:
                 if _try >= BEST_OF - 1 and best is not None:
                     break
             if best is None:
-                # sparse eligible set: one ordered pass over free
-                for n in free.items:
-                    if n not in chosen and last_used[n] <= too_recent:
-                        best = n
-                        break
-            if best is None:
-                raise CtlRefused("capacity", free=len(free), detail="recently_used")
+                # most free /64s were used in the last minute: take the oldest eligible ones
+                eligible = sorted(
+                    (n for n in free.items if n not in chosen and last_used[n] <= too_recent),
+                    key=last_used.__getitem__,
+                )
+                need = count - len(picked)
+                if len(eligible) < need:
+                    raise CtlRefused("capacity", free=len(free), eligible=len(eligible), detail="recently_used")
+                picked.extend(eligible[:need])
+                break
             chosen.add(best)
             picked.append(best)
         for n in picked:
@@ -375,14 +376,17 @@ class Allocator:
         return list(picked)
 
     def release_nets(self, nets, ref: str, now: float):
-        """release_nets: per-piece hands /64s back; they rejoin after the cool-down."""
+        """release_nets: per-piece hands /64s back; they rejoin after the cool-down.
+
+        A /64 that per-GB holds bindings on is not per-piece's to release: it is
+        skipped (a late or wrong release must never cost a customer a static IP)."""
         if ref in self.releases:
             return self.releases[ref]
         until = now + COOLDOWN_SEC
         count = 0
         for raw in nets:
             n = int(raw)
-            if not 0 <= n < NET_SELF:
+            if not 0 <= n < NET_SELF or n in self.holds:
                 continue
             count += 1
             self.reserved.pop(n, None)
