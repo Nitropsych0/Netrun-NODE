@@ -858,6 +858,75 @@ Tests: `node --test node_runtime/node_agent/pergb_runtime.test.js` (golden cfgs,
 smoke in a netns, the guard with real sockets per uid, live haproxy routing, the real
 installer twice + `systemd-analyze verify`) run in `.github/workflows/pergb-linux.yml`.
 
+## Pay-per-GB v2: the agent side (lane L3)
+
+The node agent drives the per-GB runtime (L2) and netrun-radius (L1): it
+enables it, forwards the orchestrator's state to RADIUS, meters the 3proxy
+logs, enforces the budgets, guards the box and answers on a TLS listener.
+Nothing of it runs while per-GB is not enabled on the node.
+
+| Module (`node_runtime/node_agent/`) | What |
+|---|---|
+| `pergb_tls_server.js` | HTTPS `:8086` with the node IP certificate (lego `<ip>.crt/.key`, else `/etc/netrun/tls/node.pem`), re-read every 30 s and swapped with `setSecureContext`; `X-API-KEY`; 2 MiB body limit |
+| `pergb_state.js` | enable / disable, snapshot pages + deltas to RADIUS (kills from `transitions`), usage, kill, attribution, port_check, reserve / release (A1), the loops |
+| `pergb_radius_client.js` | ctl client of `/run/netrun-radius/ctl.sock` (JSON lines; 503 `radius_unavailable`, 409 `seq_mismatch {epoch, seq}`) |
+| `pergb_meter.js` | hourly logs `p<sp>.log.YYYY.MM.DD-HH` → `meter.json` (cursor + counters in one atomic file: exactly once), archive + retention |
+| `pergb_enforcer.js` | limit rule, near-limit bound, heartbeat, `local_block`, kills, expiry |
+| `pergb_kill.js` | live per-GB sockets by cgroup (`ss ... cgroup`), attribution by tag / loopback tuple, `ss -K` by exact 4-tuple (256 per call) |
+| `pergb_guards.js` | slice admission (soft 90 %, hard 100 %, open < 80 %), log fs < 10 % / meter lag > 30 s, IPv4 local ports (close 60 %, open 50 %), RADIUS probe every 5 s (+ recovery) |
+| `pergb_smart.js`, `pergb_psl.js` | A12 smart rotation: (/64, site) failures → ctl `avoid`; site = eTLD+1 by the vendored PSL (`node_runtime/radius/public_suffix_list.dat`, `scripts/update_public_suffix_list.sh`) |
+| `pergb_ipv4.js` | A7: the per-GB IPv4s (`ip addr add`, netplan drop-in `60-netrun-pergb.yaml`, never `netplan apply`) |
+| `pergb_tag.js`, `pergb_radprobe.js` | I3 tag decode; the `netrun-svcprobe` Access-Request |
+
+Routes (all on `:8086`, I6): `GET /pergb/status`, `POST /pergb/enable`, `POST
+/pergb/disable`, `PUT /pergb/state?snapshotId&page&pages&seq` (page is 1-based;
+202 per page, 200 `{epoch, seq}` on the last; 409 `snapshot_mismatch`; staged
+120 s), `PATCH /pergb/state`, `GET /pergb/usage?since&bindingsAfter`, `POST
+/pergb/kill`, `GET /pergb/attribution?addr&from&to`, `GET
+/pergb/port_check?base&count&ipv4`, `POST /pergb/reserve_nets`, `POST
+/pergb/release_nets`. The plain `:8085` answers `/pergb/*` with 404
+`pergb_tls_only`, except `reserve_nets` / `release_nets` (the generator and
+per-piece deprovision on the node; 404 `pergb_off` without the pool file).
+`/health` carries a `pergb` block (no secrets), `/describe`
+`supports.pergb_radius = 1` and `supports.pergb_tls_port = 8086`, `/generate`
+answers 409 `ports_reserved_pergb` on the shared range or its +10000 shadow
+(option A).
+
+**Enable** (`POST /pergb/enable`, idempotent): the routed /48 (`no_routed_prefix`),
+the pool file must not say otherwise (`slice_mismatch`), the crt-list
+(`no_ip_cert`), the shared ports on the entry IPv4 (`ports_in_use`, the
+per-GB haproxy's own listeners excluded), the per-GB IPv4s (A7), then
+`pergb_runtime.apply()`, RADIUS facts and the per-piece /64 scan (`excluded`),
+and LAST the pool file `/etc/netrun/pergb-pool.conf` (`PREFIX`, `POOL`,
+`ENABLED=1`; A1). **Disable** removes the pool file FIRST (per-piece goes back
+to its own picks), then stops the runtime. The probe password is stored as
+`sha256(salt ‖ password)` in the facts; the salt is derived from the address key.
+
+**Loops**: meter → smart rotation → enforcer every 1 s (the meter does not
+advance before it has the RADIUS logins: nothing is lost as unknown), guards
+2 s, probe 5 s, a RADIUS watch every 2 s (a new epoch or `ready:false` → facts
+and `excluded` again, then logins / accounts), the per-piece /64 scan at start,
+after every `/generate` job and every 10 min, the canary refresh every 10 min.
+
+Settings (environment; tests point them at temp dirs): `NETRUN_RADIUS_CTL_SOCKET`,
+`NETRUN_RADIUS_ADDR` (127.0.0.1:1812), `NETRUN_PERGB_POOL_FILE`,
+`NETRUN_PERGB_STATE_DIR` (`/var/lib/netrun-pergb`: `meter.json`),
+`NETRUN_PERGB_TLS_PORT` (8086), `NETRUN_PERGB_TLS_HOST`, `NETRUN_PERGB_TLS=0`
+(no listener), `NETRUN_PERGB_TLS_CERT` / `_KEY` / `_PEM`, `NETRUN_PERGB_CGROUP_ROOT`,
+plus L2's `NETRUN_PERGB_ETC_DIR`, `NETRUN_PERGB_LOG_DIR`.
+
+Tests: `node --test node_runtime/node_agent/pergb_*.test.js
+node_runtime/node_agent/server.pergb.test.js` — the end-to-end one starts the
+real netrun-radius (python3) and needs openssl for its test certificates; the
+Linux-only `sudo scripts/test_pergb_agent_linux.sh --throwaway-host` checks the
+`ss` cgroup filter and `ss -K` by 4-tuple on a real kernel (V11). Both run in
+`.github/workflows/pergb-linux.yml` (jobs `l3-*`).
+
+Runbook: `curl -sk -H "X-API-KEY: $KEY" https://127.0.0.1:8086/pergb/status`
+(`radius.alive`, `guards`, `meter.logLagSec`, `enforcer.localBlocked`,
+`smartRotation`); a lost `meter.json` restarts the meter at the current log
+ends under a new epoch (event `pergb_meter_reset` with the unbilled bytes).
+
 ## IPv6 egress rotation (Wave IPV6-ROTATION)
 
 Changes the IPv6 address a proxy's **new** connections leave from, per port, without

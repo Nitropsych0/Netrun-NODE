@@ -27,6 +27,11 @@ const { nodeSetting } = require("./node_settings.js");
 const pergbPool = require("./pergb_pool.js");
 const pergbShield = require("./pergb_shield.js");
 const clockSync = require("./clock_sync.js");
+// Pay-per-GB v2 (lane L3) — the per-GB agent side: /pergb/* on the TLS
+// listener :8086 (pergb_tls_server.js), the meter / enforcer / guards loops
+// (pergb_state.js). Nothing runs while per-GB is not enabled on the node.
+const pergbStateLib = require("./pergb_state.js");
+const pergbTlsLib = require("./pergb_tls_server.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 // Wave FLEET-HEALTH (RES-10) — bind address. The unit template has always set
@@ -150,6 +155,9 @@ function apiKeyMatches(given, expected = API_KEY) {
 function ensureAuthorized(req) {
   return apiKeyMatches(req.headers["x-api-key"]);
 }
+
+const pergb = pergbStateLib.createPergb();
+const pergbServer = pergbTlsLib.createTlsServer({ pergb, apiKeyMatches: (given) => apiKeyMatches(given) });
 
 function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -3096,6 +3104,14 @@ async function handleGenerate(req, res) {
     return;
   }
   const credentialLines = credentialsParse.provided ? credentialsParse.lines : null;
+  // Pay-per-GB v2 (option A) — the shared per-GB range on the primary IPv4
+  // and its shadow (socks base+10000.., whose http mirror lands on it) are
+  // never a per-piece batch.
+  const pergbConflict = pergb.generateConflict(params.startPort, params.proxyCount);
+  if (pergbConflict) {
+    sendJson(res, 409, { success: false, status: "failed", jobId, ...pergbConflict });
+    return;
+  }
   const freshAddresses = toBool(body.freshAddresses ?? body.fresh_addresses, false);
   // Wave FLEET-HEALTH (RES-12) — reclaimable start ports; their presence (even
   // an empty list) switches kill-on-rebind to refuse-unless-listed.
@@ -3856,6 +3872,8 @@ async function handleGenerate(req, res) {
     }
     await releaseGenerationLock(lockPath, lockAttempt.lockRecord.ownerToken);
     scheduleJobPrune();
+    // Pay-per-GB v2 — the per-piece /64s may have changed: RADIUS `excluded`.
+    pergb.onGenerateDone();
   }
 }
 
@@ -4296,6 +4314,9 @@ async function handleHealth(req, res) {
     // (unknown), source, checkedAt, error }: the per-GB gate needs a synced
     // clock (nodes enforce expiresAt locally).
     clock,
+    // Pay-per-GB v2 — additive, no secrets: { enabled, pool, radiusAlive,
+    // live, guards } (the full state is GET /pergb/status on :8086).
+    pergb: { ...pergb.healthBlock(), tls: pergbServer.status() },
   });
 }
 
@@ -4325,6 +4346,9 @@ async function handleDescribe(req, res) {
     firewallDesired: firewall.settings().enabled,
     supervisor: supervisor.settings().enabled,
     httpsHostnames: httpsHostnames.settings().enabled,
+    // Pay-per-GB v2 — supports.pergb_radius / pergb_tls_port.
+    pergbRadius: true,
+    pergbTlsPort: pergbServer.port,
   });
   sendJson(res, 200, payload);
 }
@@ -4587,6 +4611,13 @@ const server = http.createServer(async (req, res) => {
     if (await egress.handleHttp(req, res, url, { sendJson, parseJsonBody, ensureAuthorized })) return;
   }
 
+  // Pay-per-GB v2 — /pergb/* lives on the TLS listener (:8086); here only
+  // the amendment-A1 reserve_nets / release_nets for node-local callers, the
+  // rest answers 404 pergb_tls_only.
+  if (pathname === "/pergb" || pathname.startsWith("/pergb/")) {
+    if (await pergbServer.handlePlain(req, res, url, { sendJson, parseJsonBody, ensureAuthorized })) return;
+  }
+
   sendJson(res, 404, { success: false, status: "failed", error: "not_found" });
 });
 
@@ -4644,6 +4675,11 @@ if (require.main === module) {
     // renew did not work through (a POST while a run was finishing, an agent
     // restart): one more run, once no run is in progress.
     httpsHostnames.start();
+    // Pay-per-GB v2 — the :8086 TLS listener (needs the node IP
+    // certificate; retried every 30 s), and the per-GB loops when per-GB is
+    // enabled here (facts + excluded to RADIUS at start).
+    pergbServer.start().catch((err) => console.error(`[node-agent] pergb TLS listener: ${(err && err.message) || err}`));
+    pergb.start().catch((err) => console.error(`[node-agent] pergb start: ${(err && err.message) || err}`));
   });
 }
 
@@ -4718,4 +4754,7 @@ module.exports = {
   evaluateProductProfileContract,
   buildProfileDiagnostics,
   nodeTuningStatus,
+  // Pay-per-GB v2 — exported for unit tests.
+  pergb,
+  pergbServer,
 };

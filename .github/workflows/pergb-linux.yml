@@ -180,3 +180,40 @@ jobs:
           bash scripts/test_https_hostnames.sh
       - name: Per-GB nft shields against the real kernel (private netns)
         run: sudo env "PATH=$PATH" unshare -n bash scripts/test_pergb_nft_shield.sh
+
+  l3-agent-pergb:
+    name: "L3: node agent per-GB (meter, enforcer, kills, guards, smart rotation, TLS :8086, e2e against the real netrun-radius) on node ${{ matrix.node }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: per-GB agent suites (python3 + openssl present, so nothing may skip)
+        run: |
+          node --test node_runtime/node_agent/pergb_*.test.js node_runtime/node_agent/server.pergb.test.js | tee "$RUNNER_TEMP/l3.out"
+          grep -q '^ℹ skipped 0$' "$RUNNER_TEMP/l3.out"
+      - name: the whole agent suite
+        run: node --test node_runtime/node_agent/*.test.js
+
+  l3-agent-linux:
+    name: "L3: per-GB sockets and kills on a real kernel (ss cgroup filter, ss -K by 4-tuple, V11)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: shellcheck
+        run: shellcheck -S warning scripts/test_pergb_agent_linux.sh
+      - name: ss listing / kills by cgroup and by address
+        run: sudo env "PATH=$PATH" bash scripts/test_pergb_agent_linux.sh --throwaway-host
