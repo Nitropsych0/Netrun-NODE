@@ -139,6 +139,10 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq haproxy rsyslog && (sudo systemctl stop haproxy || true)
       - name: Stubbed installer tests
         run: bash scripts/test_install_pergb.sh
+      - name: Certificate reload script (stubbed systemctl/haproxy) + shellcheck
+        run: |
+          shellcheck -S warning scripts/test_pergb_certs_reload.sh deploy/node/netrun-pergb-certs-reload.sh
+          bash scripts/test_pergb_certs_reload.sh
       - name: Real installer on this runner, twice
         run: sudo bash scripts/test_install_pergb.sh --real
 
