@@ -246,7 +246,9 @@ WAIT
   # single-threaded sink some accepts (reply 5) — both seen in CI, both outside
   # 3proxy. 95 % still proves the logins really authenticated through RADIUS.
   [ "$pm" -ge $((N_PATCHED * 95 / 100)) ] || fail "patched: only $pm/$N_PATCHED sessions succeeded"
-  [ "$sm" -ge $((N_STOCK * 95 / 100)) ] || fail "stock: only $sm/$N_STOCK sessions succeeded"
+  # the stock run only has to authenticate enough distinct logins for its leak
+  # to show (the RSS gate below); the stock binary also lacks IP_BIND_ADDRESS_NO_PORT
+  [ "$sm" -ge $((N_STOCK * 75 / 100)) ] || fail "stock: only $sm/$N_STOCK sessions succeeded"
   pg=$((p1 - p0)); sg=$((s1 - s0))
   [ "$pg" -lt 3072 ] || fail "patched RSS grew by $pg kB over $N_PATCHED logins (auth cache not off?)"
   [ "$sg" -gt 4096 ] && [ "$sg" -gt $((2 * (pg > 0 ? pg : 0))) ] || fail "stock RSS grew only $sg kB over $N_STOCK logins: the smoke does not show the leak"
