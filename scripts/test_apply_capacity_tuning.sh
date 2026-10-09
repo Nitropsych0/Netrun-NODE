@@ -135,6 +135,7 @@ if [ "\$1" = "-w" ]; then
     net.ipv4.ip_local_port_range) printf '%s\t%s\n' "\${v%% *}" "\${v##* }" > "\$NETRUN_TUNE_ROOT/proc/sys/net/ipv4/ip_local_port_range" ;;
     net.netfilter.nf_conntrack_max) [ "\${SYSCTL_CT_FAIL:-0}" = 1 ] && exit 1; echo "\$v" > "\$NETRUN_TUNE_ROOT/proc/sys/net/netfilter/nf_conntrack_max" ;;
     fs.pipe-user-pages-soft) echo "\$v" > "\$NETRUN_TUNE_ROOT/proc/sys/fs/pipe-user-pages-soft" ;;
+    vm.max_map_count) echo "\$v" > "\$NETRUN_TUNE_ROOT/proc/sys/vm/max_map_count" ;;
   esac
 fi
 EOF
@@ -547,5 +548,42 @@ rc="$(run_tool "$R" --only unbound)"
 grep -q 'WARNING 1 batch cfg(s) send customer DNS to third-party resolvers (legacy geo seed): 3proxy_33000.cfg' "$TMP/out" || { cat "$TMP/out"; fail "legacy DNS audit"; }
 grep -q 'ip_local_port_range 10000 65000 overlaps the proxy ports' "$TMP/out" || { cat "$TMP/out"; fail "ephemeral overlap audit"; }
 ok "audit: third-party nserver cfgs and an ephemeral range overlapping the proxy ports are reported (read-only)"
+
+# ── 20. --conntrack (pay-per-GB v2 capacity check): conntrack + maxmap only ─
+R="$(new_root pergbcap)"
+mkdir -p "$R/proc/sys/vm"; echo 65530 > "$R/proc/sys/vm/max_map_count"
+before="$(snapshot "$R")"
+rc="$(run_tool "$R" --conntrack)"
+[ "$rc" = 0 ] || { cat "$TMP/out"; fail "--conntrack dry-run exit $rc"; }
+grep -q 'steps: conntrack,maxmap |' "$TMP/out" || { cat "$TMP/out"; fail "--conntrack selects exactly conntrack + maxmap"; }
+grep -qE "maxmap +would-apply +vm.max_map_count -> 1048576; persisted 'none', runtime '65530'; do: persist runtime-raise" "$TMP/out" || { cat "$TMP/out"; fail "maxmap plan"; }
+grep -qE '\] (sysctl|unbound|nft) ' "$TMP/out" && fail "--conntrack ran a default step"
+[ "$before" = "$(snapshot "$R")" ] || fail "--conntrack dry-run modified the fixture root"
+rc="$(run_tool "$R" --only sysctl --conntrack)"
+grep -q 'steps: sysctl,conntrack,maxmap |' "$TMP/out" || { cat "$TMP/out"; fail "--conntrack adds to an explicit --only"; }
+# per-GB enabled with a large maxConns: the floor wins over the RAM size; a full table is reported
+mkdir -p "$R/etc/netrun-pergb"
+printf '{\n  "version": 1,\n  "enabled": true,\n  "base": 31000,\n  "maxConns": 100000\n}\n' > "$R/etc/netrun-pergb/enable.json"
+echo 60000 > "$R/proc/sys/net/netfilter/nf_conntrack_count"
+rc="$(run_tool "$R" --conntrack)"
+grep -qE "conntrack +would-apply +nf_conntrack_max -> 524288 \(MemTotal 3911456 kB, per-GB floor 524288 for maxConns 100000\)" "$TMP/out" || { cat "$TMP/out"; fail "per-GB conntrack floor"; }
+grep -q 'WARNING: the conntrack table is 91 % full (60000 of 65536 entries)' "$TMP/out" || { cat "$TMP/out"; fail "full-table warning"; }
+sed -i.bak 's/"enabled": true/"enabled": false/' "$R/etc/netrun-pergb/enable.json"
+rc="$(run_tool "$R" --conntrack)"
+grep -qE "conntrack +would-apply +nf_conntrack_max -> 262144 \(MemTotal 3911456 kB\);" "$TMP/out" || { cat "$TMP/out"; fail "a disabled per-GB adds no floor"; }
+# apply: raised + persisted; rerun ok; a higher runtime value is never lowered
+rc="$(run_tool "$R" --apply --conntrack)"
+[ "$rc" = 0 ] || { cat "$TMP/out"; fail "--conntrack apply exit $rc"; }
+[ "$(cat "$R/proc/sys/vm/max_map_count")" = 1048576 ] || fail "max_map_count not raised"
+grep -qx 'vm.max_map_count = 1048576' "$R/etc/sysctl.d/99-netrun.conf" || fail "max_map_count not persisted"
+grep -qx 'sysctl -w vm.max_map_count=1048576' "$CALLS" || fail "no sysctl -w vm.max_map_count"
+rc="$(run_tool "$R" --apply --conntrack)"
+[ "$rc" = 0 ] && grep -qE '\] maxmap +ok ' "$TMP/out" && grep -qE '\] conntrack +ok ' "$TMP/out" || { cat "$TMP/out"; fail "--conntrack rerun not ok"; }
+! grep -q 'sysctl -w' "$CALLS" || fail "--conntrack rerun mutated again"
+echo 2097152 > "$R/proc/sys/vm/max_map_count"
+rc="$(run_tool "$R" --apply --only maxmap)"
+[ "$(cat "$R/proc/sys/vm/max_map_count")" = 2097152 ] || fail "maxmap lowered a higher runtime value"
+rc="$(run_tool "$R" --only maxmap --max-map-count 100)"; [ "$rc" = 1 ] || fail "--max-map-count below 65530 accepted"
+ok "--conntrack: conntrack + maxmap only; per-GB floor from enable.json (enabled only); full-table warning; max_map_count raised + persisted, never lowered"
 
 echo "test_apply_capacity_tuning.sh — all $PASS checks passed"
