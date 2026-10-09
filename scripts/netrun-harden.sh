@@ -183,7 +183,7 @@ cmd_status() {
   if nft list table inet "$NFT_GUARD_TABLE" >/dev/null 2>&1; then log "A3 8085 firewall: on"; else log "A3 8085 firewall: OFF"; fi
   log "A6 authorized_keys comments: $(awk '{print $NF}' /root/.ssh/authorized_keys 2>/dev/null | tr '\n' ' ')"
   log "2026-10-08 credential files readable by others: $(open_cred_paths | wc -l | tr -d ' ')"
-  if nft list table inet netrun_proxy_guard 2>/dev/null | grep -q "meta skuid 65535 jump"; then log "2026-10-08 3proxy egress guard: on"; else log "2026-10-08 3proxy egress guard: OFF (or the old skuid != form)"; fi
+  if grep -q "meta skuid 65535 jump" <<< "$(nft list table inet netrun_proxy_guard 2>/dev/null)"; then log "2026-10-08 3proxy egress guard: on"; else log "2026-10-08 3proxy egress guard: OFF (or the old skuid != form)"; fi
   if [ -f /etc/systemd/system/nftables.service.d/netrun-boot-fallback.conf ]; then log "2026-10-08 nftables boot fallback: on"; else log "2026-10-08 nftables boot fallback: OFF"; fi
   if [ -f "$SSHD_HARDENING" ]; then log "2026-10-08 ssh keys-only: on"; else log "2026-10-08 ssh keys-only: OFF"; fi
   if [ -f "$UNBOUND_EGRESS_CONF" ]; then log "2026-10-08 unbound egress: $(awk '/outgoing-interface: .*:/ {print $2}' "$UNBOUND_EGRESS_CONF")"; else log "2026-10-08 unbound egress: primary addresses"; fi
@@ -432,7 +432,7 @@ cmd_dns_egress() {
   # The lookup above may have been answered over IPv4: say so when a query
   # sent FROM the address gets no answer (the prefix does not route back).
   if command -v dig >/dev/null 2>&1 \
-     && ! dig -b "$addr" +time=3 +tries=1 +norec @2001:500:2f::f . SOA 2>/dev/null | grep -q 'status: NOERROR'; then
+     && ! grep -q 'status: NOERROR' <<< "$(dig -b "$addr" +time=3 +tries=1 +norec @2001:500:2f::f . SOA 2>/dev/null)"; then
     log "WARNING dns-egress: no answer to a query sent from $addr — IPv6 recursion falls back to IPv4 until $prefix routes back (BGP)"
   fi
   log "dns-egress: unbound recurses from $addr ($net reserved for the node), prefer-ip6"

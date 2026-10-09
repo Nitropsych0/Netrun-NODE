@@ -334,7 +334,7 @@ audit_fingerprint() {
   # The nft part only with the fingerprint step (other steps stay nft-free).
   if want fingerprint && command -v nft >/dev/null 2>&1 && nft list table inet proxy_normalization >/dev/null 2>&1; then
     n="$(nft list table inet proxy_normalization 2>/dev/null | grep -c 'maxseg size set')"
-    log "audit: inet proxy_normalization present, MSS clamp rules: $n$(nft list table inet proxy_normalization 2>/dev/null | grep -q 'size set 1340' && echo ' (1340 = reads as OpenVPN!)') — removed by --only fingerprint"
+    log "audit: inet proxy_normalization present, MSS clamp rules: $n$(grep -q 'size set 1340' <<< "$(nft list table inet proxy_normalization 2>/dev/null)" && echo ' (1340 = reads as OpenVPN!)') — removed by --only fingerprint"
   fi
   if [ -r "$PROC_RANGE" ]; then
     range="$(awk '{ print $1 " " $2 }' "$PROC_RANGE")"

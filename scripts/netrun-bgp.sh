@@ -334,7 +334,7 @@ dry_diff() {
   return 0
 }
 
-has_local_route() { ip -6 route show table local dev lo | grep -qE "^local ${1}( |$)"; }
+has_local_route() { grep -qE "^local ${1}( |$)" <<< "$(ip -6 route show table local dev lo 2>/dev/null)"; }
 
 load_settings() {
   local plist
@@ -480,10 +480,10 @@ cmd_check() {
   load_settings
   local p bad=0
   for p in $PREFIXES; do has_local_route "$p" || { echo "missing local route: $p"; bad=1; }; done
-  if ! birdc show protocols "$PROTO" 2>/dev/null | grep -q Established; then
+  if ! grep -q Established <<< "$(birdc show protocols "$PROTO" 2>/dev/null)"; then
     echo "BGP session $PROTO is not Established"; bad=1
   fi
-  if ! nft list table inet "$GUARD_TABLE" 2>/dev/null | grep -q "tcp dport 179 drop"; then
+  if ! grep -q "tcp dport 179 drop" <<< "$(nft list table inet "$GUARD_TABLE" 2>/dev/null)"; then
     echo "the :179 guard (table inet $GUARD_TABLE) is not loaded"; bad=1
   fi
   [ "$bad" = 0 ] && echo "ok"
