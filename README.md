@@ -770,6 +770,17 @@ The shared per-GB ports authenticate through a local RADIUS server,
 `node_runtime/radius/` (units `deploy/node/netrun-radius.socket` / `.service`,
 state `/var/lib/netrun-radius/radius.db`, ctl `/run/netrun-radius/ctl.sock`).
 Design, ctl ops, runbook and tests: [node_runtime/radius/README.md](node_runtime/radius/README.md).
+It implements the 2026-10-09 amendments: one shared pool (A8: nothing is
+reserved for a per-GB customer, static addresses are derived), the list modes
+per_request / timer / link / static with link epochs (A10), the «липкая
+сессия» pause (A11), smart rotation (A12, ctl `avoid`), several egress IPv4s
+(A7/A9) and `release_nets` without a cool-down (A6).
+
+Deploying a RADIUS change: `/opt/netrun/radius` is a copy made by
+`deploy/node/install_pergb.sh` (re-run it alone after the checkout moved;
+it restarts nothing), then `systemctl restart netrun-radius.service` (the
+socket keeps the queue). The state DB is schema 2: a schema-1 file is moved
+aside like a corrupt one (new epoch, the orchestrator re-pushes everything).
 
 ## Pay-per-GB v2: the per-GB runtime (lane L2)
 
@@ -898,8 +909,13 @@ the pool file must not say otherwise (`slice_mismatch`), the crt-list
 per-GB haproxy's own listeners excluded), the per-GB IPv4s (A7), then
 `pergb_runtime.apply()`, RADIUS facts and the per-piece /64 scan (`excluded`),
 and LAST the pool file `/etc/netrun/pergb-pool.conf` (`PREFIX`, `POOL`,
-`ENABLED=1`; A1). **Disable** removes the pool file FIRST (per-piece goes back
-to its own picks), then stops the runtime. The probe password is stored as
+`ENABLED=1`; A1). New per-GB IPv4s are followed by a `netrun-proxy-guard apply`
+(they are the node's own addresses for both proxy uids at once). **Disable**
+removes the pool file FIRST (per-piece goes back to its own picks), then stops
+the runtime. Per-piece allocators of the agent (egress.js, deprovision,
+rebind) reserve and release pool /64s through the same service
+(`pergb_pool.setTransport(pergb.poolTransport)`), so its excluded set knows
+every lent /64 at once. The probe password is stored as
 `sha256(salt ‖ password)` in the facts; the salt is derived from the address key.
 
 **Loops**: meter → smart rotation → enforcer every 1 s (the meter does not
