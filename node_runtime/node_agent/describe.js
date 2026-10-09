@@ -19,6 +19,8 @@ async function buildDescribe({
   firewallDesired = false,
   supervisor = false,
   httpsHostnames = false,
+  pergbRadius = false,
+  pergbTlsPort = null,
 } = {}) {
   const ipv6 = healthSnapshot?.ipv6 || null;
   const ipv6Egress = healthSnapshot?.ipv6Egress || null;
@@ -58,6 +60,10 @@ async function buildDescribe({
       // Audit FO-08 — POST /https/hostnames (SNI certificates for the node's
       // DNS names); false when NODE_AGENT_HTTPS_HOSTNAMES=0.
       https_hostnames: Boolean(httpsHostnames),
+      // Pay-per-GB v2 — the RADIUS-based per-GB runtime (lists, /pergb/* on
+      // the TLS port below); 1 / the port when this agent has it.
+      pergb_radius: pergbRadius ? 1 : 0,
+      pergb_tls_port: pergbRadius ? Number(pergbTlsPort) || 8086 : null,
     },
   };
 }
