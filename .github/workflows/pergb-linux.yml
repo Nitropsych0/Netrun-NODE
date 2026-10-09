@@ -153,11 +153,13 @@ jobs:
         run: sudo bash scripts/test_install_pergb.sh --real
 
   l2-scripts:
-    name: "L2: capacity tuning (--conntrack, maxmap) and the touched script suites"
+    name: "L2: capacity tuning (--conntrack, maxmap, per-GB listener audit) and the touched script suites"
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning scripts/apply_capacity_tuning.sh scripts/test_apply_capacity_tuning.sh
       - run: bash scripts/test_apply_capacity_tuning.sh
       - run: bash scripts/test_3proxy_spawn.sh
       - run: bash scripts/test_capacity_18k_node.sh

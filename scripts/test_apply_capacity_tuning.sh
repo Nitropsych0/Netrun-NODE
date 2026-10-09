@@ -586,4 +586,84 @@ rc="$(run_tool "$R" --apply --only maxmap)"
 rc="$(run_tool "$R" --only maxmap --max-map-count 100)"; [ "$rc" = 1 ] || fail "--max-map-count below 65530 accepted"
 ok "--conntrack: conntrack + maxmap only; per-GB floor from enable.json (enabled only); full-table warning; max_map_count raised + persisted, never lowered"
 
+# ── 21. audit: pay-per-GB v2 listeners of the shared range are expected ─
+# NETRUN Chicago shape: shared ports 10000-10999, the per-GB haproxy on the
+# public IPv4 (master + worker share each socket), 3proxy-pergb on 127.0.0.3
+# (HTTP) and 127.0.0.4 (SOCKS5) for every port.
+R="$(new_root pergbaudit)"
+printf '1024\t8000\n' > "$R/proc/sys/net/ipv4/ip_local_port_range"   # no ephemeral-overlap warning here
+mkdir -p "$R/etc/netrun-pergb"
+cat > "$R/etc/netrun-pergb/enable.json" <<'EOF'
+{
+  "version": 1,
+  "enabled": true,
+  "base": 10000,
+  "count": 1000,
+  "last": 10999,
+  "egressIpv4": "45.32.10.20",
+  "maxConns": 8000,
+  "procs": [
+    { "sp": 10000, "first": 10000, "last": 10499 },
+    { "sp": 10500, "first": 10500, "last": 10999 }
+  ],
+  "params": { "base": 20000, "count": 5, "enabled": false }
+}
+EOF
+{
+  cat "$FIX/ss.txt"
+  for p in $(seq 10000 10999); do
+    echo "LISTEN 0 4096 45.32.10.20:$p 0.0.0.0:* users:((\"haproxy\",pid=5101,fd=$p),(\"haproxy\",pid=5100,fd=$p))"
+    echo "LISTEN 0 4096 127.0.0.3:$p 0.0.0.0:* users:((\"3proxy-pergb\",pid=5200,fd=$p))"
+    echo "LISTEN 0 4096 127.0.0.4:$p 0.0.0.0:* users:((\"3proxy-pergb\",pid=5300,fd=$p))"
+  done
+  echo 'LISTEN 0 4096 45.32.10.20:10000 0.0.0.0:* users:(("haproxy",pid=5101,fd=99))'
+} > "$TMP/ss_pergb.txt"
+{
+  cat "$TMP/ss_pergb.txt"
+  echo 'LISTEN 0 4096 0.0.0.0:10500 0.0.0.0:* users:(("3proxy-pergb",pid=5300,fd=7))'
+  echo 'LISTEN 0 4096 127.0.0.4:11000 0.0.0.0:* users:(("3proxy-pergb",pid=5300,fd=8))'
+  echo 'LISTEN 0 128 127.0.0.3:10002 0.0.0.0:* users:(("python3",pid=6000,fd=3))'
+} > "$TMP/ss_pergb_odd.txt"
+pergb_line='audit: per-GB shared ports 10000-10999 (enabled): haproxy 1000/1000, 3proxy-pergb 127.0.0.3 (HTTP) 1000/1000 + 127.0.0.4 (SOCKS5) 1000/1000 — expected, not counted above'
+before="$(snapshot "$R")"
+rc="$(SS_FIXTURE="$TMP/ss_pergb.txt" run_tool "$R")"
+[ "$rc" = 0 ] || { cat "$TMP/out"; fail "per-GB audit dry-run exit $rc"; }
+[ "$before" = "$(snapshot "$R")" ] || fail "per-GB audit modified the fixture root"
+grep -q 'audit: listeners >= 8100: 3proxy=4 haproxy=2 other=0' "$TMP/out" || { cat "$TMP/out"; fail "per-GB listeners leaked into the per-piece summary"; }
+grep -qF "$pergb_line" "$TMP/out" || { grep audit "$TMP/out"; fail "per-GB summary line"; }
+! grep -q 'WARNING' "$TMP/out" || { grep WARNING "$TMP/out" | head -5; fail "a healthy per-GB node printed a WARNING"; }
+grep -q '8085 \* node' "$TMP/out" || fail "per-GB audit: agent :8085 no longer listed"
+# a compact enable.json (one line) reads the same top-level keys
+printf '{"version":1,"enabled":true,"base":10000,"count":1000,"procs":[{"sp":10000,"first":10000,"last":10499}],"params":{"base":20000,"count":5}}\n' > "$R/etc/netrun-pergb/enable.json.compact"
+cp "$R/etc/netrun-pergb/enable.json" "$TMP/enable.pretty"
+mv "$R/etc/netrun-pergb/enable.json.compact" "$R/etc/netrun-pergb/enable.json"
+rc="$(SS_FIXTURE="$TMP/ss_pergb.txt" run_tool "$R")"
+grep -qF "$pergb_line" "$TMP/out" || { grep audit "$TMP/out"; fail "compact enable.json not read"; }
+cp "$TMP/enable.pretty" "$R/etc/netrun-pergb/enable.json"
+# anything else still warns: 3proxy-pergb on another address / outside the range, another process
+rc="$(SS_FIXTURE="$TMP/ss_pergb_odd.txt" run_tool "$R")"
+grep -q 'audit: listeners >= 8100: 3proxy=4 haproxy=2 other=3' "$TMP/out" || { grep audit "$TMP/out"; fail "unexpected listeners not counted"; }
+grep -qF "$pergb_line" "$TMP/out" || { grep audit "$TMP/out"; fail "per-GB summary with odd listeners"; }
+for w in '10500 0.0.0.0 3proxy-pergb' '11000 127.0.0.4 3proxy-pergb' '10002 127.0.0.3 python3'; do
+  grep -qxF "[capacity-tuning]     WARNING non-proxy listener in the proxy port range: $w" "$TMP/out" || { grep WARNING "$TMP/out"; fail "no WARNING for $w"; }
+done
+[ "$(grep -c 'WARNING' "$TMP/out")" = 3 ] || { grep WARNING "$TMP/out" | head; fail "only the 3 odd listeners may warn"; }
+# enabled, one HTTP listener missing: reported
+grep -v '127\.0\.0\.3:10599 ' "$TMP/ss_pergb.txt" > "$TMP/ss_pergb_gap.txt"
+rc="$(SS_FIXTURE="$TMP/ss_pergb_gap.txt" run_tool "$R")"
+grep -q 'per-GB shared ports 10000-10999 (enabled): haproxy 1000/1000, 3proxy-pergb 127.0.0.3 (HTTP) 999/1000 + 127.0.0.4 (SOCKS5) 1000/1000' "$TMP/out" || { grep audit "$TMP/out"; fail "missing HTTP listener not counted"; }
+grep -q 'WARNING per-GB is enabled but not every shared port listens' "$TMP/out" || { grep audit "$TMP/out"; fail "incomplete per-GB range not warned"; }
+# disabled (the range stays reserved): leftovers are reported
+sed -i.bak 's/"enabled": true/"enabled": false/' "$R/etc/netrun-pergb/enable.json"
+rc="$(SS_FIXTURE="$TMP/ss_pergb.txt" run_tool "$R")"
+grep -q 'per-GB shared ports 10000-10999 (disabled): haproxy 1000/1000' "$TMP/out" || { grep audit "$TMP/out"; fail "disabled per-GB summary"; }
+grep -q 'WARNING per-GB is disabled but 3000 per-GB listener(s) are still up' "$TMP/out" || { grep audit "$TMP/out"; fail "per-GB leftovers while disabled not warned"; }
+! grep -q 'WARNING non-proxy listener' "$TMP/out" || fail "disabled per-GB: the reserved range warned per listener"
+# never enabled here (no enable.json): no range, so 3proxy-pergb is not expected
+rm -f "$R/etc/netrun-pergb/enable.json" "$R/etc/netrun-pergb/enable.json.bak"
+rc="$(SS_FIXTURE="$TMP/ss_pergb.txt" run_tool "$R")"
+grep -q 'audit: listeners >= 8100: 3proxy=4 haproxy=1003 other=2000' "$TMP/out" || { grep audit "$TMP/out"; fail "no enable.json: per-GB listeners must not be expected"; }
+! grep -q 'per-GB shared ports' "$TMP/out" || fail "no enable.json: per-GB line printed"
+ok "audit: per-GB haproxy + 3proxy-pergb (127.0.0.3/.4) in the enable.json range are expected (own line, no WARNING); others still warn; gaps / leftovers reported"
+
 echo "test_apply_capacity_tuning.sh — all $PASS checks passed"

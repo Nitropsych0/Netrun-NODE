@@ -504,6 +504,12 @@ bash scripts/apply_capacity_tuning.sh            # dry-run: prints the plan + a 
 bash scripts/apply_capacity_tuning.sh --apply    # sysctl range, unbound reload, legacy nft rules, ipv6 restore
 ```
 
+The audit warns about every listener ≥ 8100 that is not 3proxy / haproxy. On a
+pay-per-GB node the shared range of `/etc/netrun-pergb/enable.json` gets a line of its
+own instead (per-GB haproxy and 3proxy-pergb on `127.0.0.3` HTTP / `127.0.0.4` SOCKS5,
+`listening/expected` per kind); a 3proxy-pergb outside that range or on another address
+still warns, as do missing shared ports while enabled and leftovers while disabled.
+
 Tests: `bash scripts/test_apply_capacity_tuning.sh`, `bash scripts/test_capacity_18k_node.sh`,
 `bash scripts/test_fleet_health_node.sh`, `bash node_runtime/soft/generator/test_capacity_18k.sh`,
 `bash node_runtime/soft/generator/test_fleet_health.sh`, `cd node_runtime/node_agent && node --test`.

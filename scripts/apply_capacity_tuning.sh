@@ -111,10 +111,14 @@
 #
 # Read-only listener audit (always printed): TCP listeners below 8100 and any
 # listener >= 8100 that is not 3proxy / haproxy (those would collide with
-# proxy ports 8100-65535). Plus (audit FP-01/CLN-03): batch cfgs whose nserver
-# lines name third-party resolvers (2026-05 geo-seed; the spawn helper fixes
-# them at the batch's next start), MSS clamp rules, the ephemeral range vs the
-# proxy ports.
+# proxy ports 8100-65535). Pay-per-GB v2 listeners inside the shared range of
+# /etc/netrun-pergb/enable.json (base .. base+count-1) are expected and get a
+# line of their own: the per-GB haproxy and 3proxy-pergb on 127.0.0.3 (HTTP) /
+# 127.0.0.4 (SOCKS5) — a 3proxy-pergb anywhere else still warns, and so does
+# an incomplete range while enabled / a listener left while disabled. Plus
+# (audit FP-01/CLN-03): batch cfgs whose nserver lines name third-party
+# resolvers (2026-05 geo-seed; the spawn helper fixes them at the batch's next
+# start), MSS clamp rules, the ephemeral range vs the proxy ports.
 #
 # Options:
 #   --dry-run                 default; print what would be done
@@ -330,22 +334,66 @@ persist_sysctl_kv() {
 
 # ── audit (read-only) ─────────────────────────────────────────────
 
+# Pay-per-GB v2: "<base> <last> <enabled|disabled>" of the shared range in
+# $PERGB_ENABLE, empty when per-GB was never enabled here (no file, unreadable,
+# no base/count). The first occurrence of a key is the top-level one: the agent
+# writes base / count / enabled before the raw params (pergb_runtime.js).
+pergb_range() {
+  [ -r "$PERGB_ENABLE" ] || return 0
+  awk '
+    function num(k,   v) {
+      if (!match(s, "\"" k "\"[ \t]*:[ \t]*[0-9]+")) return -1
+      v = substr(s, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", v); return v + 0
+    }
+    { s = s " " $0 }
+    END {
+      b = num("base"); c = num("count")
+      if (b < 1 || c < 1 || b + c - 1 > 65535) exit
+      e = "disabled"
+      if (match(s, /"enabled"[ \t]*:[ \t]*[a-z]+/) && substr(s, RSTART, RLENGTH) ~ /true$/) e = "enabled"
+      print b, b + c - 1, e
+    }' "$PERGB_ENABLE" 2>/dev/null
+}
+
 audit_listeners() {
-  local rows
+  local rows lo="" hi="" state=""
   rows="$(listen_rows)"
   if [ -z "$rows" ]; then
     log "audit: ss returned no listeners (not root, or ss unavailable)"
     return 0
   fi
+  read -r lo hi state <<< "$(pergb_range)"
+  # "<class> <port> <addr> <process>": class pergb for the per-GB runtime's own
+  # listeners inside its shared range (pergb_runtime.js renderHaproxy: haproxy
+  # on egressIpv4; HTTP_LISTEN 127.0.0.3 / SOCKS_LISTEN 127.0.0.4: 3proxy-pergb),
+  # "-" for everything else.
+  rows="$(printf '%s\n' "$rows" | awk -v lo="${lo:-0}" -v hi="${hi:--1}" '{
+    c = "-"
+    if ($1 >= lo && $1 <= hi && ($3 == "haproxy" || ($3 == "3proxy-pergb" && ($2 == "127.0.0.3" || $2 == "127.0.0.4")))) c = "pergb"
+    print c, $0
+  }')"
   log "audit: TCP listeners below $PROXY_PORT_FLOOR (node services):"
-  printf '%s\n' "$rows" | awk -v floor="$PROXY_PORT_FLOOR" '$1 < floor { print "[capacity-tuning]     " $1 " " $2 " " $3 }' | sort -u -k1,1n -k2
+  printf '%s\n' "$rows" | awk -v floor="$PROXY_PORT_FLOOR" '$1 == "-" && $2 < floor { print "[capacity-tuning]     " $2 " " $3 " " $4 }' | sort -u -k1,1n -k2
   printf '%s\n' "$rows" | awk -v floor="$PROXY_PORT_FLOOR" '
-    $1 >= floor { if ($3 == "3proxy" || $3 == "haproxy") n[$3]++; else other[$1 " " $2 " " $3] = 1 }
+    $1 == "-" && $2 >= floor { if ($4 == "3proxy" || $4 == "haproxy") n[$4]++; else other[$2 " " $3 " " $4] = 1 }
     END {
       printf "[capacity-tuning] audit: listeners >= %d: 3proxy=%d haproxy=%d", floor, n["3proxy"] + 0, n["haproxy"] + 0
       c = 0; for (k in other) c++
       printf " other=%d\n", c
       for (k in other) print "[capacity-tuning]     WARNING non-proxy listener in the proxy port range: " k
+    }'
+  [ -n "$lo" ] || return 0
+  # Distinct ports per kind, so a socket listed twice (SO_REUSEPORT shards)
+  # cannot hide a missing one.
+  printf '%s\n' "$rows" | awk -v lo="$lo" -v hi="$hi" -v state="$state" '
+    $1 == "pergb" { k = ($4 == "haproxy") ? "haproxy" : $3; if (!((k, $2) in seen)) { seen[k, $2] = 1; n[k]++ } }
+    END {
+      want = hi - lo + 1; h = n["haproxy"] + 0; p = n["127.0.0.3"] + 0; s = n["127.0.0.4"] + 0
+      printf "[capacity-tuning] audit: per-GB shared ports %d-%d (%s): haproxy %d/%d, 3proxy-pergb 127.0.0.3 (HTTP) %d/%d + 127.0.0.4 (SOCKS5) %d/%d — expected, not counted above\n", lo, hi, state, h, want, p, want, s, want
+      if (state == "enabled" && (h < want || p < want || s < want))
+        print "[capacity-tuning]     WARNING per-GB is enabled but not every shared port listens (counts above): netrun-pergb.target down or a range still restarting"
+      if (state == "disabled" && h + p + s > 0)
+        print "[capacity-tuning]     WARNING per-GB is disabled but " (h + p + s) " per-GB listener(s) are still up"
     }'
 }
 
