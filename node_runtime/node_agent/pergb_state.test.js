@@ -345,7 +345,8 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     assert.strictEqual(r.json.tagValid, true);
     assert.strictEqual(r.json.records.length, 1);
     assert.strictEqual(r.json.records[0].user, "netrun-aaaa2-static");
-    assert.strictEqual(r.json.clients[0].client, "198.51.100.77:55555");
+    assert.deepStrictEqual(r.json.clients, ["198.51.100.77:55555"]);
+    assert.strictEqual(r.json.clientsDetail[0].backend, "127.0.0.1:41111");
     const per = await call("GET", "/pergb/attribution?addr=2001:db8:aa:1::5");
     assert.strictEqual(per.json.listId, null, "a per-piece /64 is never decoded");
   });

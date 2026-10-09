@@ -1308,8 +1308,10 @@ function createPergb(deps = {}) {
       if (records.length >= 1000) break;
     }
     const keys = [...new Set(records.map((r) => `${r.client}|${r.port}`))];
-    const clients = await haproxyClients(keys);
-    return { status: 200, body: { success: true, addr, from: new Date(from).toISOString(), to: new Date(to).toISOString(), listId, tagValid, subnet, records, clients } };
+    const found = await haproxyClients(keys);
+    // I6: clients = the "ip:port" of the real clients; the matched log lines alongside
+    const clients = [...new Set(found.map((c) => c.client))];
+    return { status: 200, body: { success: true, addr, from: new Date(from).toISOString(), to: new Date(to).toISOString(), listId, tagValid, subnet, records, clients, clientsDetail: found } };
   }
 
   // The compact /health block (plain listener; no secrets).
