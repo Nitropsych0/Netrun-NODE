@@ -72,6 +72,16 @@
 // 5-7 % failure incident). A push that would ADD blocks inside
 // net.ipv4.ip_local_port_range is refused (409 ephemeral_overlap) unless
 // force; a re-apply only warns (it re-asserts what the kernel already had).
+//
+// Pay-per-GB v2 (lane L9; pergb_shield.js, /etc/netrun-pergb/enable.json).
+// Option A (per-GB shared ports on the primary IPv4): a shared port is never
+// a ghost, never kept in pergbBlocked (a drop by port would cut every per-GB
+// customer on it) and an existing block on it is lifted; an account toggle of
+// one is not recorded (the accounting call answers 409 pergb_shared_port).
+// Listeners on the per-GB loopback (127.0.0.3 / 127.0.0.4) and, with option B,
+// on the dedicated per-GB IPv4 are not per-piece and are never judged. With
+// option B the drop rule itself is scoped to the primary IPv4 (accounting.js
+// ensurePergbBlockInfra); a re-apply with blocks in the set re-checks its form.
 
 const fs = require("fs");
 const fsp = require("fs/promises");
@@ -79,6 +89,7 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const hygieneLib = require("./hygiene.js");
+const pergbShield = require("./pergb_shield.js");
 
 const NFT_TABLE = "proxy_accounting";
 const NFT_SET = "pergb_blocked";
@@ -309,12 +320,41 @@ function parseSetElements(text) {
   return out;
 }
 
+// `ss -Hltn` -> [{ addr, port }] (addr without [] or %iface; "*" = any).
+function parseListeners(text) {
+  const out = [];
+  for (const raw of String(text || "").split("\n")) {
+    const fields = raw.trim().split(/\s+/);
+    if (fields.length < 2) continue;
+    const local = String((fields.length >= 4 ? fields[3] : fields[fields.length - 1]) || "");
+    const i = local.lastIndexOf(":");
+    if (i < 0) continue;
+    const port = Number(local.slice(i + 1));
+    if (!isPort(port)) continue;
+    let addr = local.slice(0, i).replace(/^\[/, "").replace(/\]$/, "");
+    const pct = addr.indexOf("%");
+    if (pct >= 0) addr = addr.slice(0, pct);
+    out.push({ addr, port });
+  }
+  return out;
+}
+
+// Listening ports, minus the listeners bound to an ignored address (a port
+// some other listener holds stays listening).
+function listeningPortsExcept(text, ignoreAddrs = new Set()) {
+  const out = new Set();
+  for (const l of parseListeners(text)) if (!ignoreAddrs.has(l.addr)) out.add(l.port);
+  return out;
+}
+
 const inWindows = (windows) => (p) => windows.some(([lo, hi]) => p >= lo && p <= hi);
 const sorted = (it) => [...it].sort((a, b) => a - b);
 
 // The pure core. mode "push": ghosts = listeners in the windows that are not
-// live / in flight / fresh / protected. mode "reapply": ghosts = the pushed
-// ghost set minus the same exclusions (never new ones). Returns sorted arrays.
+// live / in flight / fresh / protected / per-GB shared. mode "reapply":
+// ghosts = the pushed ghost set minus the same exclusions (never new ones).
+// `shared` (option A per-GB ports): never a ghost, never pay-per-GB blocked,
+// a block on one is removed. Returns sorted arrays.
 function planFirewall({
   mode,
   listening = new Set(),
@@ -326,9 +366,10 @@ function planFirewall({
   fresh = new Set(),
   protectedPorts = new Set(),
   ghostPorts = new Set(),
+  shared = new Set(),
 }) {
   const inWin = inWindows(windows);
-  const excluded = (p) => inFlight.has(p) || fresh.has(p) || protectedPorts.has(p) || p < 1024;
+  const excluded = (p) => inFlight.has(p) || fresh.has(p) || protectedPorts.has(p) || shared.has(p) || p < 1024;
   const ghosts = new Set();
   const source = mode === "push" ? listening : ghostPorts;
   for (const p of source) {
@@ -337,17 +378,19 @@ function planFirewall({
     ghosts.add(p);
   }
   const pergbWanted = new Set();
-  for (const p of pergb) if (!inFlight.has(p) && !protectedPorts.has(p)) pergbWanted.add(p);
+  for (const p of pergb) if (!inFlight.has(p) && !protectedPorts.has(p) && !shared.has(p)) pergbWanted.add(p);
   const want = new Set([...ghosts, ...pergbWanted]);
   const add = [...want].filter((p) => !current.has(p));
-  const remove = [...current].filter((p) => inFlight.has(p) || (live.has(p) && !pergb.has(p)));
+  const remove = [...current].filter((p) => inFlight.has(p) || shared.has(p) || (live.has(p) && !pergb.has(p)));
   const skippedInFlight = [...new Set([...source, ...pergb])].filter((p) => inFlight.has(p));
+  const skippedShared = [...new Set([...pergb, ...current])].filter((p) => shared.has(p));
   return {
     ghosts: sorted(ghosts),
     pergbWanted: sorted(pergbWanted),
     add: sorted(add),
     remove: sorted(remove),
     skippedInFlight: sorted(skippedInFlight),
+    skippedShared: sorted(skippedShared),
   };
 }
 
@@ -380,6 +423,7 @@ function createFirewall({
   log = console,
   tmpDir = os.tmpdir(),
   readEphemeralRange = readEphemeralRangeProc, // -> [lo, hi] | null
+  shield = pergbShield.defaultShield(), // per-GB shared ports / listeners (lane L9)
 } = {}) {
   const settings = readSettings(env);
   const protectedSet = new Set(protectedPorts.filter(isPort));
@@ -498,10 +542,23 @@ function createFirewall({
     return { ok: true, ports: parseSetElements(res.stdout) };
   }
 
-  async function listening() {
+  // Pay-per-GB v2 — { shared: option A ports, ignore: listener addresses
+  // that are per-GB's }. An unreadable enable.json shields nothing (logged by
+  // the shield); a throwing shield never stops the firewall.
+  async function shieldState() {
+    try {
+      const [shared, ignore] = await Promise.all([shield.sharedPorts(), shield.ignoredListenAddrs()]);
+      return { shared, ignore };
+    } catch (err) {
+      log.error(`[firewall] per-GB shield unavailable: ${(err && err.message) || err}`);
+      return { shared: new Set(), ignore: new Set(pergbShield.PERGB_LOOPBACK) };
+    }
+  }
+
+  async function listening(ignore = new Set()) {
     const res = await run("ss", ["-Hltn"], { timeoutMs: 30_000 });
     if (res.code !== 0) return { ok: false, error: String(res.stderr || "").trim().slice(0, 200) || `exit ${res.code}` };
-    return { ok: true, ports: hygieneLib.parseListeningPorts(res.stdout) };
+    return { ok: true, ports: ignore.size ? listeningPortsExcept(res.stdout, ignore) : hygieneLib.parseListeningPorts(res.stdout) };
   }
 
   // Ports a generation lift kept (an old occupant still listened on them;
@@ -584,9 +641,10 @@ function createFirewall({
   // Accounting's pergb_blocked.list follows the plan: unblocked ports out,
   // pay-per-GB ports in — except a port toggled after the plan (checked when
   // the list update actually runs, behind any toggle queued before it).
-  async function syncAccountingList(plan, pergb, live, planSeq) {
+  async function syncAccountingList(plan, pergb, live, planSeq, shared = new Set()) {
     const unblock = new Set(plan.remove);
     for (const p of live) if (!pergb.has(p)) unblock.add(p);
+    for (const p of shared) unblock.add(p);
     await updateBlockedList((list) => {
       const late = expandToggles(toggles, newerThan(planSeq));
       for (const p of [...list]) if (unblock.has(p) && !(late.has(p) && late.get(p).blocked)) list.delete(p);
@@ -609,7 +667,8 @@ function createFirewall({
       const { desired } = parsed;
       const dryRun = Boolean(body && body.dryRun);
       const force = Boolean(body && body.force);
-      const [ls, cur] = await Promise.all([listening(), currentBlocked()]);
+      const sh = await shieldState();
+      const [ls, cur] = await Promise.all([listening(sh.ignore), currentBlocked()]);
       if (!ls.ok) return { status: 500, body: { success: false, error: "ss_failed", detail: ls.error } };
       if (!cur.ok) return { status: 500, body: { success: false, error: "nft_list_failed", detail: cur.error } };
       const inFlight = await inFlightPorts();
@@ -633,6 +692,7 @@ function createFirewall({
         inFlight,
         fresh,
         protectedPorts: protectedSet,
+        shared: sh.shared,
       });
       const listenersInWindows = [...ls.ports].filter(inWindows(desired.windows)).length;
       const base = {
@@ -648,6 +708,7 @@ function createFirewall({
         alreadyBlocked: cur.ports.size,
         togglesKept: kept.size,
       };
+      if (plan.skippedShared.length) base.pergbShared = summarize(plan.skippedShared);
       const eph = ephemeralHits(plan.add);
       if (eph) base.ipLocalPortRange = eph.range;
       let refusal = null;
@@ -674,7 +735,7 @@ function createFirewall({
         log.error(`[firewall] push: nft -f failed: ${nft.error}`);
         return { status: 500, body: { success: false, error: "nft_failed", detail: nft.error, report: report("push", { ...base, ok: false }) } };
       }
-      await syncAccountingList(plan, pergb, live, planSeq);
+      await syncAccountingList(plan, pergb, live, planSeq, sh.shared);
       await writeState({
         version: STATE_VERSION,
         receivedAt: new Date(nowMs).toISOString(),
@@ -720,6 +781,7 @@ function createFirewall({
       const receivedMs = Date.parse(state.receivedAt);
       const fresh = await freshPorts(Number.isFinite(receivedMs) ? receivedMs - COMPUTED_AT_MARGIN_MS : 0);
       const inFlight = await inFlightPorts();
+      const sh = await shieldState();
       const planSeq = toggleSeq;
       const { live, pergb } = overlayToggles(new Set(state.livePorts || []), withHttpMirror(state.pergbBlocked || []), expandToggles(toggles));
       const plan = planFirewall({
@@ -732,15 +794,25 @@ function createFirewall({
         fresh,
         protectedPorts: protectedSet,
         ghostPorts: new Set(state.ghostPorts || []),
+        shared: sh.shared,
       });
       const applied = dropOvertaken(plan, planSeq);
+      // The drop rule's form follows enable.json (option A / B): re-checked
+      // here while the set holds blocks; with adds, applyNft ensures it anyway.
+      if (applied.add.length === 0 && cur.ports.size > applied.remove.length) {
+        try {
+          await ensureInfra();
+        } catch (err) {
+          log.error(`[firewall] re-apply (${reason}): drop rule check failed: ${(err && err.message) || err}`);
+        }
+      }
       const nft = await applyNft(applied);
       if (nft.ok) await reassertLate(applied, planSeq, `re-apply (${reason})`);
       if (!nft.ok) {
         log.error(`[firewall] re-apply (${reason}): nft -f failed: ${nft.error}`);
         return report("reapply", { reason, ok: false, error: nft.error });
       }
-      await syncAccountingList(plan, pergb, live, planSeq);
+      await syncAccountingList(plan, pergb, live, planSeq, sh.shared);
       if (plan.add.length || plan.remove.length) {
         log.log(`[firewall] re-apply (${reason}): +${plan.add.length} block(s), -${plan.remove.length} stale block(s)`);
       }
@@ -751,6 +823,7 @@ function createFirewall({
         removed: summarize(plan.remove),
         skippedInFlight: summarize(plan.skippedInFlight),
       };
+      if (plan.skippedShared.length) out.pergbShared = summarize(plan.skippedShared);
       // Never refused (the kernel had these blocks before), only reported.
       const eph = ephemeralHits(new Set([...plan.ghosts, ...plan.pergbWanted]));
       if (eph && eph.hits.length > 0) {
@@ -823,6 +896,15 @@ function createFirewall({
   async function recordAccountToggle(port, blocked, apply) {
     const p = Number(port);
     if (!settings.enabled || !isPort(p)) return apply();
+    // Pay-per-GB v2 (option A) — a shared port is no account: never recorded
+    // (the accounting call refuses it with 409 pergb_shared_port).
+    let shared = false;
+    try {
+      shared = await shield.isSharedPort(p);
+    } catch {
+      shared = false;
+    }
+    if (shared) return apply();
     toggleSeq += 1;
     toggles.set(p, { blocked: Boolean(blocked), atMs: now(), seq: toggleSeq });
     if (toggles.size > MAX_TOGGLES) {
@@ -888,4 +970,6 @@ module.exports = {
   parseSetElements,
   withHttpMirror,
   nftBatchText,
+  parseListeners,
+  listeningPortsExcept,
 };

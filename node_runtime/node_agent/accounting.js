@@ -1,9 +1,20 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const proxySpawn = require("./proxy_spawn.js");
+const pergbShield = require("./pergb_shield.js");
+
+const { PergbSharedPortError } = pergbShield;
+// Pay-per-GB v2 (lane L9) — the per-GB shared ports and the drop-rule form
+// (/etc/netrun-pergb/enable.json, pergb_shield.js). Overridable for tests.
+let _shield = pergbShield.defaultShield();
+function _setShield(s) {
+  _shield = s || pergbShield.defaultShield();
+  _blockInfraEnsured = null;
+}
 
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
@@ -355,17 +366,66 @@ function _writeBlockedList(set) {
 // (or freshly inserted ok), so a transient insert failure is retried next call.
 // Set membership (which ports are blocked) is managed separately and NOT gated,
 // so enforcement stays correct.
-let _blockInfraEnsured = false;
+//
+// Pay-per-GB v2 (lane L9, option B) — the rule has two forms, chosen by
+// pergb_shield.dropRule(): `tcp dport @pergb_blocked drop` (no per-GB, or
+// per-GB on the primary IPv4: option A) and `ip daddr <primary IPv4> tcp dport
+// @pergb_blocked drop` (a dedicated per-GB IPv4: the per-GB ports 10000-10999
+// on it are never hit by a per-piece block; per-piece listens on the primary
+// IPv4 only). The latch holds the form last confirmed, so a form change
+// (enable.json written / removed) is applied on the next call: the old rule(s)
+// are deleted by handle and the new one inserted in ONE `nft -f` — the chain
+// never holds both or neither.
+let _blockInfraEnsured = null;
 // Overridable exec seam for the block path's nft calls (unit tests stub nft,
 // which is absent in the test env).
 let _nftExec = execCapture;
 function _setNftExec(fn) {
   _nftExec = typeof fn === "function" ? fn : execCapture;
-  _blockInfraEnsured = false;
+  _blockInfraEnsured = null;
+}
+
+// The pay-per-GB drop rules of `nft [-a] list chain inet proxy_accounting
+// input`: [{ text (normalised, no handle), handle (null without -a) }].
+function parsePergbDropRules(text) {
+  const out = [];
+  for (const raw of String(text || "").split("\n")) {
+    if (!raw.includes("@" + NFT_BLOCK_SET)) continue;
+    const h = /#\s*handle\s+(\d+)\s*$/.exec(raw);
+    const body = raw.replace(/#.*$/, "").trim().replace(/\s+/g, " ");
+    if (!/\bdrop$/.test(body)) continue;
+    out.push({ text: body, handle: h ? Number(h[1]) : null });
+  }
+  return out;
+}
+
+// One transaction: every listed pay-per-GB drop rule out (by handle), the
+// wanted one in at the top of the chain.
+function dropRuleSwapScript(rules, want) {
+  const lines = rules.map((r) => `delete rule inet ${NFT_TABLE} input handle ${r.handle}`);
+  lines.push(`insert rule inet ${NFT_TABLE} input ${want.text}`);
+  return `${lines.join("\n")}\n`;
+}
+
+async function _nftFile(text) {
+  let dir = null;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "netrun-pergb-rule-"));
+    const file = path.join(dir, "rule.nft");
+    fs.writeFileSync(file, text);
+    return await _nftExec("nft", ["-f", file]);
+  } catch (err) {
+    return { code: -1, stdout: "", stderr: String((err && err.message) || err) };
+  } finally {
+    if (dir) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    }
+  }
 }
 
 async function ensurePergbBlockInfra() {
-  if (_blockInfraEnsured) return;
+  const want = await _shield.dropRule();
+  if (_blockInfraEnsured === want.text) return;
   await _nftExec("nft", ["add", "table", "inet", NFT_TABLE]);
   await _nftExec("nft", [
     "add", "chain", "inet", NFT_TABLE, "input",
@@ -376,15 +436,30 @@ async function ensurePergbBlockInfra() {
     "{", "type", "inet_service", ";", "}",
   ]);
   const cur = await _nftExec("nft", ["list", "chain", "inet", NFT_TABLE, "input"]);
-  if (new RegExp("@" + NFT_BLOCK_SET + "[\\s\\S]*drop").test(cur.stdout || "")) {
-    _blockInfraEnsured = true;
+  const rules = parsePergbDropRules(cur.stdout);
+  if (rules.length === 1 && rules[0].text === want.text) {
+    _blockInfraEnsured = want.text;
     return;
   }
-  const ins = await _nftExec("nft", [
-    "insert", "rule", "inet", NFT_TABLE, "input",
-    "tcp", "dport", "@" + NFT_BLOCK_SET, "drop",
-  ]);
-  if (ins.code === 0) _blockInfraEnsured = true;
+  if (rules.length === 0) {
+    const ins = await _nftExec("nft", ["insert", "rule", "inet", NFT_TABLE, "input", ...want.args]);
+    if (ins.code === 0) _blockInfraEnsured = want.text;
+    return;
+  }
+  // The other form (an option A <-> B change) or duplicates: swap atomically.
+  const listed = await _nftExec("nft", ["-a", "list", "chain", "inet", NFT_TABLE, "input"]);
+  const withHandles = listed.code === 0 ? parsePergbDropRules(listed.stdout).filter((r) => r.handle !== null) : [];
+  if (withHandles.length === 0) {
+    console.error(`[accounting] pay-per-GB drop rule: cannot read its handle(s) (${String(listed.stderr || "").trim().slice(0, 200)}); form left as is`);
+    return;
+  }
+  const res = await _nftFile(dropRuleSwapScript(withHandles, want));
+  if (res.code === 0) {
+    _blockInfraEnsured = want.text;
+    console.log(`[accounting] pay-per-GB drop rule is now \`${want.text}\` (was ${withHandles.map((r) => `\`${r.text}\``).join(", ")})`);
+  } else {
+    console.error(`[accounting] pay-per-GB drop rule swap to \`${want.text}\` failed: ${String(res.stderr || "").trim().slice(0, 300)}`);
+  }
 }
 
 // Returns execCapture's result ({code, stdout, stderr}); never throws.
@@ -400,7 +475,7 @@ async function _nftSetElement(op, portNum) {
 async function _nftAddBlockElement(portNum) {
   const first = await _nftSetElement("add", portNum);
   if (first.code === 0) return first;
-  _blockInfraEnsured = false;
+  _blockInfraEnsured = null;
   await ensurePergbBlockInfra();
   return _nftSetElement("add", portNum);
 }
@@ -416,7 +491,14 @@ async function _nftAddBlockElement(portNum) {
 // fails with ENOENT, which must not turn every enable into a 500.
 async function _enforceBlock(portNum, blocked) {
   const http = _httpFor(portNum);
-  const ports = http ? [portNum, http] : [portNum];
+  // Pay-per-GB v2 (option A) — a per-GB shared port is never blocked, not
+  // even as a per-piece socks port's http mirror: the drop would hit every
+  // per-GB customer on it. Unblocking one is always fine.
+  const shared = blocked ? await _shield.sharedPorts().catch(() => new Set()) : new Set();
+  const ports = (http ? [portNum, http] : [portNum]).filter((p) => !shared.has(p));
+  if (blocked && ports.length < (http ? 2 : 1)) {
+    console.error(`[accounting] port ${portNum}: per-GB shared port(s) ${(http ? [portNum, http] : [portNum]).filter((p) => shared.has(p)).join(",")} left out of the block`);
+  }
   const failures = [];
   try {
     await ensurePergbBlockInfra();
@@ -456,6 +538,21 @@ async function reapplyPergbBlocks() {
   if (list.size === 0) return { reapplied: 0, failed: 0 };
   let failed = 0;
   let healed = false;
+  // Pay-per-GB v2 (option A) — a shared port in the persisted list (written
+  // before per-GB was enabled on this range) is dropped from it, never blocked.
+  const shared = await _shield.sharedPorts().catch(() => new Set());
+  const dropped = [...list].filter((p) => shared.has(p));
+  if (dropped.length) {
+    for (const p of dropped) {
+      list.delete(p);
+      await _nftSetElement("delete", p);
+    }
+    await updateBlockedList((l) => {
+      for (const p of dropped) l.delete(p);
+    });
+    console.error(`[accounting] reapplyPergbBlocks: ${dropped.length} per-GB shared port(s) removed from ${BLOCKED_LIST_FILE}`);
+  }
+  if (list.size === 0) return { reapplied: 0, failed: 0, sharedDropped: dropped.length };
   try {
     await ensurePergbBlockInfra();
     for (const p of list) {
@@ -464,7 +561,7 @@ async function reapplyPergbBlocks() {
       let res = await _nftSetElement("add", p);
       if ((!res || res.code !== 0) && !healed) {
         healed = true;
-        _blockInfraEnsured = false;
+        _blockInfraEnsured = null;
         await ensurePergbBlockInfra();
         res = await _nftSetElement("add", p);
       }
@@ -477,7 +574,7 @@ async function reapplyPergbBlocks() {
     console.error(`[accounting] reapplyPergbBlocks: ${failed}/${list.size} block(s) did not apply`);
   }
   console.log(`[accounting] reapplied ${list.size - failed} pergb firewall block(s)`);
-  return { reapplied: list.size - failed, failed };
+  return dropped.length ? { reapplied: list.size - failed, failed, sharedDropped: dropped.length } : { reapplied: list.size - failed, failed };
 }
 
 // Block a pay-per-GB port: firewall-drop it (works for every port, incl.
@@ -500,6 +597,9 @@ async function disablePort(port) {
   if (!Number.isInteger(portNum) || portNum <= 0) {
     throw new PortNotFoundError(port);
   }
+  // Pay-per-GB v2 (option A) — a per-GB shared port is no per-piece account:
+  // 409 pergb_shared_port, nothing touched.
+  if (await _shield.isSharedPort(portNum)) throw new PergbSharedPortError(portNum);
   // Wave FLEET-HEALTH (RES-08 hardening) — a failed nft block is held until the
   // per-port cfg teardown below has run (a single-port 3proxy is still killed),
   // then thrown: the route answers 500 disable_failed instead of a 200 the
@@ -632,6 +732,7 @@ async function enablePort(port) {
   if (!Number.isInteger(portNum) || portNum <= 0) {
     throw new PortNotFoundError(port);
   }
+  if (await _shield.isSharedPort(portNum)) throw new PergbSharedPortError(portNum);
   await _enforceBlock(portNum, false);
   try {
     return await _enablePortCfg(portNum);
@@ -689,6 +790,7 @@ module.exports = {
   PortNotFoundError,
   NftablesError,
   ProcessSpawnError,
+  PergbSharedPortError,
   // Exposed for the generation-guard unit test (no pgrep dependency).
   _bumpDisableGen,
   _disableGen,
@@ -719,4 +821,8 @@ module.exports = {
   _httpFor,
   BLOCKED_LIST_FILE,
   NFT_BLOCK_SET,
+  // Pay-per-GB v2 (lane L9) — drop-rule form + shared-port shield seams.
+  parsePergbDropRules,
+  dropRuleSwapScript,
+  _setShield,
 };

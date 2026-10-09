@@ -30,6 +30,16 @@
 //   socks -6 -a -p<PORT>  -i<bcip> -e<ipv6>
 //   proxy -6 -n -a -p<PORT-10000> -i<bcip> -e<ipv6>
 // The leading header (daemon/nserver/auth/global users) precedes the first `flush`.
+//
+// Pay-per-GB v2 (lane L9):
+//   - option A shield (pergb_shield.js): a per-GB shared port is never
+//     deprovisioned — dropped from the request (reported in skipped_shared);
+//     a request of shared ports only is refused (409 pergb_shared_port);
+//   - AMENDMENT A1 (pergb_pool.js): on a per-GB node a dropped batch hands its
+//     pool /64s back to RADIUS (release_nets, 24 h cool-down) — every /64 its
+//     cfg and its address list named, minus any /64 something per-piece still
+//     names (a fresh, complete scan). A rewritten (mixed) batch keeps its list,
+//     so its removed ports' /64s stay reserved until the batch itself goes.
 
 const fs = require("fs");
 const path = require("path");
@@ -37,6 +47,8 @@ const { spawn } = require("child_process");
 const egress = require("./egress.js");
 const proxySpawn = require("./proxy_spawn.js");
 const { withProcessLock } = require("./process_lock.js");
+const pergbShield = require("./pergb_shield.js");
+const pergbPool = require("./pergb_pool.js");
 
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
@@ -272,10 +284,30 @@ async function nftCleanup(ports) {
 // Main entry. ports = flat list of SOCKS ports to remove (the orchestrator has
 // already excluded every customer-held port). Idempotent: a port not found in any
 // cfg is reported under skipped (already gone), not an error.
-async function deprovisionPorts(rawPorts) {
-  const removeSet = new Set((rawPorts || []).map(Number).filter((p) => Number.isInteger(p) && p > 0));
-  const result = { ok: true, requested: removeSet.size, removed_ports: [], skipped_ports: [], cfgs: [] };
-  if (removeSet.size === 0) return result;
+async function deprovisionPorts(rawPorts, { shield = pergbShield.defaultShield(), pool = pergbPool.defaultAccess(), log = console } = {}) {
+  const askedSet = new Set((rawPorts || []).map(Number).filter((p) => Number.isInteger(p) && p > 0));
+  const result = { ok: true, requested: askedSet.size, removed_ports: [], skipped_ports: [], cfgs: [] };
+  if (askedSet.size === 0) return result;
+
+  // Pay-per-GB v2 (option A) — the per-GB shared ports are never touched.
+  let shared = new Set();
+  try {
+    shared = await shield.sharedPorts();
+  } catch (err) {
+    log.error(`[deprovision] per-GB shield unavailable: ${(err && err.message) || err}`);
+  }
+  const sharedAsked = [...askedSet].filter((p) => shared.has(p)).sort((a, b) => a - b);
+  if (sharedAsked.length) {
+    result.skipped_shared = sharedAsked;
+    if (sharedAsked.length === askedSet.size) {
+      return { ...result, ok: false, httpStatus: 409, error: "pergb_shared_port", detail: "every requested port is a per-GB shared port" };
+    }
+  }
+  const removeSet = new Set([...askedSet].filter((p) => !shared.has(p)));
+  // AMENDMENT A1 — /64s of dropped batches, handed back to the per-GB pool
+  // below (only on a per-GB node: elsewhere the response is as before).
+  const pergbCandidates = new Set();
+  const pergbOn = pergbPool.poolPresent(pool);
 
   let files;
   try {
@@ -309,6 +341,12 @@ async function deprovisionPorts(rawPorts) {
       await withProcessLock(async () => {
         if (wholeBatch) {
           await killCfgProcess(startPort);
+          // read before the unlinks: every /64 the batch held
+          if (pergbOn) {
+            for (const k of pergbPool.collectFileNets([cfgPath, cfgPath + ".disabled", path.join(PROXY_ROOT, `ipv6_${startPort}.list`)])) {
+              pergbCandidates.add(k);
+            }
+          }
           safeUnlink(cfgPath);
           safeUnlink(cfgPath + ".disabled");
           // Drop ALL of the generator's per-start-port state for this instance,
@@ -377,6 +415,18 @@ async function deprovisionPorts(rawPorts) {
       result.egress = { ok: false, error: String((err && err.message) || err) };
     }
     result.persist = await persistRuleset();
+  }
+  // AMENDMENT A1 — after egress.forgetPorts (the egress state no longer
+  // names the removed ports' anchors). Never fails the deprovision: a /64
+  // that is not handed back stays reserved, i.e. out of per-GB's reach.
+  if (pergbCandidates.size) {
+    const dropped = result.cfgs.filter((c) => c.ok && c.mode === "drop").map((c) => c.startPort);
+    result.pergb_release = await pergbPool.releaseUnusedNets(pergbCandidates, {
+      access: pool,
+      proxyRoot: PROXY_ROOT,
+      ref: pergbPool.newRef("deprovision", dropped[0] || ""),
+      log,
+    });
   }
   // HTTPS frontend: haproxy still binds the removed HTTP ports until its
   // frontends are rewritten — release them now, so a later generate that reuses
