@@ -55,13 +55,29 @@
 # agent calls it at start and when the routed prefixes it watches change
 # (egress.js), the installer and node_followup_v2.sh call it.
 #
+# Pay-per-GB v2: the per-GB 3proxy (3proxy-pergb, uid 65533 = netrun-pergb)
+# gets a chain of its own, `meta skuid 65533 jump pergb`: the same rules as
+# `proxy`, plus `ip daddr 127.0.0.1 udp dport 1812 accept` (its RADIUS) before
+# the 127/8 reject. Per-piece (65535) still reaches neither 1812 nor the
+# per-GB listeners on 127.0.0.3/4; per-GB reaches only DNS and RADIUS on
+# loopback. With a dedicated per-GB IPv4 (option B, /etc/netrun-pergb/enable.json
+# dedicatedIpv4) that address is in the own-IPv4 set too.
+#
 # Settings (environment): NETRUN_PROXY_GUARD_FILE (/etc/netrun/nft-proxy-guard.nft),
-# NETRUN_PROXY_UID (65535), NETRUN_PROXY_GUARD_UNIT_DIR (/etc/systemd/system),
-# NETRUN_PROXY_GUARD_SELF (/usr/local/sbin/netrun-proxy-guard).
+# NETRUN_PROXY_UIDS (the gated uids, space or comma separated; default: the
+# per-piece uid, plus the per-GB uid once its user exists, i.e. after
+# deploy/node/install_pergb.sh), NETRUN_PROXY_UID (65535, the per-piece uid
+# when NETRUN_PROXY_UIDS is unset), NETRUN_PERGB_UID (65533: the uid of the
+# list that jumps to `pergb`), NETRUN_PERGB_ENABLE_FILE
+# (/etc/netrun-pergb/enable.json), NETRUN_PROXY_GUARD_UNIT_DIR
+# (/etc/systemd/system), NETRUN_PROXY_GUARD_SELF (/usr/local/sbin/netrun-proxy-guard).
 set -euo pipefail
 
 GUARD_FILE="${NETRUN_PROXY_GUARD_FILE:-/etc/netrun/nft-proxy-guard.nft}"
 PROXY_UID="${NETRUN_PROXY_UID:-65535}"
+PERGB_UID="${NETRUN_PERGB_UID:-65533}"
+PERGB_USER="netrun-pergb"
+PERGB_ENABLE_FILE="${NETRUN_PERGB_ENABLE_FILE:-/etc/netrun-pergb/enable.json}"
 UNIT_DIR="${NETRUN_PROXY_GUARD_UNIT_DIR:-/etc/systemd/system}"
 SELF="${NETRUN_PROXY_GUARD_SELF:-/usr/local/sbin/netrun-proxy-guard}"
 TABLE="netrun_proxy_guard"
@@ -71,6 +87,37 @@ log() { echo "[netrun-proxy-guard] $*"; }
 die() { echo "[netrun-proxy-guard] ERROR: $*" >&2; exit 1; }
 
 [[ "$PROXY_UID" =~ ^[0-9]+$ ]] || die "NETRUN_PROXY_UID must be a number"
+[[ "$PERGB_UID" =~ ^[0-9]+$ ]] || die "NETRUN_PERGB_UID must be a number"
+
+# The gated uids, one per line, deduplicated in order. Default: the per-piece
+# uid, plus the per-GB uid when the netrun-pergb user owns it (per-GB
+# installed) — so every caller (agent, netrun-bgp, harden, installers) keeps
+# the per-GB chain without knowing about it.
+proxy_uids() {
+  local list="${NETRUN_PROXY_UIDS:-}" u seen=" " line
+  if [ -z "$list" ]; then
+    list="$PROXY_UID"
+    line="$(getent passwd "$PERGB_UID" 2>/dev/null || true)"
+    if [ "${line%%:*}" = "$PERGB_USER" ]; then list="$list $PERGB_UID"; fi
+  fi
+  for u in ${list//,/ }; do
+    [[ "$u" =~ ^[0-9]+$ ]] || die "NETRUN_PROXY_UIDS: '$u' is not a uid"
+    case "$seen" in *" $u "*) continue ;; esac
+    seen="$seen$u "
+    echo "$u"
+  done
+}
+UIDS="$(proxy_uids)"
+[ -n "$UIDS" ] || die "no uid to gate"
+
+# uid_match <uid>: an ERE for how `nft list` may print that uid — the number,
+# or (nft -u, or an nft that names uids) the passwd name, bare or quoted.
+uid_match() {
+  local name
+  name="$(getent passwd "$1" 2>/dev/null | cut -d: -f1 || true)"
+  if [[ "$name" =~ ^[a-z_][a-z0-9_-]*$ ]]; then printf '(%s|%s|"%s")' "$1" "$name" "$name"; else printf '%s' "$1"; fi
+}
+UID_ALT="$(for u in $UIDS; do uid_match "$u"; echo; done | paste -sd'|' -)"
 
 # guard_sets: two lines, "v4 <elements>" and "v6 <elements>" (comma separated),
 # from the node's addresses and local routes. The `ip` output reaches python
@@ -83,8 +130,8 @@ guard_sets() {
   ip -4 -o addr show scope global > "$tmp/v4" 2>/dev/null || true
   ip -6 -o addr show scope global > "$tmp/v6" 2>/dev/null || true
   ip -6 route show table local dev lo > "$tmp/routes" 2>/dev/null || true
-  python3 - "$tmp/v4" "$tmp/v6" "$tmp/routes" <<'PY' || rc=$?
-import ipaddress, re, sys
+  python3 - "$tmp/v4" "$tmp/v6" "$tmp/routes" "$PERGB_ENABLE_FILE" <<'PY' || rc=$?
+import ipaddress, json, re, sys
 
 def read(path):
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -106,6 +153,20 @@ def text(n):
 
 nodes4 = [ipaddress.ip_network(m.group(1) + "/32")
           for m in re.finditer(r"\binet ([0-9.]+)/\d+", v4_text)]
+# Pay-per-GB v2, option B: a dedicated per-GB IPv4 is one of the node's own
+# addresses even before (or without) it shows on the NIC.
+try:
+    enable = json.loads(read(sys.argv[4]))
+except (OSError, ValueError):
+    enable = None
+if isinstance(enable, dict):
+    for key in ("dedicatedIpv4", "egressIpv4"):
+        try:
+            a = ipaddress.IPv4Address(str(enable.get(key) or ""))
+        except ValueError:
+            continue
+        if a.is_global:
+            nodes4.append(ipaddress.ip_network(f"{a}/32"))
 nodes6 = []
 for m in re.finditer(r"\binet6 ([0-9a-fA-F:]+)/(\d+)", v6_text):
     nodes6.append(ipaddress.ip_network(f"{m.group(1)}/{min(int(m.group(2)), 64)}", strict=False))
@@ -125,17 +186,32 @@ guard_text() {
   v4="$(printf '%s\n' "$sets" | sed -n 's/^v4 //p')"
   v6="$(printf '%s\n' "$sets" | sed -n 's/^v6 //p')"
   [ -n "$v4" ] && [ -n "$v6" ] || die "empty address sets"
+  local u jumps="" piece="" pergb=0
+  for u in $UIDS; do
+    if [ "$u" = "$PERGB_UID" ]; then
+      pergb=1
+      jumps="$jumps    meta skuid $u jump pergb"$'\n'
+    else
+      piece="$piece${piece:+, }$u"
+      jumps="$jumps    meta skuid $u jump proxy"$'\n'
+    fi
+  done
+  local who="${piece:-}"
+  if [ "$pergb" = 1 ]; then who="${who:+$who; }per-GB 3proxy-pergb $PERGB_UID"; fi
   cat <<EOF
-# NETRUN — 3proxy (uid $PROXY_UID) may not open connections to node-local, cloud-metadata,
-# private or the node's own addresses (audit 2026-10-08). DNS to the local unbound stays.
+# NETRUN — 3proxy (uid ${who}) may not open connections to node-local, cloud-metadata,
+# private or the node's own addresses (audit 2026-10-08). DNS to the local unbound stays (and RADIUS for per-GB).
 # Written by netrun-proxy-guard (scripts/netrun-proxy-guard.sh): do not edit, run \`netrun-proxy-guard apply\`.
 table inet $TABLE
 delete table inet $TABLE
 table inet $TABLE {
   chain output {
     type filter hook output priority filter; policy accept;
-    meta skuid $PROXY_UID jump proxy
+${jumps%$'\n'}
   }
+EOF
+  if [ -n "$piece" ]; then
+    cat <<EOF
   chain proxy {
     ip daddr 127.0.0.1 udp dport 53 accept
     ip daddr 127.0.0.1 tcp dport 53 accept
@@ -145,8 +221,23 @@ table inet $TABLE {
     ip daddr { $v4 } reject
     ip6 daddr { $v6 } reject
   }
-}
 EOF
+  fi
+  if [ "$pergb" = 1 ]; then
+    cat <<EOF
+  chain pergb {
+    ip daddr 127.0.0.1 udp dport 53 accept
+    ip daddr 127.0.0.1 tcp dport 53 accept
+    ip6 daddr ::1 udp dport 53 accept
+    ip6 daddr ::1 tcp dport 53 accept
+    ip daddr 127.0.0.1 udp dport 1812 accept
+    ct state established,related accept
+    ip daddr { $v4 } reject
+    ip6 daddr { $v6 } reject
+  }
+EOF
+  fi
+  echo "}"
 }
 
 dropin_text() {
@@ -160,11 +251,12 @@ EOF
 # guard_safe: the ruleset text on stdin (the generated file, or `nft list
 # table` of the loaded one) may not touch a packet that is not 3proxy's: no
 # `skuid !=` anywhere, every hooked chain has policy accept and nothing but
-# `meta skuid <uid> jump|goto …` rules (at least one). A packet without a user
-# socket — the kernel's NDP to fe80::/10 / ff02::/16, MLD, ICMPv6 errors —
-# then never reaches a reject. Exit 1 with the reason on stdout otherwise.
+# `meta skuid <uid> jump|goto …` rules for the gated uids (at least one). A
+# packet without a user socket — the kernel's NDP to fe80::/10 / ff02::/16,
+# MLD, ICMPv6 errors — then never reaches a reject. Exit 1 with the reason on
+# stdout otherwise.
 guard_safe() {
-  awk -v uid="$PROXY_UID" '
+  awk -v alt="$UID_ALT" '
     /skuid[ \t]+!=/ { bad = "a \"skuid !=\" rule: packets without a user socket (kernel NDP) skip it and reach the rejects"; exit }
     /^[ \t]*chain[ \t]/ { inchain = 1; base = 0; next }
     inchain && /[ \t]hook[ \t]/ {
@@ -174,11 +266,11 @@ guard_safe() {
     }
     inchain && /^[ \t]*}/ { inchain = 0; base = 0; next }
     inchain && base && NF && $1 !~ /^#/ {
-      if ($0 ~ "^[ \t]*meta skuid " uid " (jump|goto) ") { gated = 1; next }
-      bad = "a hooked-chain rule not gated on meta skuid " uid ": " $0; exit
+      if ($0 ~ "^[ \t]*meta skuid (" alt ") (jump|goto) ") { gated = 1; next }
+      bad = "a hooked-chain rule not gated on meta skuid " alt ": " $0; exit
     }
     END {
-      if (bad == "" && !gated) bad = "no meta skuid " uid " jump in a hooked chain"
+      if (bad == "" && !gated) bad = "no meta skuid " alt " jump in a hooked chain"
       if (bad != "") { print bad; exit 1 }
     }'
 }
@@ -246,7 +338,11 @@ cmd_apply() {
     nft delete table inet "$TABLE" 2>/dev/null || true
     die "the loaded table is unsafe ($why) — deleted it"
   fi
-  printf '%s\n' "$listed" | grep -q "meta skuid $PROXY_UID jump proxy" || die "table inet $TABLE is not the one written"
+  local u chain
+  for u in $UIDS; do
+    chain=proxy; [ "$u" = "$PERGB_UID" ] && chain=pergb
+    printf '%s\n' "$listed" | grep -Eq "meta skuid $(uid_match "$u") jump $chain" || die "table inet $TABLE is not the one written (no meta skuid $u jump $chain)"
+  done
   nft_bin="$(command -v nft)"
   case "$nft_bin" in /*) ;; *) nft_bin=/usr/sbin/nft ;; esac
   if write_if_changed "$DROPIN" 0644 "$(dropin_text "$nft_bin")"; then
@@ -254,7 +350,7 @@ cmd_apply() {
     if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload >/dev/null 2>&1 || log "warning: systemctl daemon-reload failed"; fi
   fi
   install_self
-  log "loaded table inet $TABLE (IPv6 blocked for uid $PROXY_UID: $(printf '%s\n' "$text" | sed -n 's/^    ip6 daddr { \(.*\) } reject$/\1/p'))"
+  log "loaded table inet $TABLE (uids $(printf '%s ' $UIDS| sed 's/ $//'); IPv6 blocked: $(printf '%s\n' "$text" | sed -n 's/^    ip6 daddr { \(.*\) } reject$/\1/p' | head -n1))"
 }
 
 cmd_status() {
