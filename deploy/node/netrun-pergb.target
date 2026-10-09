@@ -1,0 +1,15 @@
+# NETRUN pay-per-GB v2 — the per-GB runtime as one unit: RADIUS (socket
+# activated), the 3proxy-pergb ranges, the per-GB haproxy and its certificate
+# watch. Enabled + started by the agent's POST /pergb/enable, disabled +
+# stopped by POST /pergb/disable (node_runtime/node_agent/pergb_runtime.js);
+# installed disabled by deploy/node/install_pergb.sh. The ranges
+# (netrun-pergb-3proxy@<start port>.service) are added to its wants by
+# `systemctl enable`. Nothing per-piece is part of it.
+[Unit]
+Description=NETRUN per-GB runtime (RADIUS, 3proxy-pergb, per-GB haproxy)
+Documentation=file:///opt/netrun/README.md
+Wants=netrun-radius.socket netrun-pergb-haproxy.service netrun-pergb-certs.path
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

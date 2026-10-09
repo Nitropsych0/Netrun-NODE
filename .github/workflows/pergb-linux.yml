@@ -1,6 +1,6 @@
 # Pay-per-GB v2 — the Linux-only checks of the node side (netns, nft,
-# systemd, Docker builds, haproxy). Jobs of lane L1 (netrun-radius) are
-# prefixed l1-.
+# systemd, Docker builds, haproxy). Jobs are prefixed with their lane:
+# l1- (netrun-radius), l2- (per-GB runtime), l3- (node agent per-GB).
 name: pergb-linux
 
 on:
@@ -57,3 +57,98 @@ jobs:
         with:
           name: l1-radius-e2e
           path: ${{ runner.temp }}/e2e
+
+  l2-3proxy-pergb-build:
+    name: "L2: build 3proxy-pergb (pinned tarball, image, apt snapshot)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in Docker
+        run: bash scripts/build_3proxy_pergb.sh --out "$RUNNER_TEMP/build"
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3proxy-pergb
+          path: ${{ runner.temp }}/build
+
+  l2-3proxy-pergb-test:
+    name: "L2: 3proxy-pergb reproducible + golden cfg + 100k-login RSS smoke (netns)"
+    needs: l2-3proxy-pergb-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: 3proxy-pergb
+          path: ${{ runner.temp }}/build
+      - name: Patch applies, committed binary = pin = rebuild, golden parses, RSS flat vs stock growth
+        run: sudo bash scripts/test_build_3proxy_pergb.sh --require-all --rebuilt "$RUNNER_TEMP/build"
+
+  l2-node-tests:
+    name: "L2: node agent tests (pergb_runtime + the whole suite)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: node --test node_runtime/node_agent/*.test.js
+
+  l2-guard:
+    name: "L2: netrun-proxy-guard (two uids; kernel section in a netns)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+      - name: The per-GB user, so nft may print its name (the guard must still pass)
+        run: sudo groupadd --system -g 65533 netrun-pergb && sudo useradd --system -u 65533 -g 65533 -M -s /usr/sbin/nologin netrun-pergb
+      - name: Guard tests (the kernel section must run)
+        run: |
+          sudo bash scripts/test_netrun_proxy_guard.sh | tee "$RUNNER_TEMP/guard.out"
+          ! grep -q '^skip: kernel' "$RUNNER_TEMP/guard.out"
+
+  l2-haproxy:
+    name: "L2: per-GB haproxy golden (haproxy -c + live routing in a netns)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq haproxy && (sudo systemctl stop haproxy || true)
+      - run: sudo bash scripts/test_pergb_haproxy.sh --require-all
+
+  l2-install:
+    name: "L2: install_pergb.sh (idempotent on a real node, systemd-analyze verify, container refusals)"
+    needs: l2-3proxy-pergb-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: 3proxy-pergb
+          path: ${{ runner.temp }}/build
+      - name: The binary (the committed one, else this run's build)
+        run: |
+          if [ ! -f deploy/node/bin/3proxy-pergb ]; then
+            cp "$RUNNER_TEMP/build/3proxy-pergb" "$RUNNER_TEMP/build/3proxy-pergb.sha256" deploy/node/bin/
+          fi
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq haproxy rsyslog && (sudo systemctl stop haproxy || true)
+      - name: Stubbed installer tests
+        run: bash scripts/test_install_pergb.sh
+      - name: Real installer on this runner, twice
+        run: sudo bash scripts/test_install_pergb.sh --real
+
+  l2-scripts:
+    name: "L2: capacity tuning (--conntrack, maxmap) and the touched script suites"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/test_apply_capacity_tuning.sh
+      - run: bash scripts/test_3proxy_spawn.sh
+      - run: bash scripts/test_capacity_18k_node.sh
+      - run: bash scripts/test_fleet_health_node.sh

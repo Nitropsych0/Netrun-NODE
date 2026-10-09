@@ -1,0 +1,54 @@
+NETRUN per-GB 3proxy: 3proxy 0.9.3 (upstream tag 0.9.3) + two changes.
+Applied with `patch -p1` in the extracted 3proxy-0.9.3/ tree by
+scripts/build_3proxy_pergb.sh; the result is deploy/node/bin/3proxy-pergb
+(sha256 pinned in deploy/node/bin/3proxy-pergb.sha256). Per-piece batches keep
+the stock deploy/node/bin/3proxy.
+
+1. conf.c h_authcache: `authcache none` sets authcachetype 0. doauth()
+   (auth.c) inserts a cache entry after every successful auth whenever the type
+   is non-zero and never prunes it (only cacheauth() prunes, and it runs only
+   with `auth cache`): one leaked entry per distinct login with the default
+   type 6, one per connection with `acl`, each insert a walk of the whole list
+   under the global hash mutex. Upstream turns 0 into 6, so the cache could not
+   be switched off from the cfg.
+2. common.c (outbound connect): IP_BIND_ADDRESS_NO_PORT before the bind of the
+   outbound socket, so the source port is chosen at connect() for the full
+   4-tuple: sockets from one egress address to different destinations share
+   source ports instead of each holding one of ip_local_port_range.
+
+diff -ru a/src/common.c b/src/common.c
+--- a/src/common.c
++++ b/src/common.c
+@@ -443,6 +443,18 @@
+ 			param->sinsl = param->srv->extsa;
+ 	}
+ 	*SAPORT(&param->sinsl) = 0;
++#ifdef __linux__
++#ifndef IP_BIND_ADDRESS_NO_PORT
++#define IP_BIND_ADDRESS_NO_PORT 24
++#endif
++	/* netrun-pergb: defer the source port to connect(), so sockets bound to
++	   one source address but connecting to different destinations share
++	   source ports (no ephemeral port exhaustion of the egress IPv4). */
++	if(param->operation >= 256 || (param->operation & CONNECT)){
++		int opt = 1;
++		so._setsockopt(param->remsock, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, (char *)&opt, sizeof(opt));
++	}
++#endif
+ 	if(so._bind(param->remsock, (struct sockaddr*)&param->sinsl, SASIZE(&param->sinsl))==-1) {
+ 		return 12;
+ 	}
+diff -ru a/src/conf.c b/src/conf.c
+--- a/src/conf.c
++++ b/src/conf.c
+@@ -1356,6 +1356,10 @@
+ #endif
+ static int h_authcache(int argc, unsigned char **argv){
+ 	conf.authcachetype = 0;
++	/* netrun-pergb: `authcache none` switches the cache off (type 0), so
++	   doauth() never inserts an entry. Upstream turns 0 into 6 below, and
++	   every type leaks one entry per distinct login (or per connection). */
++	if(!strcmp((char *) *(argv + 1), "none")) return 0;
+ 	if(strstr((char *) *(argv + 1), "ip")) conf.authcachetype |= 1;
+ 	if(strstr((char *) *(argv + 1), "user")) conf.authcachetype |= 2;
+ 	if(strstr((char *) *(argv + 1), "pass")) conf.authcachetype |= 4;

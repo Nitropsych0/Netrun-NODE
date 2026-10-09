@@ -737,6 +737,21 @@ EOF
   systemctl enable netrun-ipv6-restore.service >/dev/null 2>&1 || true
 }
 
+# Pay-per-GB v2 — the per-GB runtime (users netrun-pergb 65533 / netrun-radius,
+# the hash-pinned 3proxy-pergb, its log filesystem, rsyslog/logrotate, units)
+# installed DISABLED: the agent starts it on POST /pergb/enable. Runs before
+# install_security, so the 3proxy egress guard gates the per-GB uid too.
+# Non-fatal (per-piece does not need it); NETRUN_PERGB_INSTALL=0 skips it.
+install_pergb_runtime() {
+  if [ "${NETRUN_PERGB_INSTALL:-1}" = 0 ]; then
+    log "per-GB runtime: skipped (NETRUN_PERGB_INSTALL=0)"
+    return 0
+  fi
+  log "Installing the per-GB runtime (deploy/node/install_pergb.sh; disabled until /pergb/enable)"
+  bash "$NETRUN_HOME/deploy/node/install_pergb.sh" \
+    || warn "install_pergb.sh failed — per-GB is unavailable on this node; rerun: bash $NETRUN_HOME/deploy/node/install_pergb.sh"
+}
+
 # Audit 2026-10-08 — netrun-harden.sh secure: the 3proxy egress guard (uid
 # 65535 may not reach the node itself, private / metadata addresses, the
 # node's prefixes), credential files root-only, ssh keys only, unbound's
@@ -794,6 +809,7 @@ main() {
   install_doctor_script
   install_trend_monitor
   install_ipv6_restore_unit
+  install_pergb_runtime
   install_security
 
   verify_health

@@ -1,0 +1,10 @@
+# NETRUN pay-per-GB v2 — started by netrun-pergb-certs.path: reload the
+# per-GB haproxy when the certificates it serves changed (see
+# deploy/node/netrun-pergb-certs-reload.sh). Never touches the per-piece haproxy.
+[Unit]
+Description=NETRUN per-GB haproxy: reload after a certificate change
+After=netrun-pergb-haproxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/netrun/deploy/node/netrun-pergb-certs-reload.sh
