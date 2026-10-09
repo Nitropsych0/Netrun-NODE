@@ -1,0 +1,27 @@
+{
+  "format": "netrun-pergb-psl-v1",
+  "spec": "A12 site key: the registrable domain (eTLD+1, punycode, lowercase, no trailing dot) of the host by node_runtime/radius/public_suffix_list.dat (ICANN + private sections; longest rule wins, !exception beats *.wildcard, default rule *); a host that is an IP literal, empty, '-', or itself a public suffix has no registrable domain and the key is the destination network instead: v4:<a.b.c.0>/24 or v6:<the /48, RFC 5952>/48.",
+  "vectors": [
+    {"host": "www.bbc.co.uk", "dst": "151.101.0.81", "site": "bbc.co.uk"},
+    {"host": "bbc.co.uk", "dst": "151.101.0.81", "site": "bbc.co.uk"},
+    {"host": "co.uk", "dst": "151.101.0.81", "site": "v4:151.101.0.0/24"},
+    {"host": "foo.github.io", "dst": "185.199.108.153", "site": "foo.github.io"},
+    {"host": "a.b.foo.github.io", "dst": "185.199.108.153", "site": "foo.github.io"},
+    {"host": "github.io", "dst": "185.199.108.153", "site": "v4:185.199.108.0/24"},
+    {"host": "a.b.example.com", "dst": "2606:2800:220:1:248:1893:25c8:1946", "site": "example.com"},
+    {"host": "EXAMPLE.COM.", "dst": "93.184.216.34", "site": "example.com"},
+    {"host": "пример.рф", "dst": "93.184.216.34", "site": "xn--e1afmkfd.xn--p1ai"},
+    {"host": "www.пример.рф", "dst": "93.184.216.34", "site": "xn--e1afmkfd.xn--p1ai"},
+    {"host": "xn--e1afmkfd.xn--p1ai", "dst": "93.184.216.34", "site": "xn--e1afmkfd.xn--p1ai"},
+    {"host": "a.www.ck", "dst": "1.2.3.4", "site": "www.ck"},
+    {"host": "foo.ck", "dst": "1.2.3.4", "site": "v4:1.2.3.0/24"},
+    {"host": "x.foo.ck", "dst": "1.2.3.4", "site": "x.foo.ck"},
+    {"host": "a.city.kawasaki.jp", "dst": "1.2.3.4", "site": "city.kawasaki.jp"},
+    {"host": "bar.foo.kawasaki.jp", "dst": "1.2.3.4", "site": "bar.foo.kawasaki.jp"},
+    {"host": "1.2.3.4", "dst": "1.2.3.4", "site": "v4:1.2.3.0/24"},
+    {"host": "-", "dst": "2606:4700:10::6816:1", "site": "v6:2606:4700:10::/48"},
+    {"host": "", "dst": "93.184.216.34", "site": "v4:93.184.216.0/24"},
+    {"host": "[2001:db8::1]", "dst": "2001:db8::1", "site": "v6:2001:db8::/48"},
+    {"host": "localhost", "dst": "127.0.0.1", "site": "v4:127.0.0.0/24"}
+  ]
+}
