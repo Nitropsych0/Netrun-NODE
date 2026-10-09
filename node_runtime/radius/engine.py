@@ -724,6 +724,7 @@ class Engine:
                     v4 = self._line_v4(f, v4s, ln.v4)
                 else:
                     v6 = ln.addr.to_bytes(16, "big")
+                    a.last_used[ln.net] = int(now)  # reserve_nets spares /64s that served in the last 60 s
         except AllocError as e:
             return self._reject(e.reason, lst, now)
         if near is not None:

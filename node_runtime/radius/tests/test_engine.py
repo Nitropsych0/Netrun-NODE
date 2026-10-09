@@ -412,6 +412,12 @@ class Modes(unittest.TestCase):
         self.clock.advance(11)  # quiet: switches
         self.assertNotEqual(ask(self.eng, "netrun-tpauses", port=BASE + 1).addr, a.addr)
 
+    def test_reserve_spares_a_64_a_line_just_used(self):
+        self.eng.dispatch({"op": "facts", "facts": rtest.facts(subnets=[0, 1], minFree64ForPerpiece=0)})
+        used = ask(self.eng, "netrun-statica", port=BASE + 1).net
+        r = self.eng.dispatch({"op": "reserve_nets", "count": 1, "ref": "gen:1"})
+        self.assertEqual(r["nets"], [1 - used])
+
     def test_pause_is_ignored_on_link_and_static_lists(self):
         self.apply_list(2, lid=12, login_id="linkabc", aid=1, mode="link", stickyPauseSec=5)
         self.assertIsNone(self.eng.lists[12].pause)
