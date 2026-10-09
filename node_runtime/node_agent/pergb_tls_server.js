@@ -15,6 +15,14 @@
 // The plain :8085 listener answers /pergb/* with 404 pergb_tls_only, except
 // the two amendment-A1 routes the node itself uses (the generator, per-piece
 // deprovision): POST /pergb/reserve_nets and /pergb/release_nets.
+//
+// The listener opens only on a node where per-GB is installed
+// (deploy/node/install_pergb.sh made /etc/netrun-pergb) and never while the
+// node's agent firewall (netrun-harden agent-firewall, table
+// inet netrun_agent_guard) exists without 8086: deploying this agent fleet-wide
+// must not put a new internet-facing port on nodes guarded before 8086
+// existed. status().gate says why it is closed (rerun
+// `netrun-harden agent-firewall` to add 8086 for the same orchestrator IP).
 
 const crypto = require("crypto");
 const fs = require("fs");
@@ -36,7 +44,21 @@ function readSettings(env = process.env) {
     certPath: env.NETRUN_PERGB_TLS_CERT ? String(env.NETRUN_PERGB_TLS_CERT) : null,
     keyPath: env.NETRUN_PERGB_TLS_KEY ? String(env.NETRUN_PERGB_TLS_KEY) : null,
     ip: env.NETRUN_PERGB_TLS_IP ? String(env.NETRUN_PERGB_TLS_IP) : null,
+    installedDir: String(env.NETRUN_PERGB_ETC_DIR || "/etc/netrun-pergb"),
+    requireInstalled: !/^(0|off|false|no)$/i.test(String(env.NETRUN_PERGB_TLS_REQUIRE_INSTALLED || "1")),
+    requireFirewall: !/^(0|off|false|no)$/i.test(String(env.NETRUN_PERGB_TLS_REQUIRE_FIREWALL || "1")),
   };
+}
+
+const AGENT_GUARD_TABLE = "netrun_agent_guard";
+
+// Does the live agent guard (netrun-harden agent-firewall) cover 8086?
+// -> "covered" | "absent" (no table: an unguarded node, 8085 is open as well) | "missing_8086"
+function agentGuardState(text, code) {
+  if (code !== 0) return "absent";
+  const t = String(text || "");
+  if (/dport \{ 8085, 8086 \} drop/.test(t) || /dport \{ 8085-8086 \} drop/.test(t) || /dport 8086 drop/.test(t)) return "covered";
+  return "missing_8086";
 }
 
 function sendJson(res, status, payload) {
@@ -126,7 +148,9 @@ function createTlsServer(deps) {
   const log = deps.log || console;
   const pergb = deps.pergb;
   const keyOk = deps.apiKeyMatches;
-  const primaryIp = deps.primaryIp || defaultPrimaryIp(deps.run || require("./pergb_runtime.js").execCapture);
+  const run = deps.run || require("./pergb_runtime.js").execCapture;
+  const primaryIp = deps.primaryIp || defaultPrimaryIp(run);
+  let gate = { open: null, reason: null, firewall: null, checkedAt: null };
   let server = null;
   let listening = false;
   let current = null; // the loaded certificate
@@ -234,7 +258,28 @@ function createTlsServer(deps) {
     return tick();
   }
 
+  // May the listener open? (see the module doc)
+  async function checkGate() {
+    const out = { open: true, reason: null, firewall: null, checkedAt: new Date().toISOString() };
+    if (settings.requireInstalled && !fs.existsSync(settings.installedDir)) {
+      Object.assign(out, { open: false, reason: "pergb_not_installed" });
+    } else if (settings.requireFirewall) {
+      let r;
+      try {
+        r = await run("nft", ["list", "table", "inet", AGENT_GUARD_TABLE], { timeoutMs: 10000 });
+      } catch (e) {
+        r = { code: 1, stdout: "", stderr: String((e && e.message) || e) };
+      }
+      out.firewall = agentGuardState(r && r.stdout, r ? r.code : 1);
+      if (out.firewall === "missing_8086") Object.assign(out, { open: false, reason: "agent_firewall_without_8086" });
+    }
+    if (!out.open && gate.reason !== out.reason) log.error(`[pergb-tls] listener stays closed: ${out.reason}${out.reason === "agent_firewall_without_8086" ? " (run: netrun-harden agent-firewall)" : ""}`);
+    gate = out;
+    return out;
+  }
+
   async function tick() {
+    if (!listening && !server && !(await checkGate()).open) return status();
     const ok = await checkCertificate();
     if (!ok || listening || server) return status();
     server = https.createServer({ cert: current.cert, key: current.key, minVersion: "TLSv1.2" }, (req, res) => {
@@ -277,6 +322,7 @@ function createTlsServer(deps) {
       certificate: current ? { source: current.source, notAfter: current.notAfter, subjectAltName: current.subjectAltName } : null,
       reloads,
       error: lastError,
+      gate,
     };
   }
 
@@ -327,4 +373,4 @@ function createTlsServer(deps) {
   };
 }
 
-module.exports = { BODY_LIMIT_BYTES, DEFAULT_PORT, readSettings, readBody, loadCertificate, createTlsServer, isIP: net.isIP };
+module.exports = { BODY_LIMIT_BYTES, DEFAULT_PORT, readSettings, readBody, loadCertificate, agentGuardState, createTlsServer, isIP: net.isIP };

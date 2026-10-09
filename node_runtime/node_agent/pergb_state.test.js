@@ -142,7 +142,7 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     },
   });
   const c1 = certPair(dir, "one");
-  const srv = tlsLib.createTlsServer({ pergb, apiKeyMatches: (k) => k === API_KEY, log: QUIET, settings: { port: 0, host: "127.0.0.1", certPath: c1.crt, keyPath: c1.key, enabled: true } });
+  const srv = tlsLib.createTlsServer({ pergb, apiKeyMatches: (k) => k === API_KEY, log: QUIET, settings: { port: 0, host: "127.0.0.1", certPath: c1.crt, keyPath: c1.key, enabled: true, requireInstalled: false, requireFirewall: false } });
   t.after(() => srv.stop());
   await srv.start();
   const port = srv.port;

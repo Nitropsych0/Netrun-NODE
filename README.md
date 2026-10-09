@@ -867,7 +867,7 @@ Nothing of it runs while per-GB is not enabled on the node.
 
 | Module (`node_runtime/node_agent/`) | What |
 |---|---|
-| `pergb_tls_server.js` | HTTPS `:8086` with the node IP certificate (lego `<ip>.crt/.key`, else `/etc/netrun/tls/node.pem`), re-read every 30 s and swapped with `setSecureContext`; `X-API-KEY`; 2 MiB body limit |
+| `pergb_tls_server.js` | HTTPS `:8086` with the node IP certificate (lego `<ip>.crt/.key`, else `/etc/netrun/tls/node.pem`), re-read every 30 s and swapped with `setSecureContext`; `X-API-KEY`; 2 MiB body limit. Opens only where per-GB is installed (`/etc/netrun-pergb` exists) and never while the agent firewall (`inet netrun_agent_guard`) lacks 8086 — `/health` `pergb.tls.gate` says why; fix with `netrun-harden agent-firewall` |
 | `pergb_state.js` | enable / disable, snapshot pages + deltas to RADIUS (kills from `transitions`), usage, kill, attribution, port_check, reserve / release (A1), the loops |
 | `pergb_radius_client.js` | ctl client of `/run/netrun-radius/ctl.sock` (JSON lines; 503 `radius_unavailable`, 409 `seq_mismatch {epoch, seq}`) |
 | `pergb_meter.js` | hourly logs `p<sp>.log.YYYY.MM.DD-HH` → `meter.json` (cursor + counters in one atomic file: exactly once), archive + retention |
@@ -912,7 +912,8 @@ Settings (environment; tests point them at temp dirs): `NETRUN_RADIUS_CTL_SOCKET
 `NETRUN_RADIUS_ADDR` (127.0.0.1:1812), `NETRUN_PERGB_POOL_FILE`,
 `NETRUN_PERGB_STATE_DIR` (`/var/lib/netrun-pergb`: `meter.json`),
 `NETRUN_PERGB_TLS_PORT` (8086), `NETRUN_PERGB_TLS_HOST`, `NETRUN_PERGB_TLS=0`
-(no listener), `NETRUN_PERGB_TLS_CERT` / `_KEY` / `_PEM`, `NETRUN_PERGB_CGROUP_ROOT`,
+(no listener), `NETRUN_PERGB_TLS_REQUIRE_INSTALLED=0` / `NETRUN_PERGB_TLS_REQUIRE_FIREWALL=0`
+(skip the listener gate; tests only), `NETRUN_PERGB_TLS_CERT` / `_KEY` / `_PEM`, `NETRUN_PERGB_CGROUP_ROOT`,
 plus L2's `NETRUN_PERGB_ETC_DIR`, `NETRUN_PERGB_LOG_DIR`.
 
 Tests: `node --test node_runtime/node_agent/pergb_*.test.js
