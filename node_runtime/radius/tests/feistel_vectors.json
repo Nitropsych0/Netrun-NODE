@@ -1,0 +1,922 @@
+{
+ "format": "netrun-pergb-feistel-v1",
+ "spec": "I3: plain = listId(32) || r16(16) || mac16(16); mac16 = HMAC_SHA256(k, 'netrun-pergb-mac' || listId(4,BE) || r16(2,BE))[0:2]; 8 rounds i=0..7: (L,R) = (R, L xor F(i,R)), F(i,R) = HMAC_SHA256(k, 'netrun-pergb-tag' || byte(i) || R(4,BE))[0:4] as BE uint32; iid = L<<32 | R; r16 is redrawn while iid < 2^32 (iidAccepted=false); addr = prefix48 | subnet<<64 | iid; decrypt runs the rounds backwards, tagValid = recomputed mac16 matches.",
+ "vectors": [
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 0,
+   "r16": 0,
+   "mac16": 11864,
+   "iid": "f368d46512f43d68",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 0,
+   "r16": 1,
+   "mac16": 35577,
+   "iid": "5a87c324a93445e3",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 0,
+   "r16": 4660,
+   "mac16": 6796,
+   "iid": "f81bda966763e328",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 0,
+   "r16": 48879,
+   "mac16": 31201,
+   "iid": "d0c16d0f9d7a1dac",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 0,
+   "r16": 65535,
+   "mac16": 9684,
+   "iid": "969dafb61781ee14",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 1,
+   "r16": 0,
+   "mac16": 7627,
+   "iid": "89238cfc529ddf1c",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 1,
+   "r16": 1,
+   "mac16": 37229,
+   "iid": "fe4b35873f723c01",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 1,
+   "r16": 4660,
+   "mac16": 36243,
+   "iid": "10219d7398a96e7e",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 1,
+   "r16": 48879,
+   "mac16": 17351,
+   "iid": "50c9c01047d9dcd8",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 1,
+   "r16": 65535,
+   "mac16": 35993,
+   "iid": "d62bc3a0b89772c7",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 42,
+   "r16": 0,
+   "mac16": 39054,
+   "iid": "08c85b14742900d4",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 42,
+   "r16": 1,
+   "mac16": 6899,
+   "iid": "7a39625a51f0eb90",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 42,
+   "r16": 4660,
+   "mac16": 57681,
+   "iid": "43012de4e9354ca7",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 42,
+   "r16": 48879,
+   "mac16": 37587,
+   "iid": "899450d58f3af7b5",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 42,
+   "r16": 65535,
+   "mac16": 32354,
+   "iid": "574704c12c229da3",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 900000001,
+   "r16": 0,
+   "mac16": 11999,
+   "iid": "7404fc738c28c924",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 900000001,
+   "r16": 1,
+   "mac16": 46421,
+   "iid": "6fd8c14a15dc223c",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 900000001,
+   "r16": 4660,
+   "mac16": 1976,
+   "iid": "e278a2359ef00902",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 900000001,
+   "r16": 48879,
+   "mac16": 8347,
+   "iid": "3ac41383ac8b3b92",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 900000001,
+   "r16": 65535,
+   "mac16": 38324,
+   "iid": "abaa970cf7f128a2",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483647,
+   "r16": 0,
+   "mac16": 54961,
+   "iid": "459a0ffa7311eb4b",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483647,
+   "r16": 1,
+   "mac16": 47234,
+   "iid": "bae239be900ed594",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483647,
+   "r16": 4660,
+   "mac16": 39914,
+   "iid": "6ef8d8a01f98e628",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483647,
+   "r16": 48879,
+   "mac16": 32734,
+   "iid": "324d1e346f5acb35",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483647,
+   "r16": 65535,
+   "mac16": 3335,
+   "iid": "1a3cdcbc6d0bbb37",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483648,
+   "r16": 0,
+   "mac16": 40354,
+   "iid": "60848bcdaf29e254",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483648,
+   "r16": 1,
+   "mac16": 37565,
+   "iid": "aa9ef732e7bb2e44",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483648,
+   "r16": 4660,
+   "mac16": 24602,
+   "iid": "13ba80842c4f039f",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483648,
+   "r16": 48879,
+   "mac16": 31319,
+   "iid": "d0037b94a7fe998d",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 2147483648,
+   "r16": 65535,
+   "mac16": 23611,
+   "iid": "bc1f3c239f0cfede",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 4294967295,
+   "r16": 0,
+   "mac16": 48517,
+   "iid": "e80b9a24600fe5df",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 4294967295,
+   "r16": 1,
+   "mac16": 40852,
+   "iid": "a3c1791e4df1db01",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 4294967295,
+   "r16": 4660,
+   "mac16": 25391,
+   "iid": "2c10bc6ad0d85296",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 4294967295,
+   "r16": 48879,
+   "mac16": 56653,
+   "iid": "3ae6eb0a24843178",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 4294967295,
+   "r16": 65535,
+   "mac16": 11813,
+   "iid": "95a787b52bcec3fe",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 123456789,
+   "r16": 0,
+   "mac16": 39897,
+   "iid": "330d5e0a3d256d4a",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 123456789,
+   "r16": 1,
+   "mac16": 62450,
+   "iid": "9ed9700d8c1e8cf8",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 123456789,
+   "r16": 4660,
+   "mac16": 29300,
+   "iid": "2c19b11e74cf3235",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 123456789,
+   "r16": 48879,
+   "mac16": 36020,
+   "iid": "eb45a3641f5cdeab",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "listId": 123456789,
+   "r16": 65535,
+   "mac16": 36312,
+   "iid": "16113b6338840666",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 0,
+   "r16": 0,
+   "mac16": 49657,
+   "iid": "952a192ffc37ab41",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 0,
+   "r16": 1,
+   "mac16": 53768,
+   "iid": "baf7d39787a6b6fa",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 0,
+   "r16": 4660,
+   "mac16": 16946,
+   "iid": "41c4e8335d758e3b",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 0,
+   "r16": 48879,
+   "mac16": 37380,
+   "iid": "e5f3f2f7413479a2",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 0,
+   "r16": 65535,
+   "mac16": 36007,
+   "iid": "1dbd2690ad0b7e81",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 1,
+   "r16": 0,
+   "mac16": 7216,
+   "iid": "ec75a9e652b86872",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 1,
+   "r16": 1,
+   "mac16": 36000,
+   "iid": "b0546335e3d06573",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 1,
+   "r16": 4660,
+   "mac16": 44882,
+   "iid": "08e5b74e53a6ab7b",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 1,
+   "r16": 48879,
+   "mac16": 13481,
+   "iid": "6a5788957fd5a378",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 1,
+   "r16": 65535,
+   "mac16": 13727,
+   "iid": "b82407fbf0fa49fb",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 42,
+   "r16": 0,
+   "mac16": 33231,
+   "iid": "b128a745eac57c8d",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 42,
+   "r16": 1,
+   "mac16": 46943,
+   "iid": "636e6575a5cd6955",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 42,
+   "r16": 4660,
+   "mac16": 9032,
+   "iid": "caa6fe52bcc74216",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 42,
+   "r16": 48879,
+   "mac16": 58226,
+   "iid": "dc406610e4e43255",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 42,
+   "r16": 65535,
+   "mac16": 12799,
+   "iid": "ec6a57707f44d2e0",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 900000001,
+   "r16": 0,
+   "mac16": 227,
+   "iid": "83f3d78a12bcaa64",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 900000001,
+   "r16": 1,
+   "mac16": 45701,
+   "iid": "6e0b6345ec634b4e",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 900000001,
+   "r16": 4660,
+   "mac16": 38188,
+   "iid": "85e20000ef3a3c20",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 900000001,
+   "r16": 48879,
+   "mac16": 34629,
+   "iid": "b0cb19586088498a",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 900000001,
+   "r16": 65535,
+   "mac16": 33064,
+   "iid": "7578e48838756b99",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483647,
+   "r16": 0,
+   "mac16": 26960,
+   "iid": "96fe5630c9ba0f4f",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483647,
+   "r16": 1,
+   "mac16": 43265,
+   "iid": "50461976d73eb2cb",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483647,
+   "r16": 4660,
+   "mac16": 18734,
+   "iid": "0440ce2089df17ff",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483647,
+   "r16": 48879,
+   "mac16": 40039,
+   "iid": "8589cdd596e5d304",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483647,
+   "r16": 65535,
+   "mac16": 56580,
+   "iid": "a05a48a8efbb93c3",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483648,
+   "r16": 0,
+   "mac16": 33020,
+   "iid": "34383efb06874119",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483648,
+   "r16": 1,
+   "mac16": 37032,
+   "iid": "1bc205ed4f2c3deb",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483648,
+   "r16": 4660,
+   "mac16": 58389,
+   "iid": "3298e48b7840e15e",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483648,
+   "r16": 48879,
+   "mac16": 38613,
+   "iid": "ef119ad7db99a099",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 2147483648,
+   "r16": 65535,
+   "mac16": 13843,
+   "iid": "902c5dcc6bfec488",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 4294967295,
+   "r16": 0,
+   "mac16": 23518,
+   "iid": "4b5d1bd9b145eeed",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 4294967295,
+   "r16": 1,
+   "mac16": 5701,
+   "iid": "35a855b44f93dcd4",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 4294967295,
+   "r16": 4660,
+   "mac16": 42045,
+   "iid": "4ebe72af486cab19",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 4294967295,
+   "r16": 48879,
+   "mac16": 18223,
+   "iid": "c3fc82850461dbfb",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 4294967295,
+   "r16": 65535,
+   "mac16": 41925,
+   "iid": "5257c249def87203",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 123456789,
+   "r16": 0,
+   "mac16": 37742,
+   "iid": "0ea3024fe487caae",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 123456789,
+   "r16": 1,
+   "mac16": 36442,
+   "iid": "f1c23fde56556391",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 123456789,
+   "r16": 4660,
+   "mac16": 16521,
+   "iid": "801329e7ceabd3c1",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 123456789,
+   "r16": 48879,
+   "mac16": 52919,
+   "iid": "3cd0cbed17cef81d",
+   "iidAccepted": true
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "keyHex": "9a1a6a31c2d743b79769b02b0784fd50d68abcddefd1ae84a27991a403d74c0a",
+   "listId": 123456789,
+   "r16": 65535,
+   "mac16": 9176,
+   "iid": "d593fa0f4eb93b3a",
+   "iidAccepted": true
+  }
+ ],
+ "addresses": [
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "prefix": "2001:db8:aa::/48",
+   "subnet": 0,
+   "subnetHex": "0000",
+   "listId": 42,
+   "r16": 4660,
+   "iid": "43012de4e9354ca7",
+   "addr": "2001:db8:aa:0:4301:2de4:e935:4ca7"
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "prefix": "2001:db8:aa::/48",
+   "subnet": 32768,
+   "subnetHex": "8000",
+   "listId": 42,
+   "r16": 1,
+   "iid": "7a39625a51f0eb90",
+   "addr": "2001:db8:aa:8000:7a39:625a:51f0:eb90"
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "prefix": "2001:db8:aa::/48",
+   "subnet": 65534,
+   "subnetHex": "fffe",
+   "listId": 7,
+   "r16": 65535,
+   "iid": "70604802f3502c2e",
+   "addr": "2001:db8:aa:fffe:7060:4802:f350:2c2e"
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "prefix": "2001:db8:aa::/48",
+   "subnet": 7982,
+   "subnetHex": "1f2e",
+   "listId": 4294967295,
+   "r16": 170,
+   "iid": "6793780fa30a318f",
+   "addr": "2001:db8:aa:1f2e:6793:780f:a30a:318f"
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "prefix": "2001:db8:aa::/48",
+   "subnet": 0,
+   "subnetHex": "0000",
+   "listId": 42,
+   "r16": 4660,
+   "iid": "caa6fe52bcc74216",
+   "addr": "2001:db8:aa:0:caa6:fe52:bcc7:4216"
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "prefix": "2001:db8:aa::/48",
+   "subnet": 32768,
+   "subnetHex": "8000",
+   "listId": 42,
+   "r16": 1,
+   "iid": "636e6575a5cd6955",
+   "addr": "2001:db8:aa:8000:636e:6575:a5cd:6955"
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "prefix": "2001:db8:aa::/48",
+   "subnet": 65534,
+   "subnetHex": "fffe",
+   "listId": 7,
+   "r16": 65535,
+   "iid": "231763d7a4eef318",
+   "addr": "2001:db8:aa:fffe:2317:63d7:a4ee:f318"
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "prefix": "2001:db8:aa::/48",
+   "subnet": 7982,
+   "subnetHex": "1f2e",
+   "listId": 4294967295,
+   "r16": 170,
+   "iid": "6315bdb3f1124c3d",
+   "addr": "2001:db8:aa:1f2e:6315:bdb3:f112:4c3d"
+  }
+ ],
+ "invalid": [
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "iid": "ee668de6aac93a05",
+   "listId": 3065997314,
+   "r16": 21341,
+   "tagValid": false
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "iid": "33218a5ec81d850b",
+   "listId": 1105127668,
+   "r16": 39823,
+   "tagValid": false
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "iid": "7610eccdd66e323a",
+   "listId": 3512296153,
+   "r16": 21218,
+   "tagValid": false
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "iid": "5595d781239a5615",
+   "listId": 4022599915,
+   "r16": 51768,
+   "tagValid": false
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "iid": "3157e0cf1579daa9",
+   "listId": 1604994436,
+   "r16": 19522,
+   "tagValid": false
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "iid": "a6129eabaa31ec92",
+   "listId": 2762467098,
+   "r16": 1645,
+   "tagValid": false
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "iid": "760bd1208935c861",
+   "listId": 1693437235,
+   "r16": 47961,
+   "tagValid": false
+  },
+  {
+   "keyB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+   "iid": "dd04c9ced30014fe",
+   "listId": 1926606105,
+   "r16": 58899,
+   "tagValid": false
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "iid": "f0bbfe48caa699c7",
+   "listId": 624172475,
+   "r16": 58940,
+   "tagValid": false
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "iid": "18464b363b23eb72",
+   "listId": 2033140600,
+   "r16": 28427,
+   "tagValid": false
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "iid": "ee1c9fa876338150",
+   "listId": 2963191616,
+   "r16": 44874,
+   "tagValid": false
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "iid": "f8c0270dada8f311",
+   "listId": 3974276666,
+   "r16": 52280,
+   "tagValid": false
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "iid": "aab61ca9ca518cdd",
+   "listId": 4040207722,
+   "r16": 52116,
+   "tagValid": false
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "iid": "42b870534206a05c",
+   "listId": 3655890102,
+   "r16": 29314,
+   "tagValid": false
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "iid": "4d083582577cfe4f",
+   "listId": 875103321,
+   "r16": 12399,
+   "tagValid": false
+  },
+  {
+   "keyB64": "mhpqMcLXQ7eXabArB4T9UNaKvN3v0a6EonmRpAPXTAo=",
+   "iid": "f8fd0516ec802bbf",
+   "listId": 2243617355,
+   "r16": 60240,
+   "tagValid": false
+  }
+ ]
+}
