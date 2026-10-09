@@ -1,0 +1,14 @@
+# NETRUN pay-per-GB v2 — certificate renewals reach the per-GB haproxy
+# without netrun-https knowing about it: a change of the crt-list, the IP
+# certificate or a hostname certificate (netrun-https writes them) starts
+# netrun-pergb-certs.service, which reloads the per-GB haproxy only when the
+# crt-list or a PEM it names really changed.
+[Unit]
+Description=NETRUN per-GB haproxy: watch the TLS certificates
+PartOf=netrun-pergb.target
+
+[Path]
+PathChanged=/etc/netrun/tls/crt-list
+PathChanged=/etc/netrun/tls/node.pem
+PathChanged=/etc/netrun/tls/hosts
+Unit=netrun-pergb-certs.service

@@ -1,0 +1,15 @@
+# NETRUN pay-per-GB v2 — the per-GB haproxy access log, 14 days (abuse
+# attribution). Rotated as netrun-pergb (owner of the log directory; never
+# root in a directory a proxy user can write) by copying + truncating, so
+# rsyslog keeps writing to the same file. Installed by
+# deploy/node/install_pergb.sh as /etc/logrotate.d/netrun-pergb-haproxy.
+/var/log/netrun-pergb/haproxy.log {
+    su netrun-pergb netrun-pergb
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}

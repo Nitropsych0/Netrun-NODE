@@ -93,6 +93,21 @@
 #                2c/4GB -> 65536 = full 64 KiB splice pipes for ~2048 relayed
 #                connections instead of ~512). Persisted in 99-netrun.conf; the
 #                runtime value is only ever raised. New pipes only.
+#   maxmap       OPT-IN (pay-per-GB v2). vm.max_map_count >= 1048576 (the Ubuntu
+#                24.04 default): every 3proxy-pergb thread holds a stack mapping
+#                + guard page, and one process serves up to ~20000 connections
+#                of the base port, past the old kernel default 65530 mappings.
+#                Persisted in 99-netrun.conf; the runtime value is only ever
+#                raised (--max-map-count N overrides the target).
+#
+#   --conntrack  the per-GB capacity check (plan P1): runs exactly the opt-in
+#                steps conntrack + maxmap (added to --only when that is given).
+#                With per-GB enabled (/etc/netrun-pergb/enable.json) the conntrack
+#                target is at least the per-GB need — 3 entries per session
+#                (client->haproxy, haproxy->3proxy on loopback, 3proxy->target)
+#                for maxConns sessions plus 120 s of TIME_WAIT at
+#                NETRUN_PERGB_CONN_RATE (300) new sessions/s — as a power of two;
+#                a table >= 75 % full is reported.
 #
 # Read-only listener audit (always printed): TCP listeners below 8100 and any
 # listener >= 8100 that is not 3proxy / haproxy (those would collide with
@@ -104,8 +119,10 @@
 # Options:
 #   --dry-run                 default; print what would be done
 #   --apply                   do it (root)
-#   --only LIST               comma list of: sysctl,unbound,nft,ipv6restore,conntrack,units,fingerprint,pipes,security
+#   --only LIST               comma list of: sysctl,unbound,nft,ipv6restore,conntrack,units,fingerprint,pipes,security,maxmap
 #                             (default: sysctl,unbound,nft,ipv6restore — the others are opt-in)
+#   --conntrack               the per-GB capacity check: conntrack + maxmap (see above)
+#   --max-map-count N         maxmap step target (default 1048576)
 #   --ephemeral-range LO-HI   default 1024-8000
 #   --conntrack-max N         conntrack step target (default: sized by MemTotal)
 #   --pipe-pages N            pipes step target (default: sized by MemTotal)
@@ -167,6 +184,12 @@ UNBOUND_RRSET="64m"
 
 MODE="dry-run"
 ONLY="sysctl,unbound,nft,ipv6restore"
+ONLY_GIVEN=0
+CT_FLAG=0
+MAXMAP_OVERRIDE=""
+MAXMAP_DEFAULT=1048576
+PROC_MAXMAP="$ROOT/proc/sys/vm/max_map_count"
+PERGB_ENABLE="$ROOT/etc/netrun-pergb/enable.json"
 EPH_LO=1024
 EPH_HI=8000
 ALLOW_UNBOUND_RESTART=0
@@ -185,14 +208,17 @@ refused() { step_status "$1" "REFUSED" "$2"; RC_REFUSED=1; }
 failed() { step_status "$1" "FAILED" "$2"; RC_FAILED=1; }
 die() { log "ERROR: $*" >&2; exit 1; }
 
-usage() { sed -n '2,122p' "$0" 2>/dev/null; }
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" 2>/dev/null; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) MODE="dry-run" ;;
     --apply) MODE="apply" ;;
-    --only) [ $# -ge 2 ] || die "--only needs a list"; ONLY="$2"; shift ;;
-    --only=*) ONLY="${1#--only=}" ;;
+    --only) [ $# -ge 2 ] || die "--only needs a list"; ONLY="$2"; ONLY_GIVEN=1; shift ;;
+    --only=*) ONLY="${1#--only=}"; ONLY_GIVEN=1 ;;
+    --conntrack) CT_FLAG=1 ;;
+    --max-map-count) [ $# -ge 2 ] || die "--max-map-count needs a number"; MAXMAP_OVERRIDE="$2"; shift ;;
+    --max-map-count=*) MAXMAP_OVERRIDE="${1#--max-map-count=}" ;;
     --ephemeral-range) [ $# -ge 2 ] || die "--ephemeral-range needs LO-HI"; EPH_LO="${2%%[- ]*}"; EPH_HI="${2##*[- ]}"; shift ;;
     --allow-unbound-restart) ALLOW_UNBOUND_RESTART=1 ;;
     --ignore-genlock) IGNORE_GENLOCK=1 ;;
@@ -209,9 +235,17 @@ done
 case "$EPH_LO$EPH_HI" in *[!0-9]*|"") die "--ephemeral-range must be LO-HI (integers)" ;; esac
 [ "$EPH_LO" -ge 1024 ] && [ "$EPH_HI" -gt "$EPH_LO" ] && [ "$EPH_HI" -lt "$PROXY_PORT_FLOOR" ] \
   || die "--ephemeral-range: need 1024 <= LO < HI < $PROXY_PORT_FLOOR (the range must stay below every proxy listener)"
+# --conntrack: exactly the per-GB capacity check (or added to an explicit --only).
+if [ "$CT_FLAG" = 1 ]; then
+  if [ "$ONLY_GIVEN" = 1 ]; then ONLY="$ONLY,conntrack,maxmap"; else ONLY="conntrack,maxmap"; fi
+fi
 for s in $(printf '%s' "$ONLY" | tr ',' ' '); do
-  case "$s" in sysctl|unbound|nft|ipv6restore|conntrack|units|fingerprint|pipes|security) ;; *) die "--only: unknown step '$s'" ;; esac
+  case "$s" in sysctl|unbound|nft|ipv6restore|conntrack|units|fingerprint|pipes|security|maxmap) ;; *) die "--only: unknown step '$s'" ;; esac
 done
+if [ -n "$MAXMAP_OVERRIDE" ]; then
+  case "$MAXMAP_OVERRIDE" in *[!0-9]*) die "--max-map-count must be an integer" ;; esac
+  [ "$MAXMAP_OVERRIDE" -ge 65530 ] && [ "$MAXMAP_OVERRIDE" -le 2147483647 ] || die "--max-map-count: need 65530 <= N <= 2147483647"
+fi
 if [ -n "$CT_MAX_OVERRIDE" ]; then
   case "$CT_MAX_OVERRIDE" in *[!0-9]*) die "--conntrack-max must be an integer" ;; esac
   [ "$CT_MAX_OVERRIDE" -ge 65536 ] && [ "$CT_MAX_OVERRIDE" -le 4194304 ] || die "--conntrack-max: need 65536 <= N <= 4194304"
@@ -620,13 +654,34 @@ write_text_file() {
   printf '%s\n' "$text" > "$file.new.$$" && mv -f "$file.new.$$" "$file"
 }
 
+# Pay-per-GB v2: the conntrack entries the per-GB runtime needs, as a power of
+# two (empty when per-GB is not enabled here): 3 entries per session for
+# maxConns sessions + 120 s of TIME_WAIT at NETRUN_PERGB_CONN_RATE new/s.
+pergb_conntrack_floor() {
+  local conns rate need v=65536
+  [ -f "$PERGB_ENABLE" ] || return 0
+  conns="$(sed -n 's/.*"maxConns"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$PERGB_ENABLE" | head -n 1)"
+  grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true' "$PERGB_ENABLE" || return 0
+  [ -n "$conns" ] || return 0
+  rate="${NETRUN_PERGB_CONN_RATE:-300}"
+  case "$rate" in ''|*[!0-9]*) rate=300 ;; esac
+  need=$((3 * conns + 3 * 120 * rate))
+  while [ "$v" -lt "$need" ] && [ "$v" -lt 4194304 ]; do v=$((v * 2)); done
+  echo "$v $conns"
+}
+
 step_conntrack() {
-  local mem_kb target persisted runtime count need=() overrides
+  local mem_kb target persisted runtime count need=() overrides floor="" floor_conns="" floor_note=""
   mem_kb="$(awk '/^MemTotal:/ { print $2 }' "$MEMINFO" 2>/dev/null)"
   if [ -n "$CT_MAX_OVERRIDE" ]; then
     target="$CT_MAX_OVERRIDE"
   elif [ -n "$mem_kb" ]; then
     target="$(conntrack_max_for_mem_kb "$mem_kb")"
+    read -r floor floor_conns <<< "$(pergb_conntrack_floor)"
+    if [ -n "$floor" ]; then
+      floor_note=", per-GB floor $floor for maxConns $floor_conns"
+      [ "$floor" -gt "$target" ] && target="$floor"
+    fi
   else
     refused conntrack "cannot read MemTotal from $MEMINFO — pass --conntrack-max N"
     return 0
@@ -634,6 +689,9 @@ step_conntrack() {
   persisted="$(sysctl_file_key net.netfilter.nf_conntrack_max)"
   runtime="$(cat "$PROC_CT_MAX" 2>/dev/null || true)"
   count="$(cat "$PROC_CT_COUNT" 2>/dev/null || true)"
+  if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$runtime" =~ ^[0-9]+$ ]] && [ "$runtime" -gt 0 ] && [ $((count * 100 / runtime)) -ge 75 ]; then
+    log "  WARNING: the conntrack table is $((count * 100 / runtime)) % full ($count of $runtime entries) — new flows are dropped at 100 %"
+  fi
 
   [ "$(cat "$CT_MODULES_FILE" 2>/dev/null)" = "$CT_MODULES_TEXT" ] || need+=("modules-load")
   [ "$(cat "$CT_UDEV_RULE" 2>/dev/null)" = "$CT_UDEV_TEXT" ] || need+=("udev-rule")
@@ -649,7 +707,7 @@ step_conntrack() {
       "$ROOT"/etc/sysctl.d/*.conf "$ROOT"/etc/sysctl.conf 2>/dev/null | grep -vF "$SYSCTL_FILE" | tr '\n' ' ')"
 
   if [ "$MODE" = "dry-run" ]; then
-    step_status conntrack would-apply "nf_conntrack_max -> $target (MemTotal ${mem_kb:-?} kB${CT_MAX_OVERRIDE:+, --conntrack-max}); persisted '${persisted:-none}', runtime '${runtime:-module not loaded}'${count:+, in use $count}; do: ${need[*]}"
+    step_status conntrack would-apply "nf_conntrack_max -> $target (MemTotal ${mem_kb:-?} kB${CT_MAX_OVERRIDE:+, --conntrack-max}$floor_note); persisted '${persisted:-none}', runtime '${runtime:-module not loaded}'${count:+, in use $count}; do: ${need[*]}"
     [ -z "$overrides" ] || log "  NOTE: also set in: $overrides (a later file wins at boot — review it)"
     return 0
   fi
@@ -842,6 +900,30 @@ step_pipes() {
   step_status pipes applied "fs.pipe-user-pages-soft = $target (persisted${runtime:+, runtime was $runtime})"
 }
 
+# ── step: vm.max_map_count for the per-GB 3proxy (opt-in) ─────────
+
+step_maxmap() {
+  local target persisted runtime need=()
+  target="${MAXMAP_OVERRIDE:-$MAXMAP_DEFAULT}"
+  persisted="$(sysctl_file_key vm.max_map_count)"
+  runtime="$(cat "$PROC_MAXMAP" 2>/dev/null || true)"
+  if [ -z "$persisted" ] || { [[ "$persisted" =~ ^[0-9]+$ ]] && [ "$persisted" -lt "$target" ]; }; then need+=("persist"); fi
+  if [[ "$runtime" =~ ^[0-9]+$ ]] && [ "$runtime" -lt "$target" ]; then need+=("runtime-raise"); fi
+  if [ "${#need[@]}" -eq 0 ]; then
+    step_status maxmap ok "vm.max_map_count ${persisted} persisted (runtime ${runtime:-?})"
+    return 0
+  fi
+  if [ "$MODE" = "dry-run" ]; then
+    step_status maxmap would-apply "vm.max_map_count -> $target${MAXMAP_OVERRIDE:+ (--max-map-count)}; persisted '${persisted:-none}', runtime '${runtime:-?}'; do: ${need[*]}"
+    return 0
+  fi
+  case " ${need[*]} " in *" persist "*) persist_sysctl_kv "$SYSCTL_FILE" "vm.max_map_count" "$target" ;; esac
+  case " ${need[*]} " in *" runtime-raise "*)
+    sysctl -w "vm.max_map_count=$target" >/dev/null || { failed maxmap "sysctl -w vm.max_map_count=$target failed (persisted)"; return 0; } ;;
+  esac
+  step_status maxmap applied "vm.max_map_count = $target (${need[*]}${runtime:+; runtime was $runtime})"
+}
+
 # ── step: audit 2026-10-08 security fixes (opt-in) ────────────────
 
 step_security() {
@@ -880,6 +962,7 @@ want units && step_units
 want fingerprint && step_fingerprint
 want pipes && step_pipes
 want security && step_security
+want maxmap && step_maxmap
 
 if [ "$RC_FAILED" = 1 ]; then log "result: a step FAILED (see above)"; exit 1; fi
 if [ "$RC_REFUSED" = 1 ]; then log "result: a step was REFUSED by a safety check (nothing changed for it)"; exit 2; fi

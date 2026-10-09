@@ -1,0 +1,36 @@
+# NETRUN pay-per-GB v2 — the per-GB haproxy: its own instance (own cfg,
+# pid file, master socket and stats socket), never the per-piece haproxy.
+# Binds the shared ports on the egress IPv4; a TLS ClientHello goes through
+# its own TLS terminator (crt-list /etc/netrun/tls/crt-list) to
+# 3proxy-pergb's HTTP proxy on 127.0.0.3:<port>, SOCKS5 to 127.0.0.4:<port>.
+# cfg: /opt/netrun/pergb/haproxy/haproxy.cfg (written by the agent).
+# Certificate renewals reach it through netrun-pergb-certs.path. The reload
+# stamps the sha256 of the cfg it loads (/run/netrun-pergb/applied/haproxy.sha256).
+[Unit]
+Description=NETRUN per-GB haproxy (TLS + SOCKS5 front of the shared ports)
+Documentation=file:///opt/netrun/README.md
+After=network-online.target
+Wants=network-online.target
+PartOf=netrun-pergb.target
+RequiresMountsFor=/var/log/netrun-pergb
+StartLimitIntervalSec=0
+ConditionPathExists=/opt/netrun/pergb/haproxy/haproxy.cfg
+
+[Service]
+Type=notify
+Slice=netrun-pergb.slice
+RuntimeDirectory=netrun-pergb
+RuntimeDirectoryPreserve=yes
+Environment="CONFIG=/opt/netrun/pergb/haproxy/haproxy.cfg" "PIDFILE=/run/netrun-pergb/haproxy.pid" "MASTER=/run/netrun-pergb/haproxy-master.sock"
+ExecStartPre=/usr/sbin/haproxy -f ${CONFIG} -c -q
+ExecStartPre=/bin/sh -c 'mkdir -p /run/netrun-pergb/applied && sha256sum < /opt/netrun/pergb/haproxy/haproxy.cfg > /run/netrun-pergb/applied/haproxy.sha256'
+ExecStart=/usr/sbin/haproxy -Ws -f ${CONFIG} -p ${PIDFILE} -S ${MASTER}
+ExecStartPost=-/bin/bash /opt/netrun/deploy/node/netrun-pergb-certs-reload.sh --stamp
+ExecReload=/usr/sbin/haproxy -f ${CONFIG} -c -q
+ExecReload=/bin/sh -c 'sha256sum < /opt/netrun/pergb/haproxy/haproxy.cfg > /run/netrun-pergb/applied/haproxy.sha256'
+ExecReload=/bin/kill -USR2 $MAINPID
+KillMode=mixed
+Restart=always
+RestartSec=1
+SuccessExitStatus=143
+LimitNOFILE=1048576
