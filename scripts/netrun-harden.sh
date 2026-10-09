@@ -445,7 +445,7 @@ cmd_secure() {
   ( cmd_perms ) || rc=1
   ( cmd_ssh ) || rc=1
   ( cmd_dns_egress ) || rc=1
-  nft_persist || log "WARNING: the ruleset was not persisted (the previous /etc/nftables.conf is kept)"
+  nft_persist || { log "WARNING: the ruleset was not persisted (the previous /etc/nftables.conf is kept)"; rc=1; }
   return "$rc"
 }
 

@@ -46,7 +46,13 @@ cat > "$STUB/curl" <<'EOF'
 #!/usr/bin/env bash
 echo "curl $*" >> "$STUB_LOG"
 out=""
-while [ $# -gt 0 ]; do case "$1" in --output) out="$2"; shift ;; esac; shift; done
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift ;;
+    -H) case "$2" in @*) echo "header-file $(stat -c %a "${2#@}" 2>/dev/null || stat -f %Lp "${2#@}") $(cat "${2#@}")" >> "$STUB_LOG" ;; esac; shift ;;
+  esac
+  shift
+done
 [ -n "$out" ] && cat "$CURL_BODY_FILE" > "$out" 2>/dev/null
 cat "$CURL_CODE_FILE"
 EOF
@@ -85,10 +91,11 @@ count() { grep -c "$1" "$STUB_LOG" || true; }
 # ── 1. healthy; the key is sent ───────────────────────────────────
 reset; cfg 18100 "$LIVE"; listeners 1; health 200 '{"ok":true}'
 tick
-grep -q 'X-API-KEY: abc123' "$STUB_LOG" || fail "the agent key goes in the probe"
+grep -q '^header-file 600 X-API-KEY: abc123' "$STUB_LOG" || fail "the agent key goes in the probe, from a 0600 header file"
+grep '^curl ' "$STUB_LOG" | grep -q 'abc123' && fail "the agent key must not be on curl's command line"
 [ "$(cat "$TMP/state/watchdog_failures")" = 0 ] || fail "healthy: counter 0"
 [ "$(count systemctl)" = 0 ] || fail "healthy: no restart"
-ok "healthy /health: nothing done; the key from the unit drop-in is sent"
+ok "healthy /health: nothing done; the key from the unit drop-in is sent (header file, not argv)"
 
 # ── 2. restart tier ───────────────────────────────────────────────
 reset; health 000

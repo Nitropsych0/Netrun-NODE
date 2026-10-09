@@ -122,9 +122,16 @@ data_plane_down() {
 
 key="$(sed -n 's/^Environment=NODE_AGENT_API_KEY=//p' "$AGENT_KEY_FILE" 2>/dev/null | tail -n1)"
 body="$(mktemp 2>/dev/null || echo "$STATE_DIR/watchdog_body.$$")"
-trap 'rm -f "$body"' EXIT
+# The key goes to curl in a 0600 header file, never on its command line:
+# /proc/<pid>/cmdline is readable by every local uid (3proxy's 65535 too).
+hdr=""
+if [ -n "$key" ]; then
+  hdr="$(umask 077; mktemp 2>/dev/null || echo "$STATE_DIR/watchdog_hdr.$$")"
+  (umask 077; printf 'X-API-KEY: %s\n' "$key" > "$hdr")
+fi
+trap 'rm -f "$body" ${hdr:+"$hdr"}' EXIT
 code="$(curl --silent --output "$body" --write-out '%{http_code}' --max-time "$PROBE_TIMEOUT" \
-  ${key:+-H "X-API-KEY: $key"} "$HEALTH_URL" 2>/dev/null || true)"
+  ${hdr:+-H "@$hdr"} "$HEALTH_URL" 2>/dev/null || true)"
 current="$(num "$STATE_FAIL")"
 
 if [ "$code" = "200" ]; then
