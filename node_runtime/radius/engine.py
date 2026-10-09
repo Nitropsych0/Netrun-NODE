@@ -827,7 +827,7 @@ class Engine:
         """A13-I: one per-piece proxy. Its fixed address in its own /64; no quota, no
         near/deadman check (the traffic is still logged under the login); none of the
         per-GB modes, the pause or smart rotation; only -country-<cc> is allowed."""
-        if login.session is not None or login.ttl is not None or login.static or login.rotate:
+        if not uname.piece_params_ok(login):
             return self._reject("bad_params", lst, now)
         if not self.adm_open or acct.id in self.adm_soft:
             return self._reject("capacity", lst, now)  # node protection applies to every login

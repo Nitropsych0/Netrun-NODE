@@ -195,6 +195,20 @@ class ModeTable(unittest.TestCase):
     def test_country_does_not_change_the_mode(self):
         self.assertEqual(self.r("netrun-7k2f9ab-country-us", BASE + 2, "static"), ("static", None, "p2"))
 
+    def test_piece_params(self):
+        # A13-I: a per-piece login takes -country-<cc> only
+        self.assertTrue(U.piece_params_ok(p("netrun-7k2f9ab")))
+        self.assertTrue(U.piece_params_ok(p("netrun-7k2f9ab-country-us")))
+        for user in (
+            "netrun-7k2f9ab-session-x1",
+            "netrun-7k2f9ab-session-s01000",
+            "netrun-7k2f9ab-ttl-10m",
+            "netrun-7k2f9ab-static",
+            "netrun-7k2f9ab-rotate",
+            "netrun-7k2f9ab-country-us-session-a",
+        ):
+            self.assertFalse(U.piece_params_ok(p(user)), user)
+
     def test_format_ttl(self):
         self.assertEqual(U.format_ttl(3600), "1h")
         self.assertEqual(U.format_ttl(86400), "24h")

@@ -24,6 +24,10 @@ Mode resolution (A10: every port is a line slot that follows the list's
      timer -> timer windows of ttl (the param) or the list ttl; link -> link
      (ttl given: sticky); static -> static (ttl given: sticky).
 The legacy list modes map: rotate -> per_request, sticky -> timer.
+
+A per-piece login (A13-I, a list of kind "piece") takes only -country-<cc>:
+-session, -ttl, -static and -rotate are bad_params for it (piece_params_ok);
+its address is fixed, whatever the port.
 """
 
 from __future__ import annotations
@@ -161,6 +165,11 @@ def list_mode(mode: str) -> str:
     if m not in LIST_MODES:
         raise ValueError("unknown list mode %r" % mode)
     return m
+
+
+def piece_params_ok(login: Login) -> bool:
+    """A13-I: a per-piece login may carry -country-<cc> only."""
+    return login.session is None and login.ttl is None and not login.static and not login.rotate
 
 
 def is_line_session(session: str | None) -> bool:
