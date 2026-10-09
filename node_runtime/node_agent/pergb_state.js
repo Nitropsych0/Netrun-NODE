@@ -1069,6 +1069,22 @@ function createPergb(deps = {}) {
     return { status: 200, body: { success: true, released: reply.released, coolDownUntil: reply.coolDownUntil === undefined ? null : reply.coolDownUntil } };
   }
 
+  // The transport of pergb_pool.js (egress.js, deprovision, kill-on-rebind,
+  // fresh addresses): reserve / release go through reserveNets / releaseNets
+  // so this agent's excluded set (kills, attribution, smart rotation) learns
+  // every per-piece /64 at once; other ops use the shared ctl client.
+  async function poolTransport(op, body) {
+    if (op === "reserve_nets" || op === "release_nets") {
+      const out = op === "reserve_nets" ? await reserveNets(body) : await releaseNets(body);
+      if (out.status !== 200) {
+        const code = (out.body && out.body.error) || "radius_unavailable";
+        throw Object.assign(new Error(`${op}: ${code}`), { code, reply: out.body });
+      }
+      return out.body;
+    }
+    return ctl.call(op, body);
+  }
+
   // ── readers ─────────────────────────────────────────────────────────────
 
   async function radiusStatusNow() {
@@ -1396,6 +1412,7 @@ function createPergb(deps = {}) {
     portCheck,
     reserveNets,
     releaseNets,
+    poolTransport,
     healthBlock,
     generateConflict,
     onGenerateDone,

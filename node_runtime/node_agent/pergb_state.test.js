@@ -399,6 +399,15 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     assert.strictEqual(rel.json.released, 3);
     const badNet = await call("POST", "/pergb/release_nets", { body: { nets: ["2001:db8:bb:1::/64"], ref: "rel:2" } });
     assert.strictEqual(badNet.status, 400);
+    // pergb_pool.js (egress.js, deprovision) through the agent: the excluded set learns the /64s
+    const pool = require("./pergb_pool.js").createPoolAccess({ env: { NETRUN_PERGB_POOL_FILE: pergb.settings.poolFile }, request: pergb.poolTransport });
+    const got = await pool.reserve({ count: 2, ref: "egress:20000:x1" });
+    assert.strictEqual(got.nets.length, 2);
+    const ids = got.nets.map((k) => Number(k & 0xffffn));
+    for (const id of ids) assert.ok(pergb._excluded().has(id));
+    const back = await pool.release({ nets: got.nets, ref: "egress-rel:x1" });
+    assert.strictEqual(back.released, 2);
+    await assert.rejects(pool.reserve({ count: 5001, ref: "too-many" }), (e) => e.code === "bad_request");
   });
 
   await t.test("a RADIUS restart with a lost DB: the next watch pushes facts and excluded again", async () => {

@@ -158,6 +158,10 @@ function ensureAuthorized(req) {
 
 const pergb = pergbStateLib.createPergb();
 const pergbServer = pergbTlsLib.createTlsServer({ pergb, apiKeyMatches: (given) => apiKeyMatches(given) });
+// Per-piece allocators (egress.js, deprovision, rebind) reserve and release
+// pool /64s through the agent's per-GB service: one ctl client, and the
+// excluded set the kills and attribution skip learns each /64 at once.
+pergbPool.setTransport(pergb.poolTransport);
 
 function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
