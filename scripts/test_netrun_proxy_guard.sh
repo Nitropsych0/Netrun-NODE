@@ -217,9 +217,13 @@ ok "default uids: + 65533 only when netrun-pergb owns it; NETRUN_PROXY_UIDS over
 printf '{"version":1,"egressIpv4":"45.76.10.20","dedicatedIpv4":"45.76.10.20"}\n' > "$TMP/enable.json"
 out="$(NODE_KIND=chi NETRUN_PERGB_ENABLE_FILE="$TMP/enable.json" NETRUN_PROXY_UIDS="65535 65533" run print)" || fail "print (option B)"
 [ "$(printf '%s\n' "$out" | grep -c '    ip daddr {.*, 45.76.10.20, 139.84.246.71 } reject')" = 2 ] || fail "dedicated IPv4 in both v4 sets: $out"
+# A7: every per-GB IPv4 of params.ipv4s (entry + egress) is the node's own too
+printf '{"version":1,"egressIpv4":"45.76.10.20","dedicatedIpv4":"45.76.10.20","params":{"ipv4s":["45.76.10.20","45.76.10.21"]}}\n' > "$TMP/enable.json"
+out="$(NODE_KIND=chi NETRUN_PERGB_ENABLE_FILE="$TMP/enable.json" NETRUN_PROXY_UIDS="65535 65533" run print)" || fail "print (A7)"
+[ "$(printf '%s\n' "$out" | grep -c '    ip daddr {.*, 45.76.10.20/31, .* } reject')" = 2 ] || fail "every per-GB IPv4 (.20 + .21 = /31) in both v4 sets: $out"
 printf 'garbage' > "$TMP/enable.json"
 NODE_KIND=chi NETRUN_PERGB_ENABLE_FILE="$TMP/enable.json" run print >/dev/null || fail "a broken enable.json is ignored"
-ok "option B: enable.json dedicatedIpv4 joins the own-IPv4 set (a broken file is ignored)"
+ok "option B / A7: enable.json dedicatedIpv4 and params.ipv4s join the own-IPv4 set (a broken file is ignored)"
 
 # guard_safe with several uids: positive matches of the gated uids only
 good="$(NODE_KIND=chi NETRUN_PROXY_UIDS="65535 65533" run print)"

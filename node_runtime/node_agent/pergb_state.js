@@ -791,6 +791,13 @@ function createPergb(deps = {}) {
     if (v.ipv4s.length) {
       ipv4Result = await ipv4Lib.ensureAddresses(v.ipv4s, { run, log, settings: deps.ipv4Settings });
       if (!ipv4Result.ok) return conflict(ipv4Result.error || "ipv4_config_failed", { detail: ipv4Result.detail });
+      // The new addresses are the node's own: the proxy guard must reject them
+      // for both proxy uids at once (it reads the NIC when applied), or a proxy
+      // customer could reach services bound to 0.0.0.0 through them.
+      if (ipv4Result.added.length) {
+        const g = await reapplyGuard();
+        if (!g.ok) return { status: 500, body: { success: false, error: g.error, detail: g.detail, ipv4: ipv4Result } };
+      }
     }
     const raw = { ...body, subnets: v.pool.text, prefix, canary: v.canary, probe: { ...body.probe, canary: v.canary } };
     const applied = await rt.apply({ ...raw, egressIpv4: egress, dedicatedIpv4: dedicated }, deps.runtimeDeps || {});
@@ -844,6 +851,15 @@ function createPergb(deps = {}) {
     event("pergb_enabled", { base: enableDoc.base, changed: applied.changed.length, restarted: applied.restarted });
     const st = await status();
     return { status: 200, body: { ...st, applied: { changed: applied.changed, restarted: applied.restarted, started: applied.started, reloaded: applied.reloaded, secretCreated: applied.secretCreated }, excludedPush: ex, ipv4: ipv4Result } };
+  }
+
+  async function reapplyGuard() {
+    const bin = rtSettings.guardBin;
+    if (!bin || !fs.existsSync(bin)) return { ok: false, error: "proxy_guard_missing", detail: `${bin || "netrun-proxy-guard"} is not installed` };
+    const r = await run("bash", [bin, "apply"], { timeoutMs: 120000 });
+    if (r.code !== 0) return { ok: false, error: "proxy_guard_apply_failed", detail: String(r.stderr || r.stdout || "").trim().slice(-300) };
+    event("pergb_guard_reapplied", { reason: "ipv4s" });
+    return { ok: true };
   }
 
   function normalizePoolOn(prefix, poolNorm) {

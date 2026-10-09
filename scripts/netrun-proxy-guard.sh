@@ -60,8 +60,9 @@
 # `proxy`, plus `ip daddr 127.0.0.1 udp dport 1812 accept` (its RADIUS) before
 # the 127/8 reject. Per-piece (65535) still reaches neither 1812 nor the
 # per-GB listeners on 127.0.0.3/4; per-GB reaches only DNS and RADIUS on
-# loopback. With a dedicated per-GB IPv4 (option B, /etc/netrun-pergb/enable.json
-# dedicatedIpv4) that address is in the own-IPv4 set too.
+# loopback. The per-GB IPv4s (/etc/netrun-pergb/enable.json dedicatedIpv4 and,
+# amendment A7, params.ipv4s) are in the own-IPv4 set too, even before they show
+# on the NIC; the agent re-applies the guard after it adds them.
 #
 # Settings (environment): NETRUN_PROXY_GUARD_FILE (/etc/netrun/nft-proxy-guard.nft),
 # NETRUN_PROXY_UIDS (the gated uids, space or comma separated; default: the
@@ -160,9 +161,12 @@ try:
 except (OSError, ValueError):
     enable = None
 if isinstance(enable, dict):
-    for key in ("dedicatedIpv4", "egressIpv4"):
+    params = enable.get("params") if isinstance(enable.get("params"), dict) else {}
+    many = params.get("ipv4s") if isinstance(params.get("ipv4s"), list) else []
+    # amendment A7: every per-GB IPv4 (entry + egress) is the node's own
+    for v in [enable.get("dedicatedIpv4"), enable.get("egressIpv4")] + many:
         try:
-            a = ipaddress.IPv4Address(str(enable.get(key) or ""))
+            a = ipaddress.IPv4Address(str(v or ""))
         except ValueError:
             continue
         if a.is_global:

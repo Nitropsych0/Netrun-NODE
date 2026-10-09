@@ -108,11 +108,21 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
   // per-piece on this node: two /64s of the /48 (and one outside it)
   fs.writeFileSync(path.join(proxyRoot, "3proxy", "3proxy_20000.cfg"), "socks -6 -a -p20000 -i203.0.113.10 -e2001:db8:aa:1::5\nsocks -6 -a -p20001 -i203.0.113.10 -e2001:db8:bb::1\n");
   fs.writeFileSync(path.join(proxyRoot, "ipv6_20000.list"), "2001:db8:aa:2::9\n");
-  const rtSettings = { ...rtLib.readSettings({ NETRUN_PERGB_ETC_DIR: etc, NETRUN_PERGB_LOG_DIR: logDir, NETRUN_PERGB_CRT_LIST: crtList, NETRUN_PERGB_RUN_DIR: path.join(dir, "run") }) };
+  const guardBin = path.join(dir, "netrun-proxy-guard");
+  fs.writeFileSync(guardBin, "#!/bin/bash\nexit 0\n");
+  const rtSettings = { ...rtLib.readSettings({ NETRUN_PERGB_ETC_DIR: etc, NETRUN_PERGB_LOG_DIR: logDir, NETRUN_PERGB_CRT_LIST: crtList, NETRUN_PERGB_RUN_DIR: path.join(dir, "run"), NETRUN_PROXY_GUARD_BIN: guardBin }) };
   const runtime = T.fakeRuntime(rtSettings);
   const world = { sockets: [], cgroupSupport: true, listeners: [] };
   const run = T.fakeRun(world, {
-    ip: async (args) => (args[0] === "-6" ? { code: 0, stdout: "local 2001:db8:aa::/48 dev lo proto kernel metric 0 pref medium\nlocal ::1 dev lo proto kernel metric 0 pref medium\n", stderr: "" } : { code: 0, stdout: `1.1.1.1 via 203.0.113.1 dev eth0 src ${EGRESS} uid 0\n`, stderr: "" }),
+    ip: async (args) => {
+      if (args[0] === "-6") return { code: 0, stdout: "local 2001:db8:aa::/48 dev lo proto kernel metric 0 pref medium\nlocal ::1 dev lo proto kernel metric 0 pref medium\n", stderr: "" };
+      if (args[0] === "addr" && args[1] === "add") {
+        world.v4 = [...(world.v4 || []), args[2].split("/")[0]];
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (args.join(" ").startsWith("-4 -o addr show")) return { code: 0, stdout: [EGRESS, ...(world.v4 || [])].map((a, i) => `2: eth0    inet ${a}/${i ? 32 : 23} scope global eth0\n`).join(""), stderr: "" };
+      return { code: 0, stdout: `1.1.1.1 via 203.0.113.1 dev eth0 src ${EGRESS} uid 0\n`, stderr: "" };
+    },
     ss: async (args) => {
       if (args[0] !== "-Hltnp") return null;
       const lo = Number(args[3].slice(1));
@@ -135,6 +145,7 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     settings: { poolFile: path.join(dir, "pergb-pool.conf"), stateDir: path.join(dir, "state"), proxyRoot, loops: false, haproxyLog: path.join(logDir, "haproxy.log") },
     readCgroupOf: (pid) => cgroups[pid] || "",
     radiusWaitMs: 5000,
+    ipv4Settings: { netplanDir: path.join(dir, "netplan"), statePath: path.join(etc, "ipv4s.json") },
     statfs: () => ({ blocks: 1000, bavail: 500, bsize: 4096 }),
     readFile: (p) => {
       if (p.endsWith("ip_local_port_range")) return "1024 8000\n";
@@ -420,6 +431,27 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     assert.strictEqual(ok.status, 200);
     assert.strictEqual(ok.cert.subject.CN, "two");
     await assert.rejects(request(port, "GET", "/pergb/status", { ca: c1.pem }), "the old certificate is gone");
+  });
+
+  await t.test("A7: per-GB IPv4s are configured, the proxy guard is re-applied after them, RADIUS gets them all", async () => {
+    world.listeners = [];
+    const before = run.calls.length;
+    const ipv4s = ["198.51.100.20", "198.51.100.21"];
+    const r = await request(port, "POST", "/pergb/enable", { body: { ...ENABLE, ipv4s }, ca: fs.readFileSync(c1.crt, "utf-8") });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.deepStrictEqual(r.json.ipv4.added, ipv4s);
+    const calls = run.calls.slice(before).map((c) => c.join(" "));
+    const lastAdd = calls.map((c, i) => (c.startsWith("ip addr add") ? i : -1)).filter((i) => i >= 0).pop();
+    const guard = calls.indexOf(`bash ${guardBin} apply`);
+    assert.ok(lastAdd >= 0 && guard > lastAdd, calls.join("\n"));
+    const st = await pergb.ctl.call("status", {});
+    assert.deepStrictEqual(st.facts.egressIpv4s, ipv4s);
+    assert.strictEqual(st.facts.egressIpv4, ipv4s[0]);
+    // the same addresses again: nothing added, the guard is not touched
+    const again = run.calls.length;
+    const r2 = await request(port, "POST", "/pergb/enable", { body: { ...ENABLE, ipv4s }, ca: fs.readFileSync(c1.crt, "utf-8") });
+    assert.strictEqual(r2.status, 200, JSON.stringify(r2.json));
+    assert.ok(!run.calls.slice(again).some((c) => c[0] === "bash"), "no guard re-apply without new addresses");
   });
 
   await t.test("disable: the pool file first, then the runtime; reserve answers pergb_off", async () => {
