@@ -86,12 +86,16 @@ if [ "${1:-}" = "--real" ]; then
   systemctl daemon-reload
   ok "real: systemd-analyze verify passes for every per-GB unit"
   if command -v docker >/dev/null 2>&1; then
-    out="$(docker run --rm -v "$ROOT_DIR:/src:ro" ubuntu:24.04 bash -c \
+    # Docker Hub limits anonymous pulls per IP (CI runners share IPs): fall back
+    # to Google's Docker Hub mirror
+    ubu=ubuntu:24.04
+    docker pull -q "$ubu" >/dev/null 2>&1 || { ubu=mirror.gcr.io/library/ubuntu:24.04; docker pull -q "$ubu" >/dev/null || fail "cannot pull ubuntu:24.04"; }
+    out="$(docker run --rm -v "$ROOT_DIR:/src:ro" "$ubu" bash -c \
       'useradd -u 65533 -M intruder && bash /src/deploy/node/install_pergb.sh; echo "rc=$?"; ls -d /etc/netrun-pergb /opt/netrun/pergb 2>&1; getent passwd netrun-pergb || echo no-user' 2>&1)"
     echo "$out" | grep -q 'uid_taken: uid 65533 belongs to intruder' || fail "container uid clash: $out"
     echo "$out" | grep -q 'rc=1' || fail "container uid clash exit: $out"
     echo "$out" | grep -q 'no-user' && echo "$out" | grep -q "cannot access '/etc/netrun-pergb'" || fail "container uid clash changed something: $out"
-    out="$(docker run --rm -e NETRUN_PERGB_LOG_SIZE=100T -v "$ROOT_DIR:/src:ro" ubuntu:24.04 bash -c \
+    out="$(docker run --rm -e NETRUN_PERGB_LOG_SIZE=100T -v "$ROOT_DIR:/src:ro" "$ubu" bash -c \
       'bash /src/deploy/node/install_pergb.sh; echo "rc=$?"; getent passwd netrun-pergb || echo no-user' 2>&1)"
     echo "$out" | grep -q 'low_disk' || fail "container low disk: $out"
     echo "$out" | grep -q 'no-user' || fail "container low disk changed something: $out"

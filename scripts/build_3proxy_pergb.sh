@@ -98,10 +98,19 @@ cp bin/3proxy /out/3proxy-pergb
 chown "${HOST_UID}:${HOST_GID}" /out/3proxy-pergb /out/toolchain.txt
 EOF
 
+# Docker Hub limits anonymous pulls per IP, and CI runners share IPs
+# («toomanyrequests», 2026-10-10): then the same digest comes from Google's
+# Docker Hub mirror — a digest names the content, so it is the same image.
+RUN_IMAGE="$IMAGE"
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1 && ! docker pull -q --platform linux/amd64 "$IMAGE" >/dev/null; then
+  RUN_IMAGE="mirror.gcr.io/library/${IMAGE%%:*}@${IMAGE#*@}"
+  log "Docker Hub refused $IMAGE — pulling the same digest as $RUN_IMAGE"
+  docker pull -q --platform linux/amd64 "$RUN_IMAGE" >/dev/null || die "cannot pull $IMAGE (Docker Hub nor mirror.gcr.io)"
+fi
 log "building in $IMAGE (snapshot $SNAPSHOT)"
 docker run --rm --platform linux/amd64 \
   -e SNAPSHOT="$SNAPSHOT" -e IMAGE="$IMAGE" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-  -v "$WORK/in:/in:ro" -v "$WORK/out:/out" "$IMAGE" bash /in/build.sh
+  -v "$WORK/in:/in:ro" -v "$WORK/out:/out" "$RUN_IMAGE" bash /in/build.sh
 [ -s "$WORK/out/3proxy-pergb" ] || die "the build produced no binary"
 new="$(sha256_of "$WORK/out/3proxy-pergb")"
 log "built: sha256 $new"
