@@ -27,7 +27,10 @@
 // /run/netrun-pergb/applied/<sp>.sha256), one unit at a time, the next only
 // once the previous is active and listening again (rolling restart, e.g. on a
 // family change). The haproxy is reloaded (graceful, -Ws) when its file
-// changed. Refusals: bad_params, pergb_not_installed, uid_taken,
+// changed. refreshHaproxy() (agent start, pergb_state.start) re-renders the
+// haproxy alone from enable.json, so a new haproxy template reaches an
+// already-enabled node with the agent restart of a deploy (checked with
+// `haproxy -c` before it replaces the file). Refusals: bad_params, pergb_not_installed, uid_taken,
 // binary_hash_mismatch (the installed binary or its .sha256 differs from the
 // pinned deploy/node/bin/3proxy-pergb.sha256 of this checkout), and
 // proxy_guard_missing (the loaded netrun-proxy-guard has no `meta skuid 65533
@@ -56,7 +59,8 @@
 //   NETRUN_PERGB_SYSTEMD_DIR, NETRUN_PERGB_CRT_LIST, NETRUN_PERGB_PASSWD,
 //   NETRUN_PERGB_GROUP, NETRUN_PERGB_UID (65533), NETRUN_PROXY_GUARD_BIN,
 //   NETRUN_PERGB_REQUIRE_GUARD (1; 0 = skip the guard check),
-//   NETRUN_PERGB_CHOWN (1; 0 = never chown, tests).
+//   NETRUN_PERGB_CHOWN (1; 0 = never chown, tests),
+//   NETRUN_PERGB_HAPROXY_BIN (/usr/sbin/haproxy, the unit's; refreshHaproxy's check).
 
 const fs = require("fs");
 const path = require("path");
@@ -97,6 +101,14 @@ const FAMILIES = new Set(["dualstack", "ipv6_only"]);
 // CONNECT and the HTTP-proxy operations (plain HTTP methods + CONNECT); never
 // BIND / UDPASSOC / ICMPASSOC, FTP, ADMIN or DNSRESOLVE.
 const ACL_OPERATIONS = ["CONNECT", "HTTP_GET", "HTTP_PUT", "HTTP_POST", "HTTP_HEAD", "HTTP_OTHER", "HTTP_CONNECT"];
+// Plain HTTP-proxy requests on the shared ports (accepted, never advertised:
+// clients differ in what they call an "HTTP" / "HTTPS" proxy). The per-GB
+// haproxy recognises one by its first bytes, "<METHOD> " of these RFC 9110 /
+// 5789 methods (CONNECT host:port and absolute-URI requests alike), and sends
+// it to the same 3proxy-pergb HTTP proxy as the TLS path; 3proxy stays the
+// only HTTP parser (as behind the TLS terminator), the ACL above covers them
+// all (HTTP_CONNECT / _GET / _PUT / _POST / _HEAD, the rest HTTP_OTHER).
+const PLAIN_HTTP_METHODS = ["GET", "PUT", "HEAD", "POST", "PATCH", "TRACE", "DELETE", "OPTIONS", "CONNECT"];
 const LOGFORMAT = "- +_G%Y%m%d%H%M%S.%. %N %p %E %U %C %c %i %e %R %r %I %O %n";
 const TIMEOUTS = "1 3 30 60 180 1800 15 60";
 const READY_TIMEOUT_MS = 20000;
@@ -135,6 +147,7 @@ function readSettings(env = process.env) {
     guardBin: String(env.NETRUN_PROXY_GUARD_BIN || "/usr/local/sbin/netrun-proxy-guard"),
     requireGuard: envOn(env.NETRUN_PERGB_REQUIRE_GUARD, true),
     chown: envOn(env.NETRUN_PERGB_CHOWN, true),
+    haproxyBin: String(env.NETRUN_PERGB_HAPROXY_BIN || "/usr/sbin/haproxy"),
   };
 }
 
@@ -292,19 +305,44 @@ function renderCfg(params, range, secret, logDir = "/var/log/netrun-pergb") {
   return lines.join("\n") + "\n";
 }
 
+// The plain-HTTP ACL lines of the per-GB frontend: one `acl plain_http` per
+// request-line prefix length ("GET " .. "CONNECT "), same-name ACLs OR. A
+// fixed-length req.payload waits (inspect-delay) until that many bytes are
+// there, so a first packet split inside the method still matches, and
+// anything that is no method prefix fails at once (8 bytes are enough).
+function plainHttpAcl() {
+  const byLen = new Map();
+  for (const m of PLAIN_HTTP_METHODS) {
+    const hex = Buffer.from(`${m} `, "latin1").toString("hex");
+    if (!byLen.has(hex.length / 2)) byLen.set(hex.length / 2, []);
+    byLen.get(hex.length / 2).push(hex);
+  }
+  return [...byLen.keys()]
+    .sort((a, b) => a - b)
+    .map((n) => `    acl plain_http req.payload(0,${n}) -m bin ${byLen.get(n).join(" ")}`)
+    .join("\n");
+}
+
 // The per-GB haproxy (I4): the shared ports on the egress IPv4; a TLS
 // ClientHello loops through the own TLS terminator (abstract socket, PROXY v2
 // keeps the dialed port) to 3proxy-pergb's HTTP proxy on 127.0.0.3:<port>,
-// a SOCKS5 greeting (0x05) goes to 127.0.0.4:<port>, anything else is
-// rejected (no plain HTTP). Port-less servers reach the dialed port. The log
-// line joins the client to 3proxy's loopback tuple (%bi:%bp = 3proxy's %C:%c).
+// a SOCKS5 greeting (0x05) goes to 127.0.0.4:<port>, a plain HTTP-proxy
+// request (PLAIN_HTTP_METHODS; accepted, not advertised) goes straight to the
+// same 127.0.0.3:<port>, anything else is rejected. The TLS and SOCKS5 rules
+// come first and their first bytes (0x16 / 0x05) are no method letter, so the
+// HTTP rule never sees them. Port-less servers reach the dialed port: for the
+// TLS path the PROXY v2 destination, for SOCKS5 and plain HTTP the client's
+// own — 3proxy sees the same listener, client and NAS-Port either way. The
+// log line joins the client to 3proxy's loopback tuple (%bi:%bp = 3proxy's
+// %C:%c): the pergb_tls line for TLS, the pergb_in line for SOCKS5 and HTTP.
 function renderHaproxy(params, opts = {}) {
   const crtList = opts.crtList || "/etc/netrun/tls/crt-list";
   const runDir = opts.runDir || "/run/netrun-pergb";
   const maxconn = 2 * params.maxConns + 1000;
-  return `# NETRUN per-GB haproxy — written by node_agent/pergb_runtime.js (POST /pergb/enable); do not edit.
+  return `# NETRUN per-GB haproxy — written by node_agent/pergb_runtime.js (POST /pergb/enable, agent start); do not edit.
 # Shared ports ${params.base}-${params.last} on ${params.egressIpv4}: TLS -> 3proxy-pergb proxy ${HTTP_LISTEN}:<port>,
-# SOCKS5 -> 3proxy-pergb socks ${SOCKS_LISTEN}:<port>, anything else rejected.
+# SOCKS5 -> 3proxy-pergb socks ${SOCKS_LISTEN}:<port>, a plain HTTP-proxy request -> ${HTTP_LISTEN}:<port>
+# as well (same auth, log and meter; not advertised), anything else rejected.
 global
     log /dev/log local1 info
     log-tag netrun-pergb-haproxy
@@ -329,10 +367,13 @@ defaults
 frontend pergb_in
     bind ${params.egressIpv4}:${params.base}-${params.last}
     tcp-request inspect-delay 5s
+${plainHttpAcl()}
     tcp-request content accept if { req.ssl_hello_type 1 }
     tcp-request content accept if { req.len gt 0 } { req.payload(0,1) -m bin 05 }
+    tcp-request content accept if plain_http
     tcp-request content reject
     use_backend pergb_tls_loop if { req.ssl_hello_type 1 }
+    use_backend pergb_http if plain_http
     default_backend pergb_socks
 
 backend pergb_socks
@@ -951,6 +992,79 @@ async function apply(raw, deps = {}) {
   return result;
 }
 
+// Agent start on a node where per-GB is enabled (pergb_state.start): the
+// per-GB haproxy runs what THIS checkout renders, so a changed haproxy
+// template reaches an already-enabled node with the agent restart of a
+// deploy — no POST /pergb/enable needed. Re-rendered from enable.json (its
+// normalised params; enabled: true and an existing cfg only). A text that
+// differs from the file is checked first (`haproxy -c` on a candidate next to
+// it: a rejected one never replaces the live file, which the next start or
+// reload would refuse), then written (0640 root:haproxy) and a running
+// haproxy reloaded (graceful, -Ws: open sessions stay on the old workers;
+// ExecReload checks and stamps again). A file that already matches is
+// reloaded only when the unit's stamp says it loaded something else (the
+// rule of apply()). A stopped haproxy stays stopped (its next start loads
+// the file). Nothing else is touched: 3proxy cfgs need restarts (sessions
+// drop) and stay with POST /pergb/enable.
+// deps: { settings, run, log } -> { ok, changed, reloaded, skipped?, error?, detail? }
+async function refreshHaproxy(deps = {}) {
+  const settings = deps.settings || readSettings();
+  const run = deps.run || execCapture;
+  const log = deps.log || console;
+  const sd = makeSystemd(run);
+  const ops = makeFsOps(settings);
+  const out = { ok: true, changed: false, reloaded: false };
+  const e = readEnable(settings);
+  if (!e || e.enabled !== true) return { ...out, skipped: "not_enabled" };
+  const cur = readText(settings.haproxyCfg);
+  if (cur === null) return { ...out, skipped: "no_cfg" };
+  const norm = normalizeParams({
+    base: e.base,
+    count: e.count,
+    procs: Array.isArray(e.procs) && e.procs.length ? e.procs.length : undefined,
+    egressIpv4: e.egressIpv4,
+    dedicatedIpv4: e.dedicatedIpv4,
+    family: e.family,
+    maxConns: e.maxConns,
+    logdumpBytes: e.logdumpBytes,
+    denyPorts: e.denyPorts,
+    sliceMemMax: e.sliceMemMax,
+    cpuWeight: e.cpuWeight,
+  });
+  if (!norm.ok) return { ...out, ok: false, error: "bad_enable", detail: norm.detail };
+  const text = renderHaproxy(norm.params, { crtList: settings.crtList, runDir: settings.runDir });
+  const haproxyGroup = parseIdFile(readText(settings.groupPath)).get(settings.haproxyGroup);
+  const fileOpts = { mode: 0o640, uid: 0, gid: haproxyGroup ? haproxyGroup.id : 0 };
+  if (cur !== text) {
+    const candidate = path.join(path.dirname(settings.haproxyCfg), `.${path.basename(settings.haproxyCfg)}.candidate`);
+    try {
+      ops.writeAtomic(candidate, text, fileOpts);
+      const c = await run(settings.haproxyBin, ["-c", "-f", candidate], { timeoutMs: 60000 });
+      if (c.code !== 0) {
+        log.error(`[pergb] haproxy rejects the re-rendered cfg — ${settings.haproxyCfg} left as it was: ${short(c)}`);
+        return { ...out, ok: false, error: "haproxy_check_failed", detail: short(c) || `exit ${c.code}` };
+      }
+    } finally {
+      try {
+        fs.unlinkSync(candidate);
+      } catch {}
+    }
+    ops.writeAtomic(settings.haproxyCfg, text, fileOpts);
+    out.changed = true;
+    log.log(`[pergb] ${settings.haproxyCfg} re-rendered (the haproxy template changed)`);
+  }
+  if (await sd.isActive(HAPROXY_UNIT)) {
+    const loaded = readStamp(settings, "haproxy") || sha256Hex(cur);
+    if (loaded !== sha256Hex(text)) {
+      const rr = await sd.sc(["reload", HAPROXY_UNIT]);
+      if (rr.code !== 0) return { ...out, ok: false, error: "reload_failed", detail: short(rr) };
+      out.reloaded = true;
+      log.log(`[pergb] ${HAPROXY_UNIT} reloaded`);
+    }
+  }
+  return out;
+}
+
 // Stop the per-GB runtime: the target is disabled (no start at boot) and
 // stopped with everything PartOf it; enable.json keeps the params with
 // enabled: false (sharedRange still reports the reserved range). The RADIUS
@@ -1042,6 +1156,7 @@ module.exports = {
   HTTP_LISTEN,
   SOCKS_LISTEN,
   ACL_OPERATIONS,
+  PLAIN_HTTP_METHODS,
   LOGFORMAT,
   MAXCONN_BASE,
   MAXCONN_PORT,
@@ -1067,6 +1182,7 @@ module.exports = {
   sharedRange,
   detectPrimaryIpv4,
   apply,
+  refreshHaproxy,
   disable,
   status,
   execCapture,

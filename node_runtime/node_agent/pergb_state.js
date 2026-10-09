@@ -10,6 +10,10 @@
 //   pool file /etc/netrun/pergb-pool.conf (PREFIX, POOL, ENABLED=1; A1) —
 //   written LAST, removed FIRST on disable: per-piece allocators take /64s
 //   through RADIUS only while it exists.
+// - start (agent start, i.e. every deploy): on an enabled node the per-GB
+//   haproxy is re-rendered from enable.json and reloaded when this checkout's
+//   template differs (pergb_runtime.refreshHaproxy), serialised with enable /
+//   disable.
 // - state: the paged snapshot (staged by snapshotId, 120 s) and the delta,
 //   forwarded to RADIUS; the `transitions` of both are killed at once.
 // - the loops: meter (1 s) → smart rotation → enforcer (1 s), guards (2 s),
@@ -824,7 +828,40 @@ function createPergb(deps = {}) {
     running = false;
   }
 
-  // At agent start: per-GB enabled here → facts + excluded + logins, loops.
+  // enable, disable and the start-time haproxy refresh run one at a time
+  // (the TLS server serialises enable / disable already; a refresh at agent
+  // start must not interleave with an enable that arrives meanwhile, or it
+  // could write the cfg of the params it read before).
+  let runtimeChain = Promise.resolve();
+  function runtimeSerial(fn) {
+    const next = runtimeChain.then(fn, fn);
+    runtimeChain = next.catch(() => {});
+    return next;
+  }
+
+  // A deploy restarts the agent: the per-GB haproxy takes this checkout's
+  // template (pergb_runtime.refreshHaproxy: re-render from enable.json,
+  // `haproxy -c`, write, graceful reload; nothing when it already matches).
+  function refreshHaproxy() {
+    if (typeof rt.refreshHaproxy !== "function") return Promise.resolve(null);
+    return runtimeSerial(async () => {
+      let r;
+      try {
+        r = await rt.refreshHaproxy(deps.runtimeDeps || {});
+      } catch (e) {
+        r = { ok: false, changed: false, reloaded: false, error: "refresh_failed", detail: String((e && e.message) || e) };
+      }
+      if (!r.ok) log.error(`[pergb] haproxy refresh: ${r.error}${r.detail ? ` — ${r.detail}` : ""}`);
+      if (!r.ok || r.changed || r.reloaded) {
+        event("pergb_haproxy_refresh", { ok: r.ok, changed: r.changed, reloaded: r.reloaded, error: r.error || null });
+      }
+      return r;
+    });
+  }
+
+  // At agent start: per-GB enabled here → loops, facts + excluded + logins,
+  // then the haproxy template (nothing waits for it; the running haproxy
+  // keeps serving meanwhile).
   async function start() {
     reload();
     if (!enableDoc) return { started: false };
@@ -833,6 +870,7 @@ function createPergb(deps = {}) {
       await radiusWatch(true).catch(() => null);
       lastCanaryAt = 0;
     }
+    if (enableDoc && enableDoc.enabled === true) await refreshHaproxy();
     return { started: true };
   }
 
@@ -1674,8 +1712,9 @@ function createPergb(deps = {}) {
     start,
     stop,
     reload,
-    enable,
-    disable,
+    enable: (body) => runtimeSerial(() => enable(body)),
+    disable: (body) => runtimeSerial(() => disable(body)),
+    refreshHaproxy,
     status,
     putSnapshot,
     patchState,

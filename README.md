@@ -806,7 +806,8 @@ client ─► netrun-pergb-haproxy <egress IPv4>:<base>-<base+999>
    ├ TLS ClientHello ─► own TLS terminator (abns@netrun_pergb_tls, PROXY v2, crt-list
    │                     /etc/netrun/tls/crt-list) ─► 3proxy-pergb HTTP proxy 127.0.0.3:<port>
    ├ 0x05 (SOCKS5) ───────────────────────────────────► 3proxy-pergb SOCKS     127.0.0.4:<port>
-   └ anything else: rejected (no plain HTTP)
+   ├ "<METHOD> " (plain HTTP proxy; accepted silently) ─► 3proxy-pergb HTTP proxy 127.0.0.3:<port>
+   └ anything else: rejected
 3proxy-pergb (uid 65533) ─ Access-Request ─► netrun-radius 127.0.0.1:1812 ─ Framed address ─► egress
 ```
 
@@ -838,6 +839,23 @@ client ─► netrun-pergb-haproxy <egress IPv4>:<base>-<base+999>
   range at a time (a family change: `@<base>` first, `@<base+500>` once the first listens
   again); the haproxy is reloaded (graceful) when its cfg changed. `disable()` stops and
   disables the target and keeps `enable.json` with `enabled: false`.
+- **Plain HTTP on the shared ports** is accepted but not advertised anywhere (clients
+  differ in what they call an HTTP / HTTPS proxy): a first packet that starts with
+  `GET|PUT|HEAD|POST|PATCH|TRACE|DELETE|OPTIONS|CONNECT` + space (`acl plain_http`,
+  fixed-length `req.payload`, after the TLS and SOCKS5 rules) goes straight to the same
+  3proxy-pergb HTTP proxy `127.0.0.3:<dialed port>` the TLS terminator feeds — CONNECT and
+  absolute-URI requests, the same RADIUS auth (407 without / with a wrong login), NAS-Port,
+  log record, meter and attribution (the `pergb_in` log line joins the client to 3proxy's
+  loopback tuple, as for SOCKS5). 3proxy is the only HTTP parser on both paths. Anything
+  else is still rejected (at once; a method that never completes at the 5 s inspect-delay).
+- **Agent start = template refresh:** on an enabled node `pergb_state.start()` runs
+  `pergb_runtime.refreshHaproxy()`: the haproxy cfg is re-rendered from `enable.json`; a
+  different text is checked with `haproxy -c` on a candidate (a rejected one never replaces
+  the live file), written, and a running `netrun-pergb-haproxy` reloaded (graceful, open
+  sessions stay on the old workers). So a deploy that changes the haproxy template only
+  needs the agent restart; 3proxy cfgs (restarts drop sessions) still change only through
+  `POST /pergb/enable`. Serialised with enable / disable; a failure is logged (event
+  `pergb_haproxy_refresh`) and the old cfg keeps serving.
 - **cgroup:** `netrun-pergb.slice` nests in `netrun.slice` (the dash), so the per-GB
   units live under `/netrun.slice/netrun-pergb.slice/` and the CPU weight that counts
   against `system.slice` (per-piece) is `netrun.slice`'s.

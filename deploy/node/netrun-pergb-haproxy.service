@@ -2,8 +2,10 @@
 # pid file, master socket and stats socket), never the per-piece haproxy.
 # Binds the shared ports on the egress IPv4; a TLS ClientHello goes through
 # its own TLS terminator (crt-list /etc/netrun/tls/crt-list) to
-# 3proxy-pergb's HTTP proxy on 127.0.0.3:<port>, SOCKS5 to 127.0.0.4:<port>.
-# cfg: /opt/netrun/pergb/haproxy/haproxy.cfg (written by the agent).
+# 3proxy-pergb's HTTP proxy on 127.0.0.3:<port>, SOCKS5 to 127.0.0.4:<port>,
+# a plain HTTP-proxy request (not advertised) straight to 127.0.0.3:<port>.
+# cfg: /opt/netrun/pergb/haproxy/haproxy.cfg (written by the agent: enable,
+# and re-rendered + reloaded at agent start when its template changed).
 # Certificate renewals reach it through netrun-pergb-certs.path. The reload
 # stamps the sha256 of the cfg it loads (/run/netrun-pergb/applied/haproxy.sha256).
 [Unit]

@@ -203,6 +203,11 @@ function fakeRuntime(rtSettings) {
       }
       return { ok: true, changed, restarted: prev && prev.family !== p.family ? layout.map((r) => r.unit) : [], started: [], stopped: [], reloaded: [], procs: layout, secretCreated: false };
     },
+    // the agent-start haproxy refresh: nothing to do on a fake node
+    async refreshHaproxy() {
+      calls.push(["refreshHaproxy"]);
+      return { ok: true, changed: false, reloaded: false };
+    },
     async disable(opts) {
       calls.push(["disable", opts]);
       const e = rt.readEnable(rtSettings);

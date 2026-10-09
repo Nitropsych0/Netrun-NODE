@@ -1,6 +1,7 @@
-# NETRUN per-GB haproxy — written by node_agent/pergb_runtime.js (POST /pergb/enable); do not edit.
+# NETRUN per-GB haproxy — written by node_agent/pergb_runtime.js (POST /pergb/enable, agent start); do not edit.
 # Shared ports 31000-31999 on 203.0.113.10: TLS -> 3proxy-pergb proxy 127.0.0.3:<port>,
-# SOCKS5 -> 3proxy-pergb socks 127.0.0.4:<port>, anything else rejected.
+# SOCKS5 -> 3proxy-pergb socks 127.0.0.4:<port>, a plain HTTP-proxy request -> 127.0.0.3:<port>
+# as well (same auth, log and meter; not advertised), anything else rejected.
 global
     log /dev/log local1 info
     log-tag netrun-pergb-haproxy
@@ -25,10 +26,17 @@ defaults
 frontend pergb_in
     bind 203.0.113.10:31000-31999
     tcp-request inspect-delay 5s
+    acl plain_http req.payload(0,4) -m bin 47455420 50555420
+    acl plain_http req.payload(0,5) -m bin 4845414420 504f535420
+    acl plain_http req.payload(0,6) -m bin 504154434820 545241434520
+    acl plain_http req.payload(0,7) -m bin 44454c45544520
+    acl plain_http req.payload(0,8) -m bin 4f5054494f4e5320 434f4e4e45435420
     tcp-request content accept if { req.ssl_hello_type 1 }
     tcp-request content accept if { req.len gt 0 } { req.payload(0,1) -m bin 05 }
+    tcp-request content accept if plain_http
     tcp-request content reject
     use_backend pergb_tls_loop if { req.ssl_hello_type 1 }
+    use_backend pergb_http if plain_http
     default_backend pergb_socks
 
 backend pergb_socks

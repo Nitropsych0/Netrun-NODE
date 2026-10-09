@@ -8,7 +8,8 @@
 // TLS-only routing and certificate reload, snapshot paging and its 409s,
 // deltas and seq_mismatch, kills from `transitions` on snapshot AND delta,
 // usage (meter + RADIUS bindings + rejects), attribution, port_check,
-// reserve / release (A1), the RADIUS probe packet, disable.
+// reserve / release (A1), the RADIUS probe packet, disable, and start()'s
+// haproxy refresh (serialised with enable).
 // Run with: node --test node_runtime/node_agent/pergb_state.test.js
 
 const test = require("node:test");
@@ -571,6 +572,58 @@ test("generateConflict (option A): the shared range and its +10000 shadow refuse
   write("198.51.100.20");
   assert.strictEqual(pergb.generateConflict(31000, 10), null, "option B: per-GB is on its own IPv4");
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("start: an enabled node refreshes the per-GB haproxy (once, serialised with enable); a disabled one does not; a failed refresh does not stop the start", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pgst-"));
+  try {
+    const rtSettings = rtLib.readSettings({ NETRUN_PERGB_ETC_DIR: dir });
+    const runtime = T.fakeRuntime(rtSettings);
+    const order = [];
+    let release;
+    const gate = new Promise((r) => (release = r));
+    runtime.refreshHaproxy = async (d) => {
+      order.push(["refresh", d]);
+      await gate;
+      order.push("refresh done");
+      return { ok: true, changed: true, reloaded: true };
+    };
+    const errors = [];
+    const log = { log() {}, error: (m) => errors.push(String(m)) };
+    const runtimeDeps = { marker: "runtimeDeps" };
+    const pergb = stateLib.createPergb({ runtime, runtimeSettings: rtSettings, runtimeDeps, log, settings: { poolFile: path.join(dir, "pool"), stateDir: dir, loops: false } });
+    const write = (enabled) =>
+      fs.writeFileSync(rtSettings.enablePath, JSON.stringify({ version: 1, enabled, base: 31000, count: 1000, egressIpv4: EGRESS, dedicatedIpv4: null, procs: [] }));
+    assert.deepStrictEqual(await pergb.start(), { started: false }, "no per-GB here");
+    write(false);
+    assert.deepStrictEqual(await pergb.start(), { started: true });
+    assert.deepStrictEqual(order, [], "a disabled node keeps its haproxy cfg");
+    write(true);
+    const started = pergb.start();
+    const enabled = pergb.enable({}).then((r) => {
+      order.push("enable");
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepStrictEqual(order, [["refresh", runtimeDeps]], "the enable waits for the refresh");
+    release();
+    assert.deepStrictEqual(await started, { started: true });
+    assert.strictEqual((await enabled).status, 400, "the enable ran after it (and refused the empty body)");
+    assert.deepStrictEqual(order, [["refresh", runtimeDeps], "refresh done", "enable"]);
+    pergb.stop();
+    // a refresh that throws or fails is logged; the start goes on
+    runtime.refreshHaproxy = async () => {
+      throw new Error("boom");
+    };
+    assert.deepStrictEqual(await pergb.start(), { started: true });
+    assert.ok(errors.some((m) => /haproxy refresh: refresh_failed — boom/.test(m)), errors.join("\n"));
+    runtime.refreshHaproxy = async () => ({ ok: false, changed: false, reloaded: false, error: "haproxy_check_failed", detail: "unknown keyword" });
+    assert.deepStrictEqual(await pergb.start(), { started: true });
+    assert.ok(errors.some((m) => /haproxy refresh: haproxy_check_failed — unknown keyword/.test(m)));
+    pergb.stop();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("pool file text and parsing; /64 wire forms", () => {

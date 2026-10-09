@@ -117,8 +117,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq haproxy && (sudo systemctl stop haproxy || true)
-      - run: sudo bash scripts/test_pergb_haproxy.sh --require-all
+      - name: shellcheck
+        run: shellcheck -S warning scripts/test_pergb_haproxy.sh
+      - name: haproxy -c, live routing (TLS / SOCKS5 / plain HTTP / rejects), e2e through the committed 3proxy-pergb
+        run: sudo env "PATH=$PATH" bash scripts/test_pergb_haproxy.sh --require-all
 
   l2-install:
     name: "L2: install_pergb.sh (idempotent on a real node, systemd-analyze verify, container refusals)"

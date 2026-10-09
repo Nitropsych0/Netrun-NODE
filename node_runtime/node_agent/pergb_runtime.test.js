@@ -2,10 +2,12 @@
 
 // Pay-per-GB v2 — pergb_runtime.js: the 3proxy-pergb cfgs and the per-GB
 // haproxy cfg against golden files (testdata/), the exact 3proxy 0.9.3 ACL
-// operation names, the enable params, apply() against a fake systemd (files,
-// modes, idempotence, rolling restart order on a family change, the stale-range
-// cleanup, crash recovery from the start stamps), the refusals (binary hash,
-// uid, guard) and enable.json / sharedRange / disable.
+// operation names, the plain-HTTP rule of the shared ports, the enable params,
+// apply() against a fake systemd (files, modes, idempotence, rolling restart
+// order on a family change, the stale-range cleanup, crash recovery from the
+// start stamps), the refusals (binary hash, uid, guard), refreshHaproxy() (the
+// agent-start re-render: haproxy -c first, reload, nothing else) and
+// enable.json / sharedRange / disable.
 // Run with: node --test node_runtime/node_agent/pergb_runtime.test.js
 
 const test = require("node:test");
@@ -104,7 +106,7 @@ test("cfg: family ipv6_only renders -6, no deny line without deny ports, custom 
   assert.throws(() => rt.renderCfg(p, rt.procRanges(31000, 1000, 2)[0], "short"));
 });
 
-test("haproxy: maxconn 2 x maxConns + 1000, the range bind, TLS/SOCKS split, rejects the rest", () => {
+test("haproxy: maxconn 2 x maxConns + 1000, the range bind, TLS/SOCKS5/plain HTTP split, rejects the rest", () => {
   const p = params({ base: 10000, maxConns: 3000, egressIpv4: "198.51.100.7", dedicatedIpv4: "198.51.100.7" });
   const t = rt.renderHaproxy(p, { crtList: "/x/crt-list", runDir: "/run/x" });
   assert.match(t, /^    maxconn 7000$/m);
@@ -114,10 +116,56 @@ test("haproxy: maxconn 2 x maxConns + 1000, the range bind, TLS/SOCKS split, rej
   assert.match(t, /^    server socks 127\.0\.0\.4$/m);
   assert.match(t, /^    server http 127\.0\.0\.3$/m);
   assert.match(t, /^    server tls abns@netrun_pergb_tls send-proxy-v2$/m);
-  assert.match(t, /tcp-request content accept if \{ req\.len gt 0 \} \{ req\.payload\(0,1\) -m bin 05 \}\n    tcp-request content reject\n/);
   assert.match(t, /^    log-format "%ci:%cp %fp %bi:%bp %Tt %B %U"$/m);
   assert.match(t, /^    log \/dev\/log local1 info$/m);
   assert.doesNotMatch(t, /abns@netrun_tls\b/, "never the per-piece TLS socket");
+  // the shared-port frontend, rule by rule and in this order: TLS and SOCKS5
+  // exactly as before, then plain HTTP, then the reject; plain HTTP goes
+  // straight to the HTTP proxy backend (the one behind the TLS terminator),
+  // SOCKS5 stays the default
+  const fe = t.split("\nfrontend pergb_in\n")[1].split("\n\n")[0].split("\n");
+  const rules = fe.filter((l) => /^    (tcp-request content|use_backend|default_backend)\b/.test(l));
+  assert.deepStrictEqual(rules, [
+    "    tcp-request content accept if { req.ssl_hello_type 1 }",
+    "    tcp-request content accept if { req.len gt 0 } { req.payload(0,1) -m bin 05 }",
+    "    tcp-request content accept if plain_http",
+    "    tcp-request content reject",
+    "    use_backend pergb_tls_loop if { req.ssl_hello_type 1 }",
+    "    use_backend pergb_http if plain_http",
+    "    default_backend pergb_socks",
+  ]);
+  const acls = fe.filter((l) => /^    acl /.test(l));
+  assert.ok(acls.length > 0 && acls.every((l) => /^    acl plain_http req\.payload\(0,\d\) -m bin [0-9a-f ]+$/.test(l)), acls.join("\n"));
+  assert.ok(fe.indexOf(acls.at(-1)) < fe.indexOf(rules[0]), "the ACL is declared before the rules use it");
+  assert.match(t, /\nbackend pergb_http\n    server http 127\.0\.0\.3\n/, "one HTTP backend for both paths, port-less (the dialed port)");
+  assert.strictEqual(t.match(/^backend pergb_http$/gm).length, 1);
+  // the header says what the shared ports take (an internal file, not advertised anywhere)
+  assert.match(t, /^# SOCKS5 -> 3proxy-pergb socks 127\.0\.0\.4:<port>, a plain HTTP-proxy request -> 127\.0\.0\.3:<port>$/m);
+  assert.doesNotMatch(t, /no plain HTTP/i);
+});
+
+test("haproxy: the plain_http ACL is exactly '<METHOD> ' of PLAIN_HTTP_METHODS, never a TLS or SOCKS first byte; 3proxy's ACL allows every one", () => {
+  const t = rt.renderHaproxy(params());
+  const seen = [];
+  for (const m of t.matchAll(/^    acl plain_http req\.payload\(0,(\d+)\) -m bin ([0-9a-f ]+)$/gm)) {
+    const len = Number(m[1]);
+    for (const hex of m[2].split(" ")) {
+      const b = Buffer.from(hex, "hex");
+      assert.strictEqual(b.length, len, `${hex}: the pattern length is the fetched length`);
+      const s = b.toString("latin1");
+      assert.match(s, /^[A-Z]+ $/, `${hex} is an upper-case method and one space`);
+      seen.push(s.trim());
+    }
+  }
+  assert.deepStrictEqual(seen.slice().sort(), rt.PLAIN_HTTP_METHODS.slice().sort());
+  for (const must of ["CONNECT", "GET", "POST", "PUT", "HEAD", "DELETE", "OPTIONS", "PATCH"]) assert.ok(seen.includes(must), must);
+  // TLS records start 0x14..0x17 (or 0xff / SSLv2 >= 0x80), SOCKS5 0x05, SOCKS4 0x04: no method letter
+  for (const m of seen) assert.ok(m.charCodeAt(0) >= 0x41 && m.charCodeAt(0) <= 0x5a);
+  // at most 8 bytes decide: anything that is no method prefix is rejected at once
+  assert.ok(Math.max(...seen.map((m) => m.length + 1)) <= 8);
+  // 3proxy-pergb's ACL lets every one through (and 3proxy itself parses them)
+  const op = (m) => ({ CONNECT: "HTTP_CONNECT", GET: "HTTP_GET", PUT: "HTTP_PUT", POST: "HTTP_POST", HEAD: "HTTP_HEAD" })[m] || "HTTP_OTHER";
+  for (const m of seen) assert.ok(rt.ACL_OPERATIONS.includes(op(m)), `${m} -> ${op(m)} allowed`);
 });
 
 test("procRanges / normalizeParams / slice drop-ins", () => {
@@ -187,6 +235,7 @@ function makeNode(name, over = {}) {
     NETRUN_PERGB_GROUP: d("etc/group"),
     NETRUN_PROXY_GUARD_BIN: d("guard"),
     NETRUN_PERGB_CHOWN: "0",
+    NETRUN_PERGB_HAPROXY_BIN: d("haproxy"),
   });
   // The fake systemd: unit states, the wants of the target, and the stamps
   // the units' ExecStartPre / ExecReload write (the sha256 of the cfg loaded).
@@ -216,8 +265,16 @@ function makeNode(name, over = {}) {
       startUnit(rt.CERTS_PATH_UNIT);
     }
   };
+  // `haproxy -c -f <file>`: what it was asked to check (the file as it was then)
+  const checks = [];
   const run = async (cmd, args) => {
     calls.push([cmd, ...args].join(" "));
+    if (cmd === settings.haproxyBin) {
+      assert.deepStrictEqual(args.slice(0, 2), ["-c", "-f"]);
+      const text = fs.readFileSync(args[2], "utf8");
+      checks.push({ file: args[2], text, mode: fs.statSync(args[2]).mode & 0o7777 });
+      return over.haproxyCheck ? over.haproxyCheck(text) : { code: 0, stdout: "Configuration file is valid\n", stderr: "" };
+    }
     if (cmd === "nft") {
       return guard.loaded
         ? { code: 0, stdout: "table inet netrun_proxy_guard {\n\tchain output {\n\t\tmeta skuid 65535 jump proxy\n\t\tmeta skuid 65533 jump pergb\n\t}\n}\n", stderr: "" }
@@ -287,7 +344,7 @@ function makeNode(name, over = {}) {
       return over.ready ? over.ready(unit) : true;
     },
   };
-  return { root, d, settings, units, st, calls, deps, guard, ready };
+  return { root, d, settings, units, st, calls, deps, guard, ready, checks };
 }
 
 const ENABLE = { base: 31000, count: 1000, procs: 2, egressIpv4: IPV4, dedicatedIpv4: null, family: "dualstack", maxConns: 8000, geo: "us", subnets: "0000-fffe", addrKey: "a2V5", probe: { password: "pw", canary: [["192.0.2.1", 443]] } };
@@ -497,6 +554,132 @@ test("apply: an existing secret is kept (a stray newline normalised); a broken o
   assert.ok(res2.ok && res2.secretCreated);
   assert.notStrictEqual(fs.readFileSync(n.settings.secretPath, "utf8"), SECRET);
   assert.deepStrictEqual(res2.restarted, ["netrun-pergb-3proxy@31000.service", "netrun-pergb-3proxy@31500.service"]);
+});
+
+// ── refreshHaproxy (agent start) ─────────────────────────────────────────
+
+// What an older template rendered for the same params: this file without
+// the plain-HTTP lines (the template before plain HTTP was accepted).
+const olderTemplate = (text) => text.split("\n").filter((l) => !/plain_http|plain HTTP-proxy|^# as well /.test(l)).join("\n");
+const stampOf = (n) => path.join(n.settings.runDir, "applied", "haproxy.sha256");
+const fileId = (f) => {
+  const s = fs.statSync(f);
+  return [s.ino, s.mtimeMs, sha(fs.readFileSync(f))];
+};
+
+test("refreshHaproxy: right after apply() there is nothing to do (no check, no write, no reload), whatever the params", async () => {
+  for (const [name, over] of [
+    ["a", {}],
+    ["b", { base: 10000, egressIpv4: "198.51.100.9", dedicatedIpv4: "198.51.100.9", maxConns: 3000, family: "ipv6_only", procs: 3 }],
+  ]) {
+    const n = makeNode(`refresh-same-${name}`);
+    assert.ok((await rt.apply({ ...ENABLE, ...over }, n.deps)).ok);
+    const before = fileId(n.settings.haproxyCfg);
+    n.calls.length = 0;
+    assert.deepStrictEqual(await rt.refreshHaproxy(n.deps), { ok: true, changed: false, reloaded: false }, name);
+    assert.deepStrictEqual(n.checks, [], name);
+    assert.deepStrictEqual(mutating(n.calls), [], name);
+    assert.deepStrictEqual(fileId(n.settings.haproxyCfg), before, `${name}: not rewritten`);
+  }
+});
+
+test("refreshHaproxy: an enabled node on an older template gets this one — haproxy -c on a candidate, then the file, then a graceful reload; nothing else", async () => {
+  const n = makeNode("refresh-old");
+  assert.ok((await rt.apply(ENABLE, n.deps)).ok);
+  const want = fs.readFileSync(n.settings.haproxyCfg, "utf8");
+  assert.match(want, /^    tcp-request content accept if plain_http$/m);
+  // the node as the previous agent left it: the old file, loaded by the running haproxy
+  const old = olderTemplate(want);
+  assert.notStrictEqual(old, want);
+  assert.doesNotMatch(old, /plain_http/);
+  fs.writeFileSync(n.settings.haproxyCfg, old, { mode: 0o640 });
+  fs.writeFileSync(stampOf(n), `${sha(old)}  -\n`);
+  const others = [rt.cfgPathFor(n.settings, 31000), rt.cfgPathFor(n.settings, 31500), n.settings.enablePath, n.settings.secretPath];
+  const othersBefore = others.map(fileId);
+  n.calls.length = 0;
+  const r = await rt.refreshHaproxy(n.deps);
+  assert.deepStrictEqual(r, { ok: true, changed: true, reloaded: true });
+  assert.strictEqual(n.checks.length, 1);
+  assert.strictEqual(n.checks[0].text, want, "haproxy -c checked the new text");
+  assert.strictEqual(n.checks[0].mode, 0o640);
+  assert.strictEqual(path.dirname(n.checks[0].file), path.dirname(n.settings.haproxyCfg), "the candidate sits next to the cfg");
+  assert.notStrictEqual(n.checks[0].file, n.settings.haproxyCfg, "never the live file");
+  assert.strictEqual(fs.readFileSync(n.settings.haproxyCfg, "utf8"), want);
+  assert.strictEqual(mode(n.settings.haproxyCfg), 0o640);
+  assert.deepStrictEqual(fs.readdirSync(path.dirname(n.settings.haproxyCfg)), ["haproxy.cfg"], "no candidate or temp file left");
+  assert.deepStrictEqual(mutating(n.calls), ["systemctl reload netrun-pergb-haproxy.service"], "a reload, never a restart or a 3proxy unit");
+  assert.ok(n.calls.findIndex((c) => c.startsWith(`${n.settings.haproxyBin} `)) < n.calls.indexOf("systemctl reload netrun-pergb-haproxy.service"), "checked before the reload");
+  assert.deepStrictEqual(others.map(fileId), othersBefore, "3proxy cfgs, enable.json and the secret untouched");
+  assert.strictEqual(fs.readFileSync(stampOf(n), "utf8"), `${sha(want)}  -\n`, "the reload stamped the new file");
+  // the next agent start: nothing
+  n.calls.length = 0;
+  assert.deepStrictEqual(await rt.refreshHaproxy(n.deps), { ok: true, changed: false, reloaded: false });
+  assert.deepStrictEqual([n.checks.length, mutating(n.calls)], [1, []]);
+  // and apply() with the same params agrees with the refreshed file
+  n.calls.length = 0;
+  const again = await rt.apply(ENABLE, n.deps);
+  assert.deepStrictEqual([again.changed, again.reloaded, again.restarted, mutating(n.calls)], [[], [], [], []]);
+});
+
+test("refreshHaproxy: a cfg haproxy -c rejects never replaces the live file and nothing is reloaded", async () => {
+  const n = makeNode("refresh-reject", { haproxyCheck: () => ({ code: 1, stdout: "", stderr: "[ALERT] config : parsing [x:31] : unknown keyword 'acl'\n" }) });
+  assert.ok((await rt.apply(ENABLE, n.deps)).ok);
+  const old = olderTemplate(fs.readFileSync(n.settings.haproxyCfg, "utf8"));
+  fs.writeFileSync(n.settings.haproxyCfg, old, { mode: 0o640 });
+  fs.writeFileSync(stampOf(n), `${sha(old)}  -\n`);
+  n.calls.length = 0;
+  const r = await rt.refreshHaproxy(n.deps);
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.error, "haproxy_check_failed");
+  assert.match(r.detail, /unknown keyword/);
+  assert.deepStrictEqual([r.changed, r.reloaded], [false, false]);
+  assert.strictEqual(fs.readFileSync(n.settings.haproxyCfg, "utf8"), old, "the live file is the old one");
+  assert.deepStrictEqual(fs.readdirSync(path.dirname(n.settings.haproxyCfg)), ["haproxy.cfg"], "the candidate is removed");
+  assert.deepStrictEqual(mutating(n.calls), []);
+});
+
+test("refreshHaproxy: no per-GB / disabled / no cfg are skipped; a stopped haproxy only gets the file; a stale stamp alone reloads", async () => {
+  const none = makeNode("refresh-none");
+  assert.deepStrictEqual(await rt.refreshHaproxy(none.deps), { ok: true, changed: false, reloaded: false, skipped: "not_enabled" });
+  assert.deepStrictEqual(none.calls, []);
+
+  const off = makeNode("refresh-off");
+  assert.ok((await rt.apply(ENABLE, off.deps)).ok);
+  assert.ok((await rt.disable({}, off.deps)).ok);
+  const oldOff = olderTemplate(fs.readFileSync(off.settings.haproxyCfg, "utf8"));
+  fs.writeFileSync(off.settings.haproxyCfg, oldOff, { mode: 0o640 });
+  off.calls.length = 0;
+  assert.strictEqual((await rt.refreshHaproxy(off.deps)).skipped, "not_enabled");
+  assert.strictEqual(fs.readFileSync(off.settings.haproxyCfg, "utf8"), oldOff, "a disabled node keeps its file (the next enable renders it)");
+  assert.deepStrictEqual(off.calls, []);
+
+  const nocfg = makeNode("refresh-nocfg");
+  assert.ok((await rt.apply(ENABLE, nocfg.deps)).ok);
+  fs.unlinkSync(nocfg.settings.haproxyCfg);
+  nocfg.calls.length = 0;
+  assert.strictEqual((await rt.refreshHaproxy(nocfg.deps)).skipped, "no_cfg");
+  assert.ok(!fs.existsSync(nocfg.settings.haproxyCfg), "left to apply()");
+  assert.deepStrictEqual(nocfg.calls, []);
+
+  const stopped = makeNode("refresh-stopped");
+  assert.ok((await rt.apply(ENABLE, stopped.deps)).ok);
+  const want = fs.readFileSync(stopped.settings.haproxyCfg, "utf8");
+  stopped.st(rt.HAPROXY_UNIT).active = false;
+  fs.writeFileSync(stopped.settings.haproxyCfg, olderTemplate(want), { mode: 0o640 });
+  stopped.calls.length = 0;
+  assert.deepStrictEqual(await rt.refreshHaproxy(stopped.deps), { ok: true, changed: true, reloaded: false });
+  assert.strictEqual(fs.readFileSync(stopped.settings.haproxyCfg, "utf8"), want);
+  assert.deepStrictEqual(mutating(stopped.calls), [], "a stopped haproxy is not started");
+
+  const stale = makeNode("refresh-stamp");
+  assert.ok((await rt.apply(ENABLE, stale.deps)).ok);
+  const cur = fs.readFileSync(stale.settings.haproxyCfg, "utf8");
+  fs.writeFileSync(stampOf(stale), `${sha(olderTemplate(cur))}  -\n`); // written, but the reload never happened
+  const before = fileId(stale.settings.haproxyCfg);
+  stale.calls.length = 0;
+  assert.deepStrictEqual(await rt.refreshHaproxy(stale.deps), { ok: true, changed: false, reloaded: true });
+  assert.deepStrictEqual([stale.checks, mutating(stale.calls)], [[], ["systemctl reload netrun-pergb-haproxy.service"]]);
+  assert.deepStrictEqual(fileId(stale.settings.haproxyCfg), before);
 });
 
 test("disable: target disabled and stopped, enable.json kept with enabled=false, RADIUS socket kept unless stopRadius", async () => {
