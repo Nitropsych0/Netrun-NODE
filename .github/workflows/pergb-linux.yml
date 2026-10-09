@@ -1,0 +1,42 @@
+name: pergb-linux
+
+# Pay-per-GB v2 — the node checks that need Linux (a real nftables kernel, a
+# private network namespace, GNU userland). One job per lane; the macOS-safe
+# suites run here too so every lane branch is checked on the nodes' OS.
+on:
+  push:
+    branches:
+      - "feat/pergb2-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Lane L9 — node shields: the A1 address pool (generator, egress.js,
+  # deprovision), option A / B shields (accounting, firewall, deprovision,
+  # netrun-https), /health clock, /describe capacity, the :8086 agent guard.
+  l9-node-shields:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Tools (nftables, haproxy, openssl)
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables haproxy openssl iproute2 >/dev/null
+          nft --version; haproxy -v | head -n1; node --version; python3 --version
+      - name: Node agent tests (node --test)
+        working-directory: node_runtime/node_agent
+        run: node --test
+      - name: Generator, harden and HTTPS scripts (bash, stubs)
+        run: |
+          bash scripts/test_generator_flags.sh
+          bash node_runtime/soft/generator/test_routed_prefix.sh
+          bash scripts/test_netrun_harden_security.sh
+          bash scripts/test_https_hostnames.sh
+      - name: Per-GB nft shields against the real kernel (private netns)
+        run: sudo env "PATH=$PATH" unshare -n bash scripts/test_pergb_nft_shield.sh
