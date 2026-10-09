@@ -93,4 +93,144 @@ function fakeCtl(handlers = {}) {
   return ctl;
 }
 
-module.exports = { KEY_B64, PREFIX, UNIT_A, UNIT_B, CG, tagger, untaggedAddress, ssLine, fakeRun, fakeCtl };
+// ── the real netrun-radius (node_runtime/radius) for integration tests ─────
+
+const fs = require("fs");
+const path = require("path");
+const dgram = require("dgram");
+const { spawn, spawnSync } = require("child_process");
+
+const RADIUS_DIR = path.resolve(__dirname, "../radius");
+const SECRET = "T3stSecretT3stSecretT3stSecretT3stSecre1";
+
+function havePython() {
+  const r = spawnSync("python3", ["-c", "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"]);
+  return r.status === 0;
+}
+
+function freeUdpPort() {
+  return new Promise((resolve, reject) => {
+    const s = dgram.createSocket("udp4");
+    s.on("error", reject);
+    s.bind(0, "127.0.0.1", () => {
+      const p = s.address().port;
+      s.close(() => resolve(p));
+    });
+  });
+}
+
+// -> { ctlPath, udpPort, secretPath, stop() }
+async function startRadius(dir) {
+  fs.mkdirSync(path.join(dir, "radius"), { recursive: true });
+  const secretPath = path.join(dir, "radius.secret");
+  if (!fs.existsSync(secretPath)) fs.writeFileSync(secretPath, SECRET, { mode: 0o600 });
+  const ctlPath = path.join(dir, "c.sock");
+  const udpPort = await freeUdpPort();
+  const proc = spawn(
+    "python3",
+    ["-I", path.join(RADIUS_DIR, "netrun_radius.py"), "--listen", `127.0.0.1:${udpPort}`, "--state-dir", path.join(dir, "radius"), "--secret-file", secretPath, "--ctl-socket", ctlPath, "--no-watchdog"],
+    { stdio: ["ignore", "ignore", "pipe"] }
+  );
+  let stderr = "";
+  proc.stderr.on("data", (d) => {
+    stderr += d.toString();
+    if (stderr.length > 20000) stderr = stderr.slice(-10000);
+  });
+  const deadline = Date.now() + 15000;
+  while (!fs.existsSync(ctlPath)) {
+    if (Date.now() > deadline || proc.exitCode !== null) throw new Error(`netrun-radius did not start: ${stderr}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return {
+    ctlPath,
+    udpPort,
+    secretPath,
+    proc,
+    stderr: () => stderr,
+    stop: () =>
+      new Promise((resolve) => {
+        if (proc.exitCode !== null) return resolve();
+        proc.once("exit", () => resolve());
+        proc.kill("SIGTERM");
+      }),
+  };
+}
+
+// A pergb_runtime stand-in: apply() writes enable.json the way L2's does
+// (version 1, the proc layout, params = the raw body), status() reports the
+// units active; nothing touches systemd. Records its calls.
+function fakeRuntime(rtSettings) {
+  const rt = require("./pergb_runtime.js");
+  const calls = [];
+  const fake = {
+    ...rt,
+    calls,
+    readSettings: () => rtSettings,
+    readEnable: () => rt.readEnable(rtSettings),
+    sharedRange: () => rt.sharedRange(rtSettings),
+    detectPrimaryIpv4: async () => "203.0.113.10",
+    async apply(raw) {
+      calls.push(["apply", raw]);
+      const n = rt.normalizeParams(raw);
+      if (!n.ok) return n;
+      const p = n.params;
+      const layout = rt.procRanges(p.base, p.count, p.procs);
+      const prev = rt.readEnable(rtSettings);
+      const body = {
+        version: 1,
+        enabled: true,
+        base: p.base,
+        count: p.count,
+        last: p.last,
+        egressIpv4: p.egressIpv4,
+        dedicatedIpv4: p.dedicatedIpv4,
+        family: p.family,
+        maxConns: p.maxConns,
+        logdumpBytes: p.logdumpBytes,
+        denyPorts: p.denyPorts,
+        sliceMemMax: p.sliceMemMax,
+        cpuWeight: p.cpuWeight,
+        procs: layout.map((r) => ({ sp: r.sp, first: r.first, last: r.last, unit: r.unit, cfg: `/x/pergb_${r.sp}.cfg` })),
+        params: raw,
+      };
+      const text = `${JSON.stringify(body, null, 2)}\n`;
+      const changed = [];
+      const cur = fs.existsSync(rtSettings.enablePath) ? fs.readFileSync(rtSettings.enablePath, "utf-8") : null;
+      if (cur !== text) {
+        fs.mkdirSync(path.dirname(rtSettings.enablePath), { recursive: true });
+        fs.writeFileSync(rtSettings.enablePath, text);
+        changed.push(rtSettings.enablePath);
+      }
+      return { ok: true, changed, restarted: prev && prev.family !== p.family ? layout.map((r) => r.unit) : [], started: [], stopped: [], reloaded: [], procs: layout, secretCreated: false };
+    },
+    async disable(opts) {
+      calls.push(["disable", opts]);
+      const e = rt.readEnable(rtSettings);
+      if (e) fs.writeFileSync(rtSettings.enablePath, `${JSON.stringify({ ...e, enabled: false }, null, 2)}\n`);
+      return { ok: true, stopped: e ? [...e.procs.map((x) => x.unit), rt.HAPROXY_UNIT, rt.TARGET] : [] };
+    },
+    async status() {
+      const e = rt.readEnable(rtSettings);
+      const procs = e ? e.procs.map((x, i) => ({ unit: x.unit, first: x.first, last: x.last, active: e.enabled, pid: e.enabled ? 1000 + i : null })) : [];
+      return { enabled: Boolean(e && e.enabled), procs, haproxy: { active: Boolean(e && e.enabled), pid: 999 }, target: { active: Boolean(e && e.enabled), enabled: Boolean(e && e.enabled) } };
+    },
+  };
+  return fake;
+}
+
+module.exports = {
+  KEY_B64,
+  PREFIX,
+  UNIT_A,
+  UNIT_B,
+  CG,
+  SECRET,
+  tagger,
+  untaggedAddress,
+  ssLine,
+  fakeRun,
+  fakeCtl,
+  havePython,
+  startRadius,
+  fakeRuntime,
+};
