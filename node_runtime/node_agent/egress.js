@@ -124,7 +124,7 @@
 // that way is journaled in the state (`pergb_held`: { net, ref }) BEFORE it is
 // used; once no address of the state is in it any more (drained and
 // forgotten, dropped at a start) the GC tick hands it back (release_nets,
-// 24 h cool-down in RADIUS) and only then forgets the record — a failed call
+// back in the pool at once, amendment A6) and only then forgets the record — a failed call
 // is retried on the next tick. pergbExcludedNets(lo, hi) is the per-piece side
 // of RADIUS's `excluded` set (cfg anchors incl. .disabled / .failed, lists,
 // this module's addresses and reservations). Without the pool file nothing

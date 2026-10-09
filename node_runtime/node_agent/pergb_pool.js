@@ -18,7 +18,7 @@
 // outside POOL (none with the default 0000-fffe) stay per-piece's own and are
 // picked locally as before. The node's own last /64 (ffff) is never in the
 // pool and never a proxy's.
-// Per-piece hands /64s back with `release_nets` (24 h cool-down in RADIUS).
+// Per-piece hands /64s back with `release_nets` (back in the pool at once, amendment A6).
 //
 // This module: the pool file reader, the /64 <-> wire conversions, a minimal
 // RADIUS ctl client for reserve_nets / release_nets (I5; the transport can be

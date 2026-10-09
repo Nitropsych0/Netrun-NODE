@@ -36,7 +36,7 @@
 //     deprovisioned — dropped from the request (reported in skipped_shared);
 //     a request of shared ports only is refused (409 pergb_shared_port);
 //   - AMENDMENT A1 (pergb_pool.js): on a per-GB node a dropped batch hands its
-//     pool /64s back to RADIUS (release_nets, 24 h cool-down) — every /64 its
+//     pool /64s back to RADIUS (release_nets; amendment A6: back in the pool at once) — every /64 its
 //     cfg and its address list named, minus any /64 something per-piece still
 //     names (a fresh, complete scan). A rewritten (mixed) batch keeps its list,
 //     so its removed ports' /64s stay reserved until the batch itself goes.
