@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -174,6 +175,7 @@ class Env:
         self.tagger = tag.Tagger(self.key)
         self.prefix = ipaddress.IPv6Network(PREFIX)
         self.seq = 0
+        self.piece_net = None
 
     def call(self, req, expect_ok=True):
         r = ctl.call(self.a.ctl, req)
@@ -189,6 +191,7 @@ class Env:
             "geo": "us",
             "family": "dualstack",
             "egressIpv4": self.a.egress4,
+            "primaryIpv4": self.a.egress4,
             "prefix": PREFIX,
             "subnets": [0, 0xFFFE],
             "addrKey": base64.b64encode(self.key).decode(),
@@ -202,8 +205,24 @@ class Env:
         f.update(over)
         return self.call({"op": "facts", "facts": f})
 
+    def piece_addr(self):
+        """A13-I: the piece list 105's fixed address, derived independently of alloc.py."""
+        seed = b"netrun-pergb-pick-r\x00piece\x00" + (105).to_bytes(4, "big") + b"\x00\x00"
+        for j in range(64):
+            d = hmac.digest(self.key, seed + j.to_bytes(4, "big"), "sha256")
+            iid = tag.encrypt(self.key, 105, (d[0] << 8) | d[1])
+            if iid >= tag.IID_MIN:
+                return ipaddress.IPv6Address(int(self.prefix.network_address) | (self.piece_net << 64) | iid)
+        raise SystemExit("no piece interface id")
+
     def snapshot(self):
         self.seq += 1
+        if self.piece_net is None:
+            # A13-I: the orchestrator reserves the piece's /64 before the commit
+            self.piece_net = self.call({"op": "reserve_nets", "count": 1, "owner": "perpiece", "ref": "piece:e2e_1"})[
+                "nets"
+            ][0]
+        piece_acc = {"id": 900000002, "kind": "piece", "state": "active", "expiresAt": int(time.time()) + 86400}
         acc = {
             "id": 900000001,
             "state": "active",
@@ -260,8 +279,25 @@ class Env:
                 },
                 **pw_fields(PW),
             ),
+            dict(
+                {
+                    "id": 105,
+                    "login": "netrun-e2epiec",
+                    "accountId": 900000002,
+                    "pwRev": 1,
+                    "status": "active",
+                    "kind": "piece",
+                    "mode": "static",
+                    "lineCount": 1,
+                    "pieceNet": self.piece_net,
+                },
+                **pw_fields(PW),
+            ),
         ]
-        return self.call({"op": "snapshot", "seq": self.seq, "accounts": [acc], "lists": lists, "static": []})
+        r = self.call({"op": "snapshot", "seq": self.seq, "accounts": [acc, piece_acc], "lists": lists, "static": []})
+        if r.get("pieces", {}).get("rejected"):
+            raise SystemExit("the piece record was refused: %s" % r["pieces"]["rejected"])
+        return r
 
     def list_of(self, addr):
         if addr.version != 6 or addr not in self.prefix:
@@ -367,6 +403,25 @@ def run_checks(env: Env):
     except (ProxyError, OSError) as e:
         check("IPv4 destination over HTTP CONNECT", False, e)
 
+    # A13-I: a per-piece proxy on RADIUS — a fixed address in its own /64 on any port,
+    # IPv4 from the primary IPv4, only -country- allowed
+    want = env.piece_addr()
+    p1 = socks5(b, "netrun-e2epiec", PW, t6)
+    p2 = socks5(b + 3, "netrun-e2epiec-country-us", PW, t6)
+    check("piece: the fixed address in its own /64, on every port", p1 == want and p2 == want, (p1, p2, want))
+    try:
+        hp = http_connect(b + 1, "netrun-e2epiec", PW, t6)
+        check("piece: the same address over HTTP CONNECT", hp == want, (hp, want))
+    except (ProxyError, OSError) as e:
+        check("piece: the same address over HTTP CONNECT", False, e)
+    check(
+        "piece: an IPv4 destination leaves from the primary IPv4", str(socks5(b, "netrun-e2epiec", PW, t4)) == a.egress4
+    )
+    check("piece: -session is refused", fails(socks5, b, "netrun-e2epiec-session-x1", PW, t6))
+    check("piece: -rotate is refused", fails(socks5, b, "netrun-e2epiec-rotate", PW, t6))
+    rot = {(int(socks5(b, "netrun-e2erota", PW, t6)) >> 64) & 0xFFFF for _ in range(12)}
+    check("piece: per-GB rotation never draws the piece's /64", env.piece_net not in rot, rot)
+
     # static across a RADIUS restart
     env.restart(signal.SIGHUP)
     check("static survives a graceful RADIUS restart", socks5(b + 2, "netrun-e2estat", PW, t6) == st1)
@@ -378,6 +433,7 @@ def run_checks(env: Env):
     env.restart(signal.SIGUSR1)
     time.sleep(0.3)
     check("static survives a RADIUS crash (kill -9)", socks5(b + 2, "netrun-e2estat", PW, t6) == st1)
+    check("piece: survives a RADIUS crash (kill -9)", socks5(b, "netrun-e2epiec", PW, t6) == want)
 
     # probe
     pr = socks5(b, "netrun-svcprobe", PROBE_PW, t6)

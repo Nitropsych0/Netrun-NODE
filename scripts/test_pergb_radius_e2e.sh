@@ -16,8 +16,9 @@
 # across restarts, as systemd does.
 #
 # Checks (tests/e2e_driver.py): accept/reject, NAS-Port -> slot, Framed-IPv6 per
-# connection, sticky, static across a restart and a crash, IPv4 Framed, ipv6_only
-# reject, the probe login, a hung RADIUS = SINGLEBYTE_L then reject, restarts
+# connection, sticky, static across a restart and a crash, IPv4 Framed, a per-piece
+# list (A13-I: its fixed address in its own /64, IPv4 from the primary IPv4, no
+# -session/-rotate), ipv6_only reject, the probe login, a hung RADIUS = SINGLEBYTE_L then reject, restarts
 # under load with no failed connection; then real Access-Requests are captured
 # to $OUT/3proxy_captured.json (fixture for tests/test_proto.py).
 set -euo pipefail
