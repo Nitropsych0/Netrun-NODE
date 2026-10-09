@@ -1,0 +1,12 @@
+# NETRUN — parent of netrun-pergb.slice (a dash in a slice name nests it:
+# /netrun.slice/netrun-pergb.slice). Its CPU weight is what the per-GB
+# runtime gets against system.slice, where the per-piece 3proxy batches run.
+# Installed by deploy/node/install_pergb.sh (CPUWeight from
+# NETRUN_PERGB_CPU_WEIGHT); the agent's enable drop-in
+# (netrun.slice.d/50-netrun-enable.conf) overrides it.
+[Unit]
+Description=NETRUN slices
+Before=slices.target
+
+[Slice]
+CPUWeight=50

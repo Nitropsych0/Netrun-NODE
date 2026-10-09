@@ -1,0 +1,51 @@
+# NETRUN pay-per-GB v2 — one 3proxy-pergb process per range of the shared
+# ports: netrun-pergb-3proxy@<start port>.service runs
+# /opt/netrun/pergb/cfg/pergb_<start port>.cfg (written by the agent,
+# node_runtime/node_agent/pergb_runtime.js). Listens on 127.0.0.3 (HTTP proxy)
+# and 127.0.0.4 (SOCKS) only: the per-GB haproxy fronts the public ports.
+# Runs as netrun-pergb (uid 65533, gated by netrun-proxy-guard), never as
+# root; no `daemon`, so systemd restarts it after a crash or an OOM kill.
+# The binary must match the pinned sha256 (deploy/node/bin/3proxy-pergb.sha256,
+# installed next to it). ExecStartPre (as root, `+`) also stamps the sha256 of
+# the cfg about to be loaded into /run/netrun-pergb/applied/<sp>.sha256: the
+# agent restarts a range only when that differs from the file.
+[Unit]
+Description=NETRUN per-GB 3proxy (shared ports from %i)
+Documentation=file:///opt/netrun/README.md
+After=network-online.target netrun-radius.socket netrun-bgp-prefix.service
+Wants=network-online.target netrun-radius.socket
+PartOf=netrun-pergb.target
+RequiresMountsFor=/var/log/netrun-pergb
+StartLimitIntervalSec=0
+ConditionPathExists=/opt/netrun/pergb/cfg/pergb_%i.cfg
+
+[Service]
+Type=simple
+User=netrun-pergb
+Group=netrun-pergb
+Slice=netrun-pergb.slice
+WorkingDirectory=/opt/netrun/pergb/bin
+ExecStartPre=/usr/bin/sha256sum --quiet --strict --check /opt/netrun/pergb/bin/3proxy-pergb.sha256
+ExecStartPre=+/bin/sh -c 'mkdir -p /run/netrun-pergb/applied && sha256sum < /opt/netrun/pergb/cfg/pergb_%i.cfg > /run/netrun-pergb/applied/%i.sha256'
+ExecStart=/opt/netrun/pergb/bin/3proxy-pergb /opt/netrun/pergb/cfg/pergb_%i.cfg
+Restart=always
+RestartSec=1
+TimeoutStopSec=15
+UMask=0027
+LimitNOFILE=1048576
+LimitNPROC=infinity
+TasksMax=infinity
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/netrun-pergb
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=netrun-pergb.target

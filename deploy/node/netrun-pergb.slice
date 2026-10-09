@@ -1,0 +1,17 @@
+# NETRUN pay-per-GB v2 — every per-GB process (netrun-radius, the
+# 3proxy-pergb ranges, the per-GB haproxy) runs here, so per-GB can never
+# starve the per-piece batches of memory or tasks. cgroup:
+# /netrun.slice/netrun-pergb.slice. Installed by deploy/node/install_pergb.sh
+# with the values from NETRUN_PERGB_MEM_MAX (1536M; MemoryHigh = 85 %),
+# NETRUN_PERGB_CPU_WEIGHT (50) and NETRUN_PERGB_MAX_CONNS (8000; TasksMax =
+# 2 x 1000 listeners + maxConns + 500); the agent's enable drop-in
+# (netrun-pergb.slice.d/50-netrun-enable.conf) overrides them per node.
+[Unit]
+Description=NETRUN per-GB resource limits (RADIUS, 3proxy-pergb, haproxy)
+Before=slices.target
+
+[Slice]
+CPUWeight=50
+MemoryHigh=1305M
+MemoryMax=1536M
+TasksMax=10500

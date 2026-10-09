@@ -1,0 +1,15 @@
+# NETRUN pay-per-GB v2 — the per-GB logs on a filesystem of their own (a
+# loop image), so they can never fill the root filesystem the per-piece
+# batches depend on. Installed by deploy/node/install_pergb.sh as
+# /etc/systemd/system/var-log-netrun\x2dpergb.mount (@IMAGE@ / @WHERE@
+# filled in); pulled in by the per-GB units (RequiresMountsFor), not enabled.
+[Unit]
+Description=NETRUN per-GB log filesystem (loop image)
+RequiresMountsFor=@IMAGE_DIR@
+Before=netrun-pergb.target
+
+[Mount]
+What=@IMAGE@
+Where=@WHERE@
+Type=ext4
+Options=loop,noatime,nodev,nosuid,noexec
