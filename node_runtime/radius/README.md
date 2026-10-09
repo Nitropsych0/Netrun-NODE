@@ -113,6 +113,11 @@ All of I5. Additions (all additive):
   `excluded_shrink`, `capacity`, `ref_conflict`, `unknown_account`,
   `not_ready`, `db_write_failed`, `internal`.
 
+`heartbeat`, `admission` and `ipv4_admission` are not committed before the
+reply: admission is in memory only (open after a restart until the agent's next
+guard tick), the last heartbeat is written by the batch writer. Every other
+state-changing op is durable when it replies.
+
 Types: `epoch` is a random integer in `[2^32, 2^53)` (safe in JavaScript);
 `seq` an integer; list `login` is stored as `netrun-<id>` (a bare id is
 prefixed); `bindings` items carry `at` as unix seconds (float).

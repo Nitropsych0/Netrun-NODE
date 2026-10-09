@@ -797,6 +797,7 @@ class Engine:
         return self.store.prune_events(now - EVENT_RETENTION_SEC)
 
     def latency(self):
+        """(p50, p99) in ms over the last LAT_SAMPLES requests (the copy is taken at once)."""
         n = self.lat_n
         if not n:
             return None, None
@@ -807,8 +808,8 @@ class Engine:
 
     def op_status(self, req):
         now = self.clock()
+        p50, p99 = self.latency()
         with self.lock:
-            p50, p99 = self.latency()
             out = {
                 "epoch": self.epoch,
                 "seq": self.seq,
