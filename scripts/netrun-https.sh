@@ -33,12 +33,16 @@
 # to $HOSTNAMES_FILE and starts `certs` detached:
 #   1. outside the sync lock, under the ACME lock (/run/netrun/https-acme.lock,
 #      also taken by the IP renewal: one HTTP-01 client on :80 at a time): every
-#      listed name whose A record (the node's own resolver) is exactly the
-#      public IPv4 — or, with pay-per-GB option B, exactly the dedicated per-GB
-#      IPv4 of /etc/netrun-pergb/enable.json (its host names point there; its
-#      :80 answers HTTP-01 too) — gets `lego run` (default profile, LEGO_DIR kept, so a renewal
-#      is `run` again) once its certificate is missing or within
-#      NETRUN_HTTPS_HOST_RENEW_DAYS (30) of expiry. A name that does not point
+#      listed name whose A record is exactly the public IPv4 — or, with
+#      pay-per-GB option B, exactly the dedicated per-GB IPv4 of
+#      /etc/netrun-pergb/enable.json (its host names point there; its :80
+#      answers HTTP-01 too) — gets `lego run` (default profile, LEGO_DIR kept,
+#      so a renewal is `run` again) once its certificate is missing or within
+#      NETRUN_HTTPS_HOST_RENEW_DAYS (30) of expiry. "Points here": the node's
+#      own resolver says so; or, when it says otherwise (a stale cache entry,
+#      NETRUN Chicago 2026-10-09), EVERY public resolver gives exactly the
+#      node's address — then `unbound-control flush <name>` drops the stale
+#      entry (that name only; see host_points_here). A name that does not point
 #      here is skipped and never sent to the CA (failed validations count
 #      against Let's Encrypt limits); a name whose lego run failed waits
 #      NETRUN_HTTPS_ACME_RETRY_MIN (60) before the next try (the time of the
@@ -74,6 +78,9 @@
 #     the reload's exit code.
 #   NETRUN_HTTPS_RELOAD_MAX_AGE_H (6)  reload anyway when the last applied
 #     reload is older than this (a safety net; 0 = never).
+#   NETRUN_HTTPS_PUBLIC_RESOLVERS ("1.1.1.1 8.8.8.8")  the resolvers asked
+#     when the node's own resolver says a hostname does not point here (IP
+#     literals; "off" = the node's resolver alone, as before 2026-10-09).
 #
 # Reload stamp (audit follow-up): the frontend set is validated with
 # `haproxy -c` BEFORE it replaces /etc/haproxy/netrun.d (a set haproxy rejects
@@ -243,6 +250,94 @@ resolve_ipv4() {
   return 0
 }
 
+# The public resolvers of NETRUN_HTTPS_PUBLIC_RESOLVERS, one per line: IP
+# literals only (each becomes a dig argument); nothing when "off".
+public_resolvers() {
+  local list r
+  list="$(netrun_setting NETRUN_HTTPS_PUBLIC_RESOLVERS "1.1.1.1 8.8.8.8")"
+  case "$(printf '%s' "$list" | tr '[:upper:]' '[:lower:]')" in 0|off|false|no|none) return 0 ;; esac
+  for r in $(printf '%s' "$list" | tr ',' ' '); do
+    if [[ "$r" =~ ^[0-9]+(\.[0-9]+){3}$ || "$r" =~ ^[0-9A-Fa-f]*:[0-9A-Fa-f:.]*$ ]]; then
+      printf '%s\n' "$r"
+    fi
+  done
+}
+
+# The A records public resolver $2 gives for $1, sorted, one per line;
+# nothing for an NXDOMAIN / empty answer. Exit 1 when there is no reply
+# (dig timed out, or there is no dig).
+public_resolve_ipv4() {
+  local out
+  command -v dig >/dev/null 2>&1 || return 1
+  out="$(dig +short +time=3 +tries=2 A "$1" "@$2" 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' | sort -u
+}
+
+# 0 when the address list $1 (space-separated) is exactly $2 or exactly $3.
+addrs_here() {
+  [ -n "$1" ] && { [ "$1" = "$2" ] || { [ -n "${3:-}" ] && [ "$1" = "$3" ]; }; }
+}
+
+# Removes name $1 from the node's unbound cache, including a cached NXDOMAIN
+# or NODATA for it. Only that name is flushed, never the whole cache.
+# 1 when unbound-control is missing or fails.
+unbound_flush_name() {
+  command -v unbound-control >/dev/null 2>&1 || return 1
+  unbound-control flush "$1" >/dev/null 2>&1
+}
+
+# 0 when hostname $1 points here: its A records are exactly $2 (the public
+# IPv4) or exactly $3 (the per-GB IPv4 of option B). The node's own resolver
+# is asked first, and when it says so that is the answer (as before).
+#
+# NETRUN Chicago, 2026-10-09: the node's unbound looked up new names a moment
+# before the orchestrator created their records. It cached the NXDOMAIN for
+# the zone's negative TTL (1800 s), so every run skipped the names while
+# 1.1.1.1 and 8.8.8.8 already gave the node's address. Since then, when the
+# node's resolver says no, the public resolvers (public_resolvers) are asked.
+# The name counts as pointing here only when EVERY one of them replies with
+# the same address list and that list is exactly the node's address. Partial
+# agreement, a missing reply or another address means a skip, as before.
+# When they all agree, the node's answer is a stale cache entry:
+# `unbound-control flush <name>` drops that one name and the node's resolver
+# is asked once more. If its answer is still wrong, the public resolvers'
+# verdict stands; the CA never asks this node's resolver.
+# Sets DNS_LOCAL (the node's answer) and DNS_PUBLIC (what each public
+# resolver said; empty when none was asked) for the caller's note.
+host_points_here() {
+  local h="$1" ip="$2" pergb="${3:-}" r pub first="" n=0 agree=1 stale now
+  DNS_LOCAL="$(resolve_ipv4 "$h" | tr '\n' ' ')"
+  DNS_LOCAL="${DNS_LOCAL% }"
+  DNS_PUBLIC=""
+  addrs_here "$DNS_LOCAL" "$ip" "$pergb" && return 0
+  for r in $(public_resolvers); do
+    n=$((n + 1))
+    if pub="$(public_resolve_ipv4 "$h" "$r")"; then
+      pub="$(printf '%s' "$pub" | tr '\n' ' ')"
+      DNS_PUBLIC="${DNS_PUBLIC:+$DNS_PUBLIC, }@$r ${pub:-missing}"
+    else
+      pub=""
+      DNS_PUBLIC="${DNS_PUBLIC:+$DNS_PUBLIC, }@$r no reply"
+    fi
+    [ "$n" != 1 ] || first="$pub"
+    [ -n "$pub" ] && [ "$pub" = "$first" ] || agree=0
+  done
+  [ "$n" -gt 0 ] && [ "$agree" = 1 ] && addrs_here "$first" "$ip" "$pergb" || return 1
+  stale="${DNS_LOCAL:-missing}"
+  if ! unbound_flush_name "$h"; then
+    log "WARNING: $h: the node's resolver answers $stale but every public resolver gives $first — unbound-control flush $h failed; going by the public resolvers"
+    return 0
+  fi
+  now="$(resolve_ipv4 "$h" | tr '\n' ' ')"
+  now="${now% }"
+  if addrs_here "$now" "$ip" "$pergb"; then
+    log "$h: the node's resolver had a stale answer ($stale; every public resolver: $first) — flushed from unbound, it now answers $now"
+  else
+    log "WARNING: $h: the node's resolver still answers ${now:-missing} after unbound-control flush $h but every public resolver gives $first — going by the public resolvers"
+  fi
+  return 0
+}
+
 # 0 when certificate file $2 (key: $3, default the same file — a PEM holds
 # both) is for hostname $1 (a DNS name in its subjectAltName), has not
 # expired (or, with $4 seconds, does not expire within them) and matches the key.
@@ -304,18 +399,16 @@ file_sha256() {
 # lego 5 `run` decides about a renewal itself: what happened is read from the
 # certificate file (sha256 before / after), never assumed.
 certs_obtain() {
-  local ip="$1" h addrs days crt errf rc failed=0 before after msg pergb
+  local ip="$1" h days crt errf rc failed=0 before after msg pergb
   [ -n "$ip" ] || { log "ERROR: cannot detect the public IPv4 — no hostname certificate"; return 1; }
   days="$(netrun_setting NETRUN_HTTPS_HOST_RENEW_DAYS 30)"
   case "$days" in ''|*[!0-9]*) days=30 ;; esac
   # pay-per-GB option B: a name may point at the dedicated per-GB IPv4 instead
   pergb="$(pergb_ipv4 "$ip")"
   for h in $(https_hostnames); do
-    addrs="$(resolve_ipv4 "$h" | tr '\n' ' ')"
-    addrs="${addrs% }"
-    if [ "$addrs" != "$ip" ] && { [ -z "$pergb" ] || [ "$addrs" != "$pergb" ]; }; then
-      log "skip $h: its A record is ${addrs:-missing}, not $ip${pergb:+ or $pergb (per-GB)} — not sent to the CA"
-      host_note "$h" "dns: A ${addrs:-missing}, not $ip${pergb:+ or $pergb}"
+    if ! host_points_here "$h" "$ip" "$pergb"; then
+      log "skip $h: its A record is ${DNS_LOCAL:-missing}, not $ip${pergb:+ or $pergb (per-GB)}${DNS_PUBLIC:+ (public resolvers: $DNS_PUBLIC)} — not sent to the CA"
+      host_note "$h" "dns: A ${DNS_LOCAL:-missing}, not $ip${pergb:+ or $pergb}${DNS_PUBLIC:+ (public resolvers: $DNS_PUBLIC)}"
       continue
     fi
     crt="$LEGO_DIR/certificates/$h.crt"

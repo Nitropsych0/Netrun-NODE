@@ -440,11 +440,19 @@ haproxy's TLS terminator now loads a crt-list and picks the certificate by SNI.
   `500 issue_start_failed`. `GET /https/hostnames` and `/health httpsHostnames` (cached 5 s)
   show the list, the certificate per name and `issuing`.
 - `netrun-https certs` (also run by `renew`, twice a day, after the IP certificate): for every
-  listed name whose A record (the node's resolver) is exactly the public IPv4, `lego run`
+  listed name whose A record is exactly the public IPv4, `lego run`
   (default profile, same `--path /etc/netrun/lego`) when its certificate is missing or within
   `NETRUN_HTTPS_HOST_RENEW_DAYS` (30) of expiry — outside the sync lock, under
-  `/run/netrun/https-acme.lock` (the IP renewal takes it too: one HTTP-01 client on :80). A
-  name pointing elsewhere is skipped and never sent to the CA; a failed name waits
+  `/run/netrun/https-acme.lock` (the IP renewal takes it too: one HTTP-01 client on :80). When
+  the node's resolver says a name does not point here, the public resolvers
+  (`NETRUN_HTTPS_PUBLIC_RESOLVERS`, default `1.1.1.1 8.8.8.8`; `off` = the node's resolver
+  alone) are asked. A name the node's unbound has a stale answer for (NETRUN Chicago,
+  2026-10-09: an NXDOMAIN cached a moment before the orchestrator created the record) counts
+  as pointing here only when EVERY public resolver gives exactly the node's address. Then
+  `unbound-control flush <name>` drops that one name from unbound's cache and the node's
+  resolver is asked once more. A partial or missing public answer is a skip, as before. A
+  name pointing elsewhere is skipped and never sent to the CA; its `dns:` note lists what
+  each public resolver said. A failed name waits
   `NETRUN_HTTPS_ACME_RETRY_MIN` (60) minutes (the time of its last failure:
   `hosts/<name>.acme-failed`, apart from the note — a `dns:` note never resets it; a name only
   waiting does not fail the run, so `netrun-https-renew.service` is not "failed" for it); one
