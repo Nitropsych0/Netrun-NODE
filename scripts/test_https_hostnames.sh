@@ -210,6 +210,34 @@ ok "hostname list: lowercase FQDNs, deduplicated, IPs / wildcards / bad labels d
 ) || fail "ACME step"
 ok "ACME step: a name whose A record is not exactly the node IPv4 never reaches lego; one failing name never stops the others; fresh certs skipped; failed names back off (not a failure; a dns: note never resets it); obtained / renewed / unchanged logged from the file"
 
+# ── 2b. pay-per-GB option B: a name may point at the dedicated per-GB IPv4 ──
+(
+  fresh pergb; load
+  export NETRUN_PERGB_ENABLE_FILE="$D/enable.json"
+  printf '%s\n' us-1.proxy.netrun.lol us1.proxy.netrun.lol other.example.com > "$HOSTNAMES_FILE"
+  dns us-1.proxy.netrun.lol 45.32.99.7; dns us1.proxy.netrun.lol "$IP"; dns other.example.com 9.9.9.9
+  # no per-GB: only the public IPv4 counts
+  certs_obtain "$IP" || exit 1
+  [ "$(lego_calls us-1.proxy.netrun.lol)" = 0 ] && [ "$(lego_calls us1.proxy.netrun.lol)" = 1 ] || { cat "$STUB_LOG"; exit 1; }
+  grep -qx "dns: A 45.32.99.7, not $IP" "$HOSTS_DIR/us-1.proxy.netrun.lol.error" || exit 1
+  # option A (egressIpv4 null or = the public IPv4): the same
+  printf '{"base":31000,"count":1000,"egressIpv4":"%s"}' "$IP" > "$NETRUN_PERGB_ENABLE_FILE"
+  [ -z "$(pergb_ipv4 "$IP")" ] || { echo "option A has no per-GB IPv4"; exit 1; }
+  # option B: the per-GB host name gets its certificate; a foreign name still does not
+  printf '{"base":10000,"count":1000,"egressIpv4":"45.32.99.7"}' > "$NETRUN_PERGB_ENABLE_FILE"
+  [ "$(pergb_ipv4 "$IP")" = 45.32.99.7 ] || exit 1
+  : > "$STUB_LOG"; : > "$D/log"
+  certs_obtain "$IP" || { cat "$D/log"; exit 1; }
+  [ "$(lego_calls us-1.proxy.netrun.lol)" = 1 ] || { echo "the per-GB host name did not reach lego"; cat "$STUB_LOG"; exit 1; }
+  [ "$(lego_calls other.example.com)" = 0 ] || exit 1
+  grep -qx "dns: A 9.9.9.9, not $IP or 45.32.99.7" "$HOSTS_DIR/other.example.com.error" || { cat "$HOSTS_DIR/other.example.com.error"; exit 1; }
+  printf '{"base":10000,"enabled":false,"egressIpv4":"45.32.99.7"}' > "$NETRUN_PERGB_ENABLE_FILE"
+  [ -z "$(pergb_ipv4 "$IP")" ] || exit 1
+  printf 'not json' > "$NETRUN_PERGB_ENABLE_FILE"
+  [ -z "$(pergb_ipv4 "$IP")" ] || exit 1
+) || fail "ACME step, pay-per-GB option B"
+ok "ACME step: with a dedicated per-GB IPv4 (option B) a name pointing at it gets its certificate; option A / no per-GB / a broken enable.json: the public IPv4 only"
+
 # ── 3. apply step: crt-list (IP first), PEMs 0600, stale removal, reload only on change ──
 (
   fresh apply; load

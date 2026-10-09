@@ -1,6 +1,6 @@
 # Pay-per-GB v2 — the Linux-only checks of the node side (netns, nft,
 # systemd, Docker builds, haproxy). Jobs are prefixed with their lane:
-# l1- (netrun-radius), l2- (per-GB runtime), l3- (node agent per-GB).
+# l1- (netrun-radius), l2- (per-GB runtime), l3- (node agent per-GB), l9- (node shields).
 name: pergb-linux
 
 on:
@@ -152,3 +152,31 @@ jobs:
       - run: bash scripts/test_3proxy_spawn.sh
       - run: bash scripts/test_capacity_18k_node.sh
       - run: bash scripts/test_fleet_health_node.sh
+
+  # Lane L9 — node shields: the A1 address pool (generator, egress.js,
+  # deprovision), option A / B shields (accounting, firewall, deprovision,
+  # netrun-https), /health clock, /describe capacity, the :8086 agent guard.
+  l9-node-shields:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Tools (nftables, haproxy, openssl)
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables haproxy openssl iproute2 >/dev/null
+          nft --version; haproxy -v | head -n1; node --version; python3 --version
+      - name: Node agent tests (node --test)
+        working-directory: node_runtime/node_agent
+        run: node --test
+      - name: Generator, harden and HTTPS scripts (bash, stubs)
+        run: |
+          bash scripts/test_generator_flags.sh
+          bash node_runtime/soft/generator/test_routed_prefix.sh
+          bash scripts/test_netrun_harden_security.sh
+          bash scripts/test_https_hostnames.sh
+      - name: Per-GB nft shields against the real kernel (private netns)
+        run: sudo env "PATH=$PATH" unshare -n bash scripts/test_pergb_nft_shield.sh

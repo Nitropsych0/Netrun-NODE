@@ -22,6 +22,11 @@ const firewallLib = require("./firewall.js");
 const proxySpawn = require("./proxy_spawn.js");
 const httpsHostnamesLib = require("./https_hostnames.js");
 const { nodeSetting } = require("./node_settings.js");
+// Pay-per-GB v2 (lane L9) — the A1 address pool (release of per-piece /64s)
+// and /health clock.ntpSynchronized.
+const pergbPool = require("./pergb_pool.js");
+const pergbShield = require("./pergb_shield.js");
+const clockSync = require("./clock_sync.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 // Wave FLEET-HEALTH (RES-10) — bind address. The unit template has always set
@@ -1209,6 +1214,11 @@ async function collectRunningInstances() {
     if (!cmd.includes("3proxy")) {
       continue;
     }
+    // Pay-per-GB v2 — the per-GB 3proxy (own binary and cfgs, D3) is no
+    // per-piece instance: it would read as a duplicate "unknown_cfg" batch.
+    if (pergbShield.isPergbProcessCmd(cmd)) {
+      continue;
+    }
 
     const cfgMatch = cmd.match(cfgRegex);
     const cfgPath = cfgMatch ? path.normalize(cfgMatch[0]) : "";
@@ -1574,6 +1584,9 @@ async function killOverlappingListeners({ newStart, newCount, reclaimStartPorts 
     } catch (_error) {
       ports = [];
     }
+    // AMENDMENT A1 — the torn-down batch's /64s go back to the per-GB pool
+    // (only those nothing per-piece names any more; a no-op without per-GB).
+    const pergbNets = pergbPool.poolPresent() ? pergbPool.collectFileNets(perStartPortFiles(startPort)) : new Set();
     try {
       for (const filePath of perStartPortFiles(startPort)) {
         await safeUnlink(filePath);
@@ -1591,6 +1604,9 @@ async function killOverlappingListeners({ newStart, newCount, reclaimStartPorts 
       } catch (_error) {
         // best effort, as in /deprovision
       }
+    }
+    if (pergbNets.size) {
+      await pergbPool.releaseUnusedNets(pergbNets, { proxyRoot: PROXY_ROOT, ref: pergbPool.newRef("rebind", startPort) });
     }
   }
 
@@ -3516,7 +3532,13 @@ async function handleGenerate(req, res) {
       credentialsFileCreated = true;
     }
     if (freshAddresses) {
+      // AMENDMENT A1 — the dropped list's /64s go back to the per-GB pool
+      // unless something per-piece still names them.
+      const staleNets = pergbPool.poolPresent() ? pergbPool.collectFileNets([buildIpv6ListPath(params.startPort)]) : new Set();
       await safeUnlink(buildIpv6ListPath(params.startPort));
+      if (staleNets.size) {
+        await pergbPool.releaseUnusedNets(staleNets, { proxyRoot: PROXY_ROOT, ref: pergbPool.newRef("fresh", params.startPort) });
+      }
     }
 
     markJobStatus(jobMeta, "running");
@@ -4142,13 +4164,14 @@ async function handleHealth(req, res) {
     if (p > 0) probePorts.add(p);
   }
   for (const c of inventory.cfgs) probePorts.add(probeOf(c.startPort));
-  const [ipv6Check, dnsCheck, listenState, ipv6Addresses, httpsHostnamesStatus, ipv6EgressRouted] = await Promise.all([
+  const [ipv6Check, dnsCheck, listenState, ipv6Addresses, httpsHostnamesStatus, ipv6EgressRouted, clock] = await Promise.all([
     checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
     checkDns(5000),
     listListeningExactPorts([...probePorts]),
     ipv6Coverage.get(),
     httpsHostnames.healthStatus(),
     routedEgress.get(),
+    clockSync.status(),
   ]);
   // Wave NODE-GENLOCK-HARDENING — 3proxy readiness, additive. Lets the
   // orchestrator distinguish "agent up but 3proxy not listening yet" (fresh
@@ -4269,6 +4292,10 @@ async function handleHealth(req, res) {
     // reason, the NIC /64, the routed prefixes the exit guard covers, and
     // rotate_prefix — where new addresses come from (the routed /48 or the /64).
     egress: egress.status(),
+    // Pay-per-GB v2 — additive. { ntpSynchronized: true | false | null
+    // (unknown), source, checkedAt, error }: the per-GB gate needs a synced
+    // clock (nodes enforce expiresAt locally).
+    clock,
   });
 }
 
@@ -4412,6 +4439,10 @@ const server = http.createServer(async (req, res) => {
       if (err && err.code === "PORT_NOT_FOUND") {
         return sendJson(res, 404, { success: false, error: "port_not_found", port });
       }
+      // Pay-per-GB v2 (option A) — a per-GB shared port is no account.
+      if (err && err.code === "PERGB_SHARED_PORT") {
+        return sendJson(res, 409, { success: false, error: "pergb_shared_port", port });
+      }
       return sendJson(res, 500, {
         success: false,
         error: action === "disable" ? "disable_failed" : "enable_failed",
@@ -4509,7 +4540,9 @@ const server = http.createServer(async (req, res) => {
           // status only
         }
       }
-      return sendJson(res, 200, { success: result.ok, ...result });
+      // Pay-per-GB v2 — 409 pergb_shared_port when only shared ports were asked.
+      const { httpStatus, ...body } = result;
+      return sendJson(res, httpStatus || 200, { success: result.ok, ...body });
     } catch (err) {
       return sendJson(res, 500, {
         success: false,

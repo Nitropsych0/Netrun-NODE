@@ -114,6 +114,22 @@
 // reuses it instead of adding EGRESS_POOL_SIZE each time), and the node holds
 // at most EGRESS_MAX_EXTRA_ADDRS current + pool + draining addresses.
 //
+// Pay-per-GB v2, AMENDMENT A1 (lane L9). On a per-GB node
+// (/etc/netrun/pergb-pool.conf, pergb_pool.js) the routed /48 is one pool
+// whose allocator of record is netrun-radius: a /64 of the pool is taken ONLY
+// through RADIUS reserve_nets (provisionRouted; one /64 per address, never a
+// blind pick, no sharing fallback — a port that gets none fails with
+// address_add_failed), and /64s of the rotation prefix outside the pool (none
+// with the default POOL=0000-fffe) are picked here as before. Every /64 taken
+// that way is journaled in the state (`pergb_held`: { net, ref }) BEFORE it is
+// used; once no address of the state is in it any more (drained and
+// forgotten, dropped at a start) the GC tick hands it back (release_nets,
+// 24 h cool-down in RADIUS) and only then forgets the record — a failed call
+// is retried on the next tick. pergbExcludedNets(lo, hi) is the per-piece side
+// of RADIUS's `excluded` set (cfg anchors incl. .disabled / .failed, lists,
+// this module's addresses and reservations). Without the pool file nothing
+// here changes.
+//
 // Boot: other writers save the whole ruleset (`nft list ruleset >
 // /etc/nftables.conf`), this table included, and its proxy entries are gone
 // after a reboot. A drop-in on nftables.service (written at start, see
@@ -126,6 +142,7 @@ const net = require("net");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
 const { nodeSetting } = require("./node_settings.js");
+const pergbPool = require("./pergb_pool.js");
 
 const DEFAULT_PROXY_ROOT = "/opt/netrun/proxyserver";
 const STATE_FILENAME = "egress_state.json";
@@ -433,6 +450,51 @@ function generateRoutedAddresses(prefixText, count, usedNets, randomBytes = cryp
   return { addrs, shared };
 }
 
+// AMENDMENT A1 — up to `count` free /64s (BigInt keys) of a routed prefix
+// that lie OUTSIDE the per-GB pool range (`pool` = { lo, hi } absolute /64
+// keys), none of `usedNets` / `never`, each taken once. No sharing: fewer
+// than `count` when that is all there is (the rest must come from RADIUS).
+function pickOutsidePool(prefixText, count, usedNets, never, pool, randomBytes = crypto.randomBytes) {
+  const [addrText, lenText] = String(prefixText).split("/");
+  const nets = 1n << BigInt(64 - Number(lenText));
+  const base = (groupsToBig(ipv6Groups(addrText)) >> 64n) & ~(nets - 1n);
+  const end = base + nets - 1n;
+  const pLo = pool.lo > base ? pool.lo : base;
+  const pHi = pool.hi < end ? pool.hi : end;
+  const inPoolRange = (k) => k >= pool.lo && k <= pool.hi;
+  const blocked = (k) => inPoolRange(k) || usedNets.has(k) || never.has(k);
+  let outside = nets - (pHi >= pLo ? pHi - pLo + 1n : 0n);
+  for (const k of never) if (k >= base && k <= end && !inPoolRange(k)) outside -= 1n;
+  if (count <= 0 || outside <= 0n) return [];
+  const rand64 = () => randomBytes(8).readBigUInt64BE(0);
+  const out = [];
+  if (nets <= 1n << 20n) {
+    const free = [];
+    for (let k = base; k <= end; k += 1n) {
+      if (k === pLo && pHi >= pLo) {
+        k = pHi;
+        continue;
+      }
+      if (!blocked(k)) free.push(k);
+    }
+    while (out.length < count && free.length) {
+      const j = Number(rand64() % BigInt(free.length));
+      out.push(free[j]);
+      free[j] = free[free.length - 1];
+      free.pop();
+    }
+    return out;
+  }
+  const taken = new Set();
+  for (let tries = 0; out.length < count && tries < count * 64 + 256; tries += 1) {
+    const k = base + (rand64() & (nets - 1n));
+    if (blocked(k) || taken.has(k)) continue;
+    taken.add(k);
+    out.push(k);
+  }
+  return out;
+}
+
 // ── cfg anchors and `ip` output ──────────────────────────────────────────
 
 // socks lines of one cfg -> Map port -> raw `-e` token (null when absent).
@@ -589,7 +651,7 @@ function emptyState() {
 function cloneState(s) {
   const ports = {};
   for (const [k, v] of Object.entries(s.ports)) ports[k] = { ...v };
-  return {
+  const out = {
     version: STATE_VERSION,
     ports,
     pool: s.pool.slice(),
@@ -597,6 +659,10 @@ function cloneState(s) {
     pool_idle_since: s.pool_idle_since || null,
     draining: s.draining.map((d) => ({ ...d })),
   };
+  // AMENDMENT A1 — /64s reserved from the per-GB pool, not handed back yet
+  // (absent when there are none: the file of a node without per-GB is as before)
+  if (Array.isArray(s.pergb_held) && s.pergb_held.length) out.pergb_held = s.pergb_held.map((h) => ({ ...h }));
+  return out;
 }
 
 function serializeState(s) {
@@ -676,7 +742,35 @@ function sanitizeState(raw) {
     const port = d && Number.isInteger(d.port) && d.port >= 1 && d.port <= 65535 ? d.port : null;
     if (addr && Number.isFinite(until)) addDraining(s, addr, until, port);
   }
+  // AMENDMENT A1 — { net: "<prefix>/64", ref } records of reserved pool /64s
+  const held = new Map();
+  for (const h of Array.isArray(raw.pergb_held) ? raw.pergb_held : []) {
+    const text = h && typeof h.net === "string" ? h.net.trim() : "";
+    const m = /^([0-9a-fA-F:]+)\/64$/.exec(text);
+    const k = m ? net64Of(m[1]) : null;
+    const ref = h && typeof h.ref === "string" && /^[A-Za-z0-9:._-]{1,128}$/.test(h.ref) ? h.ref : "egress";
+    if (k !== null) held.set(String(k), { net: heldNetText(k), ref });
+  }
+  if (held.size) s.pergb_held = [...held.values()];
   return s;
+}
+
+// A /64 key -> the `pergb_held` text "<prefix>::/64".
+function heldNetText(key) {
+  return `${formatIpv6(bigToGroups(BigInt(key) << 64n))}/64`;
+}
+
+// A `pergb_held` record -> its /64 key (BigInt), or null.
+function heldKey(h) {
+  return h && typeof h.net === "string" ? net64Of(h.net.replace(/\/64$/, "")) : null;
+}
+
+// AMENDMENT A1 — a call's next state is built from the state before it; the
+// reservations its provisioning journaled ride along (journal ⊇ before).
+function carryHeld(next, journal) {
+  if (journal && Array.isArray(journal.pergb_held) && journal.pergb_held.length) {
+    next.pergb_held = journal.pergb_held.map((h) => ({ ...h }));
+  }
 }
 
 // ── pure planners ────────────────────────────────────────────────────────
@@ -1245,8 +1339,10 @@ function createEgressService({
   randomBytes = crypto.randomBytes,
   findBin = findExecutable,
   log = console,
+  pergb = null, // AMENDMENT A1 — the per-GB pool access (pergb_pool.createPoolAccess)
 } = {}) {
   const cfg = readConfig(env);
+  const pool = pergb || pergbPool.createPoolAccess({ env, log });
   const cfgDir = path.join(cfg.proxyRoot, "3proxy");
   const statePath = path.join(cfg.proxyRoot, STATE_FILENAME);
   const withLock = createMutex();
@@ -1811,7 +1907,16 @@ function createEgressService({
   // Rotation inside a routed prefix: every address of it is local (its `local
   // … dev lo` route), so nothing is provisioned — the address is journaled and
   // usable at once. Each one gets a /64 nothing else uses.
-  function provisionRouted(before, count, cfgAnchors, nowMs) {
+  async function provisionRouted(before, count, cfgAnchors, nowMs) {
+    const ps = pool.state();
+    if (ps.state === "error") {
+      // a per-GB node whose pool file cannot be read: nothing is picked blind
+      log.error(`[egress] per-GB pool file unusable (${ps.error}): no /64 of ${rotation} is handed out until it is fixed`);
+      return { journal: null, fresh: [], present: new Set() };
+    }
+    if (ps.state === "on" && pergbPool.poolOverlaps(ps.pool, rotation)) {
+      return provisionFromPool(ps.pool, before, count, cfgAnchors, nowMs);
+    }
     const { addrs, shared } = generateRoutedAddresses(rotation, count, usedNets(cfgAnchors, before), randomBytes, reservedNets());
     if (shared) log.error(`[egress] ${rotation}: no free /64 left; ${shared} address(es) share a /64`);
     const journal = cloneState(before);
@@ -1822,6 +1927,157 @@ function createEgressService({
       throw new EgressUnavailableError(`state_write_failed: ${errText(err)}`);
     }
     return { journal, fresh: addrs, present: new Set(addrs) };
+  }
+
+  // AMENDMENT A1 — a per-GB node: /64s outside the pool range are picked
+  // here, the rest is lent by RADIUS (reserve_nets) and journaled in
+  // `pergb_held` with the draining-now addresses BEFORE anything uses them.
+  // A /64 RADIUS lends that per-piece already uses (its `excluded` set is
+  // behind) stays reserved and is not used; one more reservation asks for the
+  // shortfall. Whatever cannot be had is not handed out (no sharing).
+  async function provisionFromPool(poolRange, before, count, cfgAnchors, nowMs) {
+    const used = usedNets(cfgAnchors, before);
+    const never = reservedNets();
+    const local = pickOutsidePool(rotation, count, used, never, poolRange, randomBytes);
+    const lent = [];
+    const taken = new Set(local);
+    const unroutable = [];
+    for (let attempt = 0; attempt < 2 && local.length + lent.length < count; attempt += 1) {
+      const want = Math.min(pergbPool.RESERVE_MAX, count - local.length - lent.length);
+      const ref = pergbPool.newRef("egress");
+      let got;
+      try {
+        got = await pool.reserve({ count: want, ref });
+      } catch (err) {
+        log.error(`[egress] per-GB pool: reserve_nets of ${want} /64(s) failed (${errText(err)}); ${want} address(es) not handed out`);
+        break;
+      }
+      let conflicts = 0;
+      for (const k of got.nets) {
+        if (used.has(k) || never.has(k) || taken.has(k)) {
+          conflicts += 1;
+          continue;
+        }
+        // only a routed /64 is local (`local … dev lo`): anything else would leave nowhere
+        if (!inRoutedPrefix(formatIpv6(bigToGroups(k << 64n)), routed)) {
+          unroutable.push(k);
+          continue;
+        }
+        taken.add(k);
+        lent.push({ net: k, ref: got.ref || ref });
+      }
+      if (unroutable.length) break;
+      if (conflicts === 0) break;
+      log.error(`[egress] per-GB pool: reserve_nets lent ${conflicts} /64(s) per-piece already uses (RADIUS's excluded set is behind); they stay reserved`);
+    }
+    if (unroutable.length) {
+      log.error(`[egress] per-GB pool: ${unroutable.length} lent /64(s) are not routed to this host; handed back`);
+      try {
+        await pool.release({ nets: unroutable, ref: pergbPool.newRef("egress-unroutable") });
+      } catch (err) {
+        log.error(`[egress] per-GB pool: release_nets of unroutable /64(s) failed (${errText(err)})`);
+      }
+    }
+    const short = count - local.length - lent.length;
+    if (short > 0) log.error(`[egress] per-GB pool: ${short} of ${count} address(es) could not get a /64 of ${rotation}`);
+    const rand64 = () => randomBytes(8).readBigUInt64BE(0);
+    const addrOf = (k) => {
+      let host = rand64();
+      while (host >> 32n === 0n) host = rand64();
+      return formatIpv6(bigToGroups((k << 64n) | host));
+    };
+    const addrs = [...local, ...lent.map((l) => l.net)].map(addrOf);
+    const journal = cloneState(before);
+    for (const a of addrs) addDraining(journal, a, nowMs);
+    if (lent.length) {
+      journal.pergb_held = [...(journal.pergb_held || []), ...lent.map((l) => ({ net: heldNetText(l.net), ref: l.ref }))];
+    }
+    try {
+      persist(journal);
+    } catch (err) {
+      // the reservations stay in RADIUS (out of per-GB's reach): leaked, never double-used
+      throw new EgressUnavailableError(`state_write_failed: ${errText(err)}`);
+    }
+    return { journal, fresh: addrs, present: new Set(addrs) };
+  }
+
+  // AMENDMENT A1 — pool /64s of `pergb_held` no address of the state is in
+  // any more go back to RADIUS (release_nets, by the ref they were lent
+  // under); the record goes once RADIUS acked. One that a cfg anchor or a
+  // list names now is per-piece's: its record goes, its reservation stays.
+  // Called under the lock (the GC tick). null = nothing to do.
+  async function releaseHeldOrphans() {
+    const held = state.pergb_held || [];
+    if (held.length === 0) return null;
+    const ps = pool.state();
+    if (ps.state !== "on") return null;
+    const inUse = new Set(addressesOf(state).map(net64Of));
+    const orphans = held.filter((h) => !inUse.has(heldKey(h)));
+    if (orphans.length === 0) return null;
+    let elsewhere;
+    try {
+      elsewhere = usedNets(readAnchors().all, state);
+    } catch (err) {
+      log.error(`[egress] per-GB pool: cfg anchors unreadable (${errText(err)}); nothing handed back this tick`);
+      return null;
+    }
+    const done = new Set();
+    const byRef = new Map();
+    for (const h of orphans) {
+      const k = heldKey(h);
+      if (elsewhere.has(k)) {
+        done.add(h.net);
+        continue;
+      }
+      if (!byRef.has(h.ref)) byRef.set(h.ref, []);
+      byRef.get(h.ref).push(h);
+    }
+    let released = 0;
+    for (const [ref, list] of byRef) {
+      try {
+        await pool.release({ nets: list.map((h) => heldKey(h)), ref });
+        for (const h of list) done.add(h.net);
+        released += list.length;
+      } catch (err) {
+        log.error(`[egress] per-GB pool: release_nets of ${list.length} /64(s) failed (${errText(err)}); retried on the next tick`);
+      }
+    }
+    if (done.size === 0) return { released: 0 };
+    const next = cloneState(state);
+    const keep = held.filter((h) => !done.has(h.net));
+    if (keep.length) next.pergb_held = keep;
+    else delete next.pergb_held;
+    const outcome = await commit(state, next, state);
+    return { released: outcome.ok ? released : 0 };
+  }
+
+  // AMENDMENT A1 — the per-piece /64s inside subnet ids [lo, hi] of the
+  // per-GB pool's prefix (RADIUS `excluded`, I5: ints relative to PREFIX):
+  // every cfg anchor (.disabled / .failed too), the generator's lists and
+  // .tmp lists, and this module's addresses and reservations. complete =
+  // every source was read (an incomplete scan may only ADD to excluded).
+  function pergbExcludedNets(lo = 0, hi = null, { prefix = null } = {}) {
+    const ps = pool.state();
+    const p = pergbPool.parsePrefix(prefix || (ps.state === "on" ? ps.pool.prefix : ""));
+    if (!p) return { nets: [], complete: false, error: ps.state === "error" ? ps.error : "no_pool" };
+    const from = p.base + BigInt(Math.max(0, Number(lo) || 0));
+    const to = hi === null || hi === undefined ? p.base + p.nets - 1n : p.base + BigInt(Number(hi));
+    const scan = pergbPool.scanPerPieceNets({ proxyRoot: cfg.proxyRoot });
+    const all = new Set(scan.nets);
+    for (const a of addressesOf(state)) {
+      const k = net64Of(a);
+      if (k !== null) all.add(k);
+    }
+    for (const e of Object.values(state.ports)) {
+      const k = net64Of(e.anchor);
+      if (k !== null) all.add(k);
+    }
+    for (const h of state.pergb_held || []) {
+      const k = heldKey(h);
+      if (k !== null) all.add(k);
+    }
+    const nets = [...all].filter((k) => k >= from && k <= to).map((k) => Number(k - p.base)).sort((a, b) => a - b);
+    return { nets, complete: scan.complete, prefix: p.text, errors: scan.errors };
   }
 
   // nft first, then the file. A failed nft leaves the kernel as it was (each
@@ -1905,6 +2161,7 @@ function createEgressService({
     // after all.
     const used = new Set(addressesOf(next));
     for (const a of prov.fresh) if (!used.has(a)) addDraining(next, a, nowMs);
+    carryHeld(next, prov.journal);
     const outcome = await commit(before, next, prov.journal || before);
     if (!outcome.ok) {
       const failed = items.map((it) => {
@@ -2048,50 +2305,64 @@ function createEgressService({
     if (!ready) return initAndFill().then(() => ({ deleted: 0 }));
     return withLock(async () => {
       if (!ready) return { deleted: 0 };
-      await ensureTable();
-      const nowMs = now();
-      let proxies = await ensureProxyNdp(nowMs);
-      const idle = retireIdlePool(state, { nowMs, idleSec: cfg.poolRefreshSec, drainSec: cfg.drainSec });
-      if (idle) {
-        log.log(`[egress] per-connection pool idle for ${cfg.poolRefreshSec}s: ${state.pool.length} address(es) drain`);
-        await commit(state, idle, state);
-      }
-      if (state.draining.length === 0) return { deleted: 0 };
-      if (!state.draining.some((d) => Date.parse(d.until) <= nowMs)) return { deleted: 0 };
+      const out = await gcLocked();
+      // AMENDMENT A1 — after the GC forgot what was due
+      let rel = null;
       try {
-        if (!proxies) proxies = await listProxies();
+        rel = await releaseHeldOrphans();
       } catch (err) {
-        log.error(`[egress] gc: ${errText(err)}`);
-        return { deleted: 0 };
+        log.error(`[egress] per-GB pool: hand-back failed: ${errText(err)}`);
       }
-      const protectedAddrs = new Set([...readAnchors().all, ...state.pool]);
-      for (const e of Object.values(state.ports)) {
-        protectedAddrs.add(e.anchor);
-        if (e.current) protectedAddrs.add(e.current);
-      }
-      const plan = planGc(state, { nowMs, proxies, nic: nicLeftovers, protectedAddrs });
-      // what is still there after the batch (nothing, when it succeeded)
-      let stillProxied = new Set();
-      let stillNic = new Map();
-      if (plan.deletes.length) {
-        const res = await ipBatch(gcBatchLines(plan.deletes, iface));
-        if (res.code !== 0) {
-          log.error(`[egress] gc: ${stderrOf(res)}`);
-          try { stillProxied = await listProxies(); } catch { stillProxied = proxies; }
-          if (plan.deletes.some((d) => d.plen !== undefined)) {
-            try { stillNic = await listIface(); } catch { stillNic = nicLeftovers; }
-          }
+      if (rel && rel.released) out.pergbReleased = rel.released;
+      return out;
+    });
+  }
+
+  // The GC tick's body (under the lock).
+  async function gcLocked() {
+    await ensureTable();
+    const nowMs = now();
+    let proxies = await ensureProxyNdp(nowMs);
+    const idle = retireIdlePool(state, { nowMs, idleSec: cfg.poolRefreshSec, drainSec: cfg.drainSec });
+    if (idle) {
+      log.log(`[egress] per-connection pool idle for ${cfg.poolRefreshSec}s: ${state.pool.length} address(es) drain`);
+      await commit(state, idle, state);
+    }
+    if (state.draining.length === 0) return { deleted: 0 };
+    if (!state.draining.some((d) => Date.parse(d.until) <= nowMs)) return { deleted: 0 };
+    try {
+      if (!proxies) proxies = await listProxies();
+    } catch (err) {
+      log.error(`[egress] gc: ${errText(err)}`);
+      return { deleted: 0 };
+    }
+    const protectedAddrs = new Set([...readAnchors().all, ...state.pool]);
+    for (const e of Object.values(state.ports)) {
+      protectedAddrs.add(e.anchor);
+      if (e.current) protectedAddrs.add(e.current);
+    }
+    const plan = planGc(state, { nowMs, proxies, nic: nicLeftovers, protectedAddrs });
+    // what is still there after the batch (nothing, when it succeeded)
+    let stillProxied = new Set();
+    let stillNic = new Map();
+    if (plan.deletes.length) {
+      const res = await ipBatch(gcBatchLines(plan.deletes, iface));
+      if (res.code !== 0) {
+        log.error(`[egress] gc: ${stderrOf(res)}`);
+        try { stillProxied = await listProxies(); } catch { stillProxied = proxies; }
+        if (plan.deletes.some((d) => d.plen !== undefined)) {
+          try { stillNic = await listIface(); } catch { stillNic = nicLeftovers; }
         }
       }
-      const left = (d) => (d.proxy && stillProxied.has(d.addr)) || (d.plen !== undefined && stillNic.has(d.addr));
-      for (const d of plan.deletes) {
-        if (d.plen !== undefined && !stillNic.has(d.addr)) nicLeftovers.delete(d.addr);
-      }
-      const next = cloneState(state);
-      next.draining = [...plan.keep, ...plan.deletes.filter(left).map((d) => d.entry)];
-      await commit(state, next, state);
-      return { deleted: plan.deletes.filter((d) => !left(d)).length };
-    });
+    }
+    const left = (d) => (d.proxy && stillProxied.has(d.addr)) || (d.plen !== undefined && stillNic.has(d.addr));
+    for (const d of plan.deletes) {
+      if (d.plen !== undefined && !stillNic.has(d.addr)) nicLeftovers.delete(d.addr);
+    }
+    const next = cloneState(state);
+    next.draining = [...plan.keep, ...plan.deletes.filter(left).map((d) => d.entry)];
+    await commit(state, next, state);
+    return { deleted: plan.deletes.filter((d) => !left(d)).length };
   }
 
   // An idle pool (no per_connection port) is neither refreshed nor refilled:
@@ -2115,6 +2386,7 @@ function createEgressService({
       if (fresh.length || retired.length) next.pool_refreshed_at = new Date(nowMs).toISOString();
       for (const a of retired) addDraining(next, a, nowMs + cfg.drainSec * 1000);
       for (const a of prov.fresh) if (!prov.present.has(a)) addDraining(next, a, nowMs);
+      carryHeld(next, prov.journal);
       const outcome = await commit(before, next, prov.journal || before);
       return { refreshed: outcome.ok ? fresh.length : 0, ok: outcome.ok };
     });
@@ -2272,6 +2544,7 @@ function createEgressService({
     }),
     snapshot: () => cloneState(state),
     config: () => ({ ...cfg }),
+    pergbExcludedNets,
   };
 }
 
@@ -2291,6 +2564,10 @@ module.exports = {
   ownedAddresses: () => defaultService().ownedAddresses(),
   handleHttp: (...args) => defaultService().handleHttp(...args),
   forgetPorts: (ports) => defaultService().forgetPorts(ports),
+  // AMENDMENT A1 — the per-piece side of RADIUS's `excluded` set (lane L3
+  // pushes it): (lo, hi) subnet ids of the pool prefix -> { nets: [int],
+  // complete, prefix, errors }.
+  pergbExcludedNets: (lo, hi, opts) => defaultService().pergbExcludedNets(lo, hi, opts),
   // exported for unit tests (pure, no fs / exec)
   normalizeIpv6,
   ipv6Groups,
@@ -2306,6 +2583,7 @@ module.exports = {
   net64Of,
   generateAddresses,
   generateRoutedAddresses,
+  pickOutsidePool,
   parseCfgAnchors,
   parseDefaultRouteDev,
   parseIpAddrShow,
