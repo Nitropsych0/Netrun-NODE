@@ -23,9 +23,10 @@ const proxySpawn = require("./proxy_spawn.js");
 const httpsHostnamesLib = require("./https_hostnames.js");
 const { nodeSetting } = require("./node_settings.js");
 // Pay-per-GB v2 (lane L9) — the A1 address pool (release of per-piece /64s)
-// and the per-GB shields.
+// and /health clock.ntpSynchronized.
 const pergbPool = require("./pergb_pool.js");
 const pergbShield = require("./pergb_shield.js");
+const clockSync = require("./clock_sync.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 // Wave FLEET-HEALTH (RES-10) — bind address. The unit template has always set
@@ -4163,13 +4164,14 @@ async function handleHealth(req, res) {
     if (p > 0) probePorts.add(p);
   }
   for (const c of inventory.cfgs) probePorts.add(probeOf(c.startPort));
-  const [ipv6Check, dnsCheck, listenState, ipv6Addresses, httpsHostnamesStatus, ipv6EgressRouted] = await Promise.all([
+  const [ipv6Check, dnsCheck, listenState, ipv6Addresses, httpsHostnamesStatus, ipv6EgressRouted, clock] = await Promise.all([
     checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
     checkDns(5000),
     listListeningExactPorts([...probePorts]),
     ipv6Coverage.get(),
     httpsHostnames.healthStatus(),
     routedEgress.get(),
+    clockSync.status(),
   ]);
   // Wave NODE-GENLOCK-HARDENING — 3proxy readiness, additive. Lets the
   // orchestrator distinguish "agent up but 3proxy not listening yet" (fresh
@@ -4290,6 +4292,10 @@ async function handleHealth(req, res) {
     // reason, the NIC /64, the routed prefixes the exit guard covers, and
     // rotate_prefix — where new addresses come from (the routed /48 or the /64).
     egress: egress.status(),
+    // Pay-per-GB v2 — additive. { ntpSynchronized: true | false | null
+    // (unknown), source, checkedAt, error }: the per-GB gate needs a synced
+    // clock (nodes enforce expiresAt locally).
+    clock,
   });
 }
 

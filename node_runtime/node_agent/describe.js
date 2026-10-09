@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 const https = require("https");
+const pergbShield = require("./pergb_shield.js");
 
 const AGENT_VERSION = "1.0.0";
 
@@ -19,16 +20,25 @@ async function buildDescribe({
   firewallDesired = false,
   supervisor = false,
   httpsHostnames = false,
+  shield = pergbShield.defaultShield(),
 } = {}) {
   const ipv6 = healthSnapshot?.ipv6 || null;
   const ipv6Egress = healthSnapshot?.ipv6Egress || null;
   const dns = healthSnapshot?.dns || null;
+  // Pay-per-GB v2 (lane L9) — what per-GB takes from the box (its slice's
+  // memory budget; option A: its shared ports on the primary IPv4).
+  let pergb = NO_PERGB;
+  try {
+    pergb = await shield.capacityBudget();
+  } catch {
+    pergb = NO_PERGB;
+  }
 
   return {
     agent_version: AGENT_VERSION,
     node_runtime_commit: getGitCommit(),
-    capacity: estimateCapacity(),
-    capacity_model: describeCapacityModel(),
+    capacity: estimateCapacity({ pergb }),
+    capacity_model: describeCapacityModel({ pergb }),
     // Kept at 1 / 1500 (Wave CAPACITY-18K): the agent serialises /generate
     // behind ONE generation lock (a 2nd parallel job only gets node_busy), and
     // a bigger batch saves almost no RAM (per-process overhead is ~1.5-7.5 MiB
@@ -102,6 +112,13 @@ const CAPACITY_MODEL = Object.freeze({
   portCeiling: 27436,
 });
 const CAPACITY_FALLBACK = 5000;
+// Pay-per-GB v2 (lane L9) — per-GB on the node takes its own budget out of the
+// per-piece model: the netrun-pergb.slice MemoryMax (enable.json sliceMemMax,
+// default 1536M; RADIUS, both 3proxy-pergb processes and the per-GB haproxy
+// live inside it) comes off the usable RAM, and with option A (shared ports on
+// the primary IPv4) each shared port costs at most one dual pair — its socks
+// or its http side — so the port ceiling drops by the shared port count.
+const NO_PERGB = Object.freeze({ enabled: false, memMb: 0, ports: 0, option: null });
 
 function parseMemTotalMb(meminfoText) {
   const m = /^MemTotal:\s+(\d+)\s+kB/m.exec(String(meminfoText || ""));
@@ -110,11 +127,13 @@ function parseMemTotalMb(meminfoText) {
   return Number.isFinite(mb) && mb > 0 ? mb : null;
 }
 
-function capacityFromMemTotalMb(memTotalMb, model = CAPACITY_MODEL) {
-  const usableMb = memTotalMb * (1 - model.freePct / 100) - model.baseReserveMb;
+function capacityFromMemTotalMb(memTotalMb, model = CAPACITY_MODEL, pergb = NO_PERGB) {
+  const pergbMb = pergb && pergb.enabled ? Math.max(0, Number(pergb.memMb) || 0) : 0;
+  const pergbPorts = pergb && pergb.enabled ? Math.max(0, Number(pergb.ports) || 0) : 0;
+  const usableMb = memTotalMb * (1 - model.freePct / 100) - model.baseReserveMb - pergbMb;
   const perProxyMb = model.perProxyKb / 1024 + model.perProcessMb / model.avgBatchSize;
   const ramLimit = Math.floor(Math.max(0, usableMb) / perProxyMb);
-  return Math.max(model.minCapacity, Math.min(model.portCeiling, ramLimit));
+  return Math.max(model.minCapacity, Math.min(model.portCeiling - pergbPorts, ramLimit));
 }
 
 function readMeminfo() {
@@ -122,27 +141,33 @@ function readMeminfo() {
 }
 
 // `meminfoText` is injectable for tests; production reads /proc/meminfo.
-function estimateCapacity({ meminfoText } = {}) {
+// `pergb`: the per-GB budget (pergb_shield.capacityBudget()), none by default.
+function estimateCapacity({ meminfoText, pergb = NO_PERGB } = {}) {
   try {
     const text = meminfoText === undefined ? readMeminfo() : meminfoText;
     const memTotalMb = parseMemTotalMb(text);
     if (memTotalMb === null) return CAPACITY_FALLBACK;
-    return capacityFromMemTotalMb(memTotalMb);
+    return capacityFromMemTotalMb(memTotalMb, CAPACITY_MODEL, pergb);
   } catch {
     return CAPACITY_FALLBACK;
   }
 }
 
-function describeCapacityModel({ meminfoText } = {}) {
+function describeCapacityModel({ meminfoText, pergb = NO_PERGB } = {}) {
   let memTotalMb = null;
   try {
     memTotalMb = parseMemTotalMb(meminfoText === undefined ? readMeminfo() : meminfoText);
   } catch {
     memTotalMb = null;
   }
+  const on = Boolean(pergb && pergb.enabled);
   return {
     ...CAPACITY_MODEL,
     memTotalMb: memTotalMb === null ? null : Math.round(memTotalMb),
+    // Pay-per-GB v2 — additive: what per-GB took out of the model.
+    pergbReserveMb: on ? Math.max(0, Number(pergb.memMb) || 0) : 0,
+    pergbSharedPorts: on ? Math.max(0, Number(pergb.ports) || 0) : 0,
+    pergbOption: on ? pergb.option || null : null,
   };
 }
 
