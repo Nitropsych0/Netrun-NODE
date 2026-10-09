@@ -126,6 +126,9 @@ class Server:
         self.engine = Engine(self.store, secret=secret)
         self.ctl = None
         self.sock = None
+        self.wake_r, self.wake_w = os.pipe()  # a signal wakes the UDP loop at once
+        os.set_blocking(self.wake_r, False)
+        os.set_blocking(self.wake_w, False)
         self.watchdog = bool(os.environ.get("WATCHDOG_USEC")) and not args.no_watchdog
 
     def start(self):
@@ -157,17 +160,18 @@ class Server:
         eng = self.engine
         sock = self.sock
         handle = eng.handle
+        rlist = [sock, self.wake_r]
         while not self.stop.is_set():
             eng.udp_alive = time.monotonic()
             try:
-                ready, _, _ = select.select([sock], [], [], 1.0)
+                ready, _, _ = select.select(rlist, [], [], 1.0)
             except InterruptedError:
                 continue
             except OSError as e:
                 log("select failed: %s" % e)
                 time.sleep(0.1)
                 continue
-            if not ready:
+            if not ready or sock not in ready:
                 continue
             for _ in range(DRAIN_MAX):
                 try:
@@ -231,6 +235,13 @@ class Server:
             self.engine.secret = secret
             log("RADIUS secret %s" % ("reloaded" if secret else "unavailable"))
 
+    def wake(self):
+        self.stop.set()
+        try:
+            os.write(self.wake_w, b"x")
+        except OSError:
+            pass
+
     def shutdown(self):
         self.stop.set()
         sd_notify("STOPPING=1")
@@ -259,7 +270,7 @@ def main(argv=None) -> int:
     srv = Server(args)
 
     def on_term(signum, frame):
-        srv.stop.set()
+        srv.wake()
 
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
