@@ -182,6 +182,28 @@ test("partial tails, interleaved bad lines, hourly rotation, an inode change", (
   assert.strictEqual(disk.files["p31000.log.2026.10.09-15"].off, fs.statSync(f2).size);
 });
 
+test("a log replaced under the SAME inode (Linux reuses inode numbers) is read again from 0", () => {
+  const dir = tmpdir("sameino");
+  const now = clock();
+  const m = newMeter(dir, now);
+  m.tick();
+  const f = logFile(dir, "p31000.log.2026.10.09-16");
+  fs.writeFileSync(f, `${rec({ i: 7, o: 0 })}\n`);
+  m.tick();
+  assert.strictEqual(m.counters()["netrun-abc12"].down, 7);
+  const ino = fs.statSync(f).ino;
+  // writeFileSync on an existing path truncates and rewrites the SAME inode:
+  // the new content is longer than the old cursor, so only the head tells
+  fs.writeFileSync(f, `${rec({ t: "20261009160500.000", i: 30, o: 0 })}\n${rec({ i: 40, o: 0 })}\n`);
+  assert.strictEqual(fs.statSync(f).ino, ino, "the test needs the same inode");
+  m.tick();
+  assert.strictEqual(m.counters()["netrun-abc12"].down, 77, "both records of the new content are counted");
+  // appending to the same file does not look like a replacement
+  fs.appendFileSync(f, `${rec({ i: 3, o: 0 })}\n`);
+  m.tick();
+  assert.strictEqual(m.counters()["netrun-abc12"].down, 80);
+});
+
 test("exactly once: a crash anywhere between read and persist, 1000 times", () => {
   const dir = tmpdir("crash");
   const now = clock();

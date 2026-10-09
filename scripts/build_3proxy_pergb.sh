@@ -66,15 +66,20 @@ cp "$PATCH" "$WORK/in/netrun-pergb.patch"
 cat > "$WORK/in/build.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+# snapshot.ubuntu.com serves over HTTPS (plain http redirects there) and the bare
+# image has no CA bundle: take ca-certificates from the image's own archive first
+# (it only affects TLS trust, not the build output).
+apt-get -o Acquire::Retries=5 update -qq
+apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends ca-certificates >/dev/null
 rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
 cat > /etc/apt/sources.list.d/snapshot.sources <<SRC
 Types: deb
-URIs: http://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}/
+URIs: https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}/
 Suites: noble noble-updates noble-security
 Components: main
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SRC
-export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 -o Acquire::Check-Valid-Until=false update -qq
 apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends gcc make libc6-dev patch >/dev/null
 mkdir -p /build

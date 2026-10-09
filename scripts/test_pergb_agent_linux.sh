@@ -131,7 +131,8 @@ const guards = require(process.env.AGENT + "/pergb_guards.js");
 })();
 JS
 sleep 0.5
-OUT="$(AGENT="$AGENT" CG="$CG" PORT="$PORT" WORK="$WORK" node "$WORK/run.js")"
+export AGENT CG PORT WORK
+OUT="$(node "$WORK/run.js")"
 echo "$OUT"
 sleep 0.6
 get() { python3 -c "import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]])" "$OUT" "$1"; }

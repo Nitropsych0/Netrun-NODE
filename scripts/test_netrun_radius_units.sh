@@ -57,7 +57,7 @@ id netrun-radius >/dev/null 2>&1 || useradd --system --no-create-home --shell /u
 install -d -m 0755 /opt/netrun/radius
 install -m 0644 "$RADIUS_DIR"/*.py /opt/netrun/radius/
 install -d -m 0750 -g netrun-radius /etc/netrun-pergb
-LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40 >/etc/netrun-pergb/radius.secret
+openssl rand -hex 20 | tr -d '\n' >/etc/netrun-pergb/radius.secret
 chown root:netrun-radius /etc/netrun-pergb/radius.secret
 chmod 0640 /etc/netrun-pergb/radius.secret
 install -m 0644 "$REPO/deploy/node/netrun-radius.socket" "$REPO/deploy/node/netrun-radius.service" "$UNIT_DIR/"
@@ -111,7 +111,7 @@ STATIC_AFTER="$(radctl bindings '{"after": 0}' | python3 -c 'import json,sys; pr
 [[ "$STATIC_BEFORE" == "$STATIC_AFTER" ]] && ok "static binding survives restarts" || bad "static changed"
 
 # ---- crash loop never reaches start-limit-hit ------------------------------------------
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
   pid="$(mainpid)"
   [[ "$pid" != 0 ]] && kill -9 "$pid" 2>/dev/null || true
   radclient --user netrun-unittst --password UnitPassw0rdUnit --nas-port 31001 --dst 2001:db8:ffff::1 --count 1 --timeout 5 >/dev/null || true

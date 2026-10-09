@@ -89,7 +89,8 @@ nsx ip -6 addr add 2001:db8:ffff::1/128 dev lo nodad   # IPv6 target
 nsx ip -6 route replace local 2001:db8:aa::/48 dev lo   # the per-GB /48, as on a node
 nsx sysctl -qw net.ipv6.ip_nonlocal_bind=1 || true
 
-SECRET="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40)"
+# openssl, not `tr </dev/urandom | head`: under pipefail tr dies of SIGPIPE
+SECRET="$(openssl rand -hex 20)"
 printf '%s\n' "$SECRET" >"$WORK/radius.secret"
 chmod 0600 "$WORK/radius.secret"
 

@@ -57,6 +57,8 @@ const DIGITS_RE = /^\d{1,20}$/;
 const PROBE_LOGIN = "netrun-svcprobe";
 const BASE_RE = /^netrun-[a-z0-9]{1,32}$/;
 const MAX_LINE = 4096;
+// a log file's identity = inode + the hash of its first HEAD_BYTES bytes
+const HEAD_BYTES = 256;
 const UNKNOWN_SAMPLE_CAP = 1000;
 const TUPLE_TTL_MS = 30 * 60 * 1000;
 const TUPLE_CAP = 200000;
@@ -244,6 +246,47 @@ function createMeter(opts = {}) {
     return out;
   }
 
+  // A file's identity is (inode, the first HEAD_BYTES bytes). The inode alone
+  // is not enough: Linux (ext4/tmpfs) commonly hands a file created right
+  // after an unlink the SAME inode number, so a replaced log would be read on
+  // from the old offset and its first records lost. Log files only grow, so
+  // the hash of their first bytes never changes while they are the same file.
+  function headHash(file, len) {
+    if (!len) return null;
+    let fd;
+    try {
+      fd = fsx.openSync(file, READ_NOFOLLOW);
+      const buf = Buffer.alloc(len);
+      const got = fsx.readSync(fd, buf, 0, len, 0);
+      if (got !== len) return null;
+      return crypto.createHash("sha1").update(buf).digest("hex");
+    } catch {
+      return null;
+    } finally {
+      if (fd !== undefined) fsx.closeSync(fd);
+    }
+  }
+
+  // false only when the stored head positively differs from the file's
+  // (an unreadable / too short file is decided by the size check instead).
+  function sameHead(file, cur) {
+    if (!cur.headLen || !cur.head) return true;
+    const now = headHash(file, cur.headLen);
+    return now === null || now === cur.head;
+  }
+
+  // (Re)take the head fingerprint once the cursor has moved past it.
+  function noteHead(file, cur) {
+    if (cur.off <= 0) return;
+    const want = Math.min(HEAD_BYTES, cur.off);
+    if (cur.headLen && cur.headLen >= want) return;
+    const h = headHash(file, want);
+    if (h) {
+      cur.head = h;
+      cur.headLen = want;
+    }
+  }
+
   // Position just after the last "\n" of a file (fresh-state start).
   function endOfLastLine(file, size) {
     if (size === 0) return 0;
@@ -328,6 +371,7 @@ function createMeter(opts = {}) {
       if (!st.isFile()) continue;
       const off = endOfLastLine(file, st.size);
       s.files[f.name] = { ino: st.ino, off, size: st.size, growAt: now() };
+      noteHead(file, s.files[f.name]);
       if (off > 0) {
         skippedBytes += off;
         skippedFiles += 1;
@@ -451,7 +495,7 @@ function createMeter(opts = {}) {
       if (!cur) {
         cur = { ino: st.ino, off: 0, size: 0, growAt: now() };
         changed = true;
-      } else if (cur.ino !== st.ino || st.size < cur.off) {
+      } else if (cur.ino !== st.ino || st.size < cur.off || !sameHead(file, cur)) {
         event("pergb_meter_file_replaced", { file: f.name, oldIno: cur.ino, ino: st.ino, off: cur.off, size: st.size });
         cur = { ino: st.ino, off: 0, size: 0, growAt: now() };
         changed = true;
@@ -503,6 +547,7 @@ function createMeter(opts = {}) {
           dropped += 1;
           changed = true;
         }
+        noteHead(file, cur);
       }
       newFiles[f.name] = cur;
     }
