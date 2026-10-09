@@ -365,6 +365,45 @@ gen6 2 ipv6_18400.list > "$P6/got.list" || fail "2 local /64s need no reservatio
   || fail "local-only batch: $(nets_of6 "$P6/got.list" | tr '\n' ' '), curl: $(cat "$CURL_LOG")"
 ok "per-GB pool: an agent error, a short / duplicate / conflicting reservation, no agent, a bad / unreadable pool file or a missing lib refuse the batch; a batch the per-piece part covers asks nothing"
 
+# a batch over the 5000-per-call limit: chunks of <= 5000 under REF:c1, REF:c2, ...
+cat > "$P6/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+# fake curl: reserve_nets answers `count` fresh subnet ids per call
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    --write-out|--max-time|--data-binary|-H) shift 2 ;;
+    --silent|--show-error) shift ;;
+    *) shift ;;
+  esac
+done
+body="$(cat)"; printf '%s\n' "$body" >> "$CURL_BODIES"
+python3 -c '
+import json, sys
+b = json.loads(sys.argv[1]); k = int(b["ref"].rsplit(":c", 1)[1])
+print(json.dumps({"nets": [(k - 1) * 5000 + i for i in range(b["count"])], "ref": b["ref"]}))' "$body" > "$out"
+printf 200
+CURL
+chmod +x "$P6/bin/curl"
+: > "$CURL_BODIES"
+env PATH="$P6/bin:$PATH" TMPDIR="$P6/tmp" NODE_AGENT_API_KEY=k bash -c '. "$1"; pergb_reserve_nets 12001 gen:20000:big' _ "$ROOT_DIR/scripts/lib/pergb_pool.sh" > "$P6/big.out" \
+  || fail "12001 /64s in chunks failed"
+[ "$(wc -l < "$P6/big.out" | tr -d ' ')" = 12001 ] && [ -z "$(sort "$P6/big.out" | uniq -d)" ] || fail "chunked reserve: $(wc -l < "$P6/big.out") lines"
+[ "$(python3 -c '
+import json, sys
+print(" ".join("%s=%d" % (json.loads(l)["ref"], json.loads(l)["count"]) for l in open(sys.argv[1]) if l.strip()))' "$CURL_BODIES")" \
+  = "gen:20000:big:c1=5000 gen:20000:big:c2=5000 gen:20000:big:c3=2001" ] || fail "chunk bodies: $(cat "$CURL_BODIES")"
+[ -z "$(ls -A "$P6/tmp")" ] || fail "chunk temp files left: $(ls -A "$P6/tmp")"
+mv -f "$P6/bin/curl" "$P6/bin/curl.chunks"
+printf '#!/bin/sh\nexit 7\n' > "$P6/bin/curl"; chmod +x "$P6/bin/curl"
+if env PATH="$P6/bin:$PATH" TMPDIR="$P6/tmp" NODE_AGENT_API_KEY=k bash -c '. "$1"; pergb_reserve_nets 6000 gen:1:x' _ "$ROOT_DIR/scripts/lib/pergb_pool.sh" > "$P6/big.out" 2>/dev/null; then
+  fail "a failed chunk must fail the whole reservation"
+fi
+[ ! -s "$P6/big.out" ] && [ -z "$(ls -A "$P6/tmp")" ] || fail "a failed chunked reservation printed / left: $(cat "$P6/big.out") $(ls -A "$P6/tmp")"
+mv -f "$P6/bin/curl.chunks" "$P6/bin/curl"
+ok "per-GB pool: a batch over 5000 /64s is reserved in chunks of <= 5000 under REF:c<i>; one failed chunk fails it all"
+
 # ENABLED=0 / no pool file: the allocator as before (no agent call, the pool range is per-piece's again)
 for conf in off none; do
   if [ "$conf" = none ]; then rm -f "$NETRUN_PERGB_POOL_FILE"; else printf 'PREFIX=2001:db8:a9::/56\nPOOL=80-fe\nENABLED=0\n' > "$NETRUN_PERGB_POOL_FILE"; fi

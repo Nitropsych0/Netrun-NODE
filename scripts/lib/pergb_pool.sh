@@ -22,7 +22,10 @@
 #   pergb_pool_value KEY        -> KEY's value in the pool file ("" when absent)
 #   pergb_reserve_nets N REF    -> the N lent /64s, one per line (as the agent
 #                                  answered: a subnet id or "<net>/64"); fails
-#                                  closed (non-zero, nothing on stdout)
+#                                  closed (non-zero, nothing on stdout). N above
+#                                  5000 (the per-call limit) goes in calls of
+#                                  <= 5000 under REF:c1, REF:c2, ... (each
+#                                  idempotent: a retry gets the same /64s)
 #   pergb_release_nets REF NET… -> hands /64s back (0 = the agent accepted)
 
 pergb_pool_file() {
@@ -82,6 +85,39 @@ pergb_agent_post() {
 }
 
 pergb_reserve_nets() {
+  local count="$1" ref="$2" left i=0 n out
+  if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ] || [ "$count" -gt 65535 ]; then
+    echo "pergb: reserve_nets count must be 1..65535 (got $count)" >&2
+    return 1
+  fi
+  if [ "$count" -le 5000 ]; then
+    _pergb_reserve_chunk "$count" "$ref"
+    return
+  fi
+  # a batch bigger than one call: chunks of <= 5000 under sub-refs
+  ref="${ref:0:120}"
+  out="$(umask 077; mktemp "${TMPDIR:-/tmp}/netrun-pergb-nets.XXXXXX")" || return 1
+  left="$count"
+  while [ "$left" -gt 0 ]; do
+    n="$left"; [ "$n" -gt 5000 ] && n=5000
+    i=$((i + 1))
+    if ! _pergb_reserve_chunk "$n" "$ref:c$i" >> "$out"; then
+      rm -f "$out"
+      return 1
+    fi
+    left=$((left - n))
+  done
+  if [ "$(wc -l < "$out" | tr -d ' ')" != "$count" ] || [ -n "$(sort "$out" | uniq -d | head -n 1)" ]; then
+    echo "pergb: reserve_nets chunks lent a /64 twice or not $count in all" >&2
+    rm -f "$out"
+    return 1
+  fi
+  cat "$out"
+  rm -f "$out"
+}
+
+# One reserve_nets call (count 1..5000).
+_pergb_reserve_chunk() {
   local count="$1" ref="$2" resp
   if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ] || [ "$count" -gt 5000 ]; then
     echo "pergb: reserve_nets count must be 1..5000 (got $count)" >&2
