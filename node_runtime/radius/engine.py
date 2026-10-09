@@ -32,7 +32,7 @@ from array import array
 import proto
 import psl as psl_lib
 import username as uname
-from alloc import STATIC, Allocator, AllocError, CtlRefused, Line
+from alloc import STATIC, Allocator, AllocError, CtlRefused
 from state import EVENT_RETENTION_SEC, Batch, log
 
 REASONS = ("bad_login", "bad_params", "list_off", "account_off", "quota", "capacity")
@@ -577,16 +577,12 @@ class Engine:
         cannot come back (its /64 is per-piece's now, another prefix) is reported as
         released, so the orchestrator's mirror follows its next address."""
         a = self.alloc
-        dropped = 0
-        for list_id, slot, kind, addr, net, v4, acct, created, expires, last_used in rows:
-            ln = Line(list_id, slot, kind, int.from_bytes(addr, "big"), net, v4, acct, created, expires)
-            ln.last_seen = last_used or created
-            if not a.load_line(ln, now):
-                dropped += 1
-                a.dirty_lines[(kind, list_id, slot)] = None
-                if kind == STATIC:
-                    a.events.append(("release", list_id, slot, ln.addr, "load_conflict", now))
-        return dropped
+        dropped = a.load_rows(rows, now)
+        for list_id, slot, kind, addr, *_rest in dropped:
+            a.dirty_lines[(kind, list_id, slot)] = None
+            if kind == STATIC:
+                a.events.append(("release", list_id, slot, int.from_bytes(addr, "big"), "load_conflict", now))
+        return len(dropped)
 
     def _set_facts(self, f: Facts, now: float):
         self.alloc.configure(f.prefix, f.prefix_str, f.lo, f.hi, f.key, now)

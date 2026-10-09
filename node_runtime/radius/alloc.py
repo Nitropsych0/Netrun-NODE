@@ -669,6 +669,68 @@ class Allocator:
             self.acct_sticky[ln.account_id] = self.acct_sticky.get(ln.account_id, 0) + 1
         return True
 
+    def load_rows(self, rows, now: float) -> list:
+        """Bulk load_line for start-up (READY within 1 s with cap-sized state): rows are
+        (list_id, slot, kind, addr16, net, v4, account_id, created, expires, last_used).
+        Returns the rows that were dropped."""
+        dropped = []
+        static, sticky = self.static, self.sticky
+        by_list, net_index, list_nets = self.by_list, self.net_index, self.list_nets
+        heap, fifo, acct_sticky = self.sticky_heap, self.acct_fifo, self.acct_sticky
+        lo, hi = self.lo, self.hi
+        scan, reserved = self.scan, self.reserved
+        top = self.prefix >> 80 if self.prefix is not None else None
+        mask64 = (1 << 64) - 1
+        for row in rows:
+            list_id, slot, kind, addr16, net, v4, acct, created, expires, last_used = row
+            addr = int.from_bytes(addr16, "big")
+            if kind == STATIC:
+                table = static
+            elif kind == STICKY:
+                table = sticky
+                if expires is None or expires <= now:
+                    dropped.append(row)
+                    continue
+            else:
+                dropped.append(row)
+                continue
+            key = (list_id, slot)
+            if (
+                key in table
+                or not lo <= net <= hi
+                or net == NET_SELF
+                or net in scan
+                or net in reserved
+                or addr >> 80 != top
+                or (addr >> 64) & 0xFFFF != net
+                or (addr & mask64) < IID_MIN
+            ):
+                dropped.append(row)
+                continue
+            ln = Line(list_id, slot, kind, addr, net, v4, acct, created, expires)
+            ln.last_seen = last_used or created
+            table[key] = ln
+            kinds = by_list.get(list_id)
+            if kinds is None:
+                kinds = by_list[list_id] = set()
+            kinds.add((kind, slot))
+            s = net_index.get(net)
+            if s is None:
+                s = net_index[net] = set()
+            s.add((kind, list_id, slot))
+            m = list_nets.get(list_id)
+            if m is None:
+                m = list_nets[list_id] = {}
+            m[net] = m.get(net, 0) + 1
+            if table is sticky:
+                heap.append((expires, list_id, slot))
+                dq = fifo.get(acct)
+                if dq is None:
+                    dq = fifo[acct] = deque()
+                dq.append((created, key))
+                acct_sticky[acct] = acct_sticky.get(acct, 0) + 1
+        return dropped
+
     def loaded(self):
         """End of start-up loading: the per-account FIFOs in creation order."""
         heapq.heapify(self.sticky_heap)
