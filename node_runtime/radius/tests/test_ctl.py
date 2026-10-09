@@ -40,7 +40,15 @@ class SeqAndTransitions(unittest.TestCase):
         self.assertEqual(r, {"error": "seq_mismatch", "epoch": self.eng.epoch, "seq": 5})
         self.assertEqual(self.eng.accounts[1].state, "active")  # nothing applied
         r = self.eng.dispatch({"op": "apply", "baseSeq": 5, "seq": 6, "accounts": [], "lists": []})
-        self.assertEqual(r, {"epoch": self.eng.epoch, "seq": 6, "transitions": T()})
+        self.assertEqual(
+            r,
+            {
+                "epoch": self.eng.epoch,
+                "seq": 6,
+                "transitions": T(),
+                "pieces": {"accepted": 0, "rejected": [], "addrs": {}},
+            },
+        )
         r = self.eng.dispatch({"op": "apply", "baseSeq": 5, "seq": 7, "accounts": [], "lists": []})
         self.assertEqual(r["error"], "seq_mismatch")
         self.assertEqual(r["seq"], 6)
@@ -134,7 +142,15 @@ class SeqAndTransitions(unittest.TestCase):
         got = {x["id"]: x for x in self.eng.dispatch({"op": "logins"})["lists"]}
         self.assertEqual(
             got[10],
-            {"id": 10, "login": "netrun-aaaaaaa", "accountId": 1, "status": "active", "pwRev": 1, "mode": "static"},
+            {
+                "id": 10,
+                "login": "netrun-aaaaaaa",
+                "accountId": 1,
+                "status": "active",
+                "pwRev": 1,
+                "mode": "static",
+                "kind": "pergb",
+            },
         )
         # a bare login id is normalised
         self.eng.dispatch(

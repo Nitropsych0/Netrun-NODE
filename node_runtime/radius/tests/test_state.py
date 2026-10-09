@@ -66,7 +66,7 @@ class Persistence(unittest.TestCase):
         a.check_invariants(self.clock())
         st = e2.dispatch({"op": "status"})
         # the legacy sticky list is a timer list (A10): its line is derived, only the session is remembered
-        self.assertEqual(st["counts"], {"lists": 3, "accounts": 2, "sticky": 1, "static": 1, "lines": 1})
+        self.assertEqual(st["counts"], {"lists": 3, "accounts": 2, "sticky": 1, "static": 1, "lines": 1, "pieces": 0})
         # the static event feed continues
         self.assertEqual(len(e2.dispatch({"op": "bindings", "after": 0})["items"]), 1)
 

@@ -10,8 +10,11 @@ Tables
   nets                    excluded sources per /64 (scan flag, reservation ref)
   reservations            reserve_nets / release_nets idempotency records
 
-Schema 2 (amendments A6/A8/A10/A11): a schema-1 file is unknown and is moved
-aside like a corrupt one (new epoch; the orchestrator re-pushes everything).
+Schema 3 (amendments A6/A8/A10/A11, A13-I): accounts.kind, lists.kind and
+lists.piece_net. A schema-2 file is migrated in place (the columns are added,
+default kind "pergb"; the epoch, the reservations and everything else stay). A
+schema-1 file is unknown and is moved aside like a corrupt one (new epoch; the
+orchestrator re-pushes everything).
 
 Binding changes are written in batches (every 100 ms by the writer thread); ctl
 operations commit before they reply. A DB that cannot be opened or loaded is
@@ -30,17 +33,18 @@ import sys
 import threading
 import time
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 EVENT_RETENTION_SEC = 7 * 86400
 
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY, state TEXT NOT NULL, expires_at REAL,"
-    " limit_json TEXT, trial INTEGER NOT NULL DEFAULT 0, local_blocked INTEGER NOT NULL DEFAULT 0)",
+    " limit_json TEXT, trial INTEGER NOT NULL DEFAULT 0, local_blocked INTEGER NOT NULL DEFAULT 0,"
+    " kind TEXT NOT NULL DEFAULT 'pergb')",
     "CREATE TABLE IF NOT EXISTS lists(id INTEGER PRIMARY KEY, login TEXT NOT NULL UNIQUE, account_id INTEGER NOT NULL,"
     " pw_salt TEXT NOT NULL, pw_hash TEXT NOT NULL, pw_rev INTEGER NOT NULL, status TEXT NOT NULL,"
     " mode TEXT NOT NULL, ttl_sec INTEGER, timer_anchor REAL, link_epoch INTEGER NOT NULL DEFAULT 0,"
-    " line_epochs TEXT, sticky_pause INTEGER)",
+    " line_epochs TEXT, sticky_pause INTEGER, kind TEXT NOT NULL DEFAULT 'pergb', piece_net INTEGER)",
     "CREATE TABLE IF NOT EXISTS bindings(list_id INTEGER NOT NULL, slot TEXT NOT NULL, kind TEXT NOT NULL,"
     " addr BLOB NOT NULL, net INTEGER NOT NULL, v4 INTEGER NOT NULL, account_id INTEGER NOT NULL,"
     " created_at REAL NOT NULL, expires_at REAL, last_used_at REAL, PRIMARY KEY(list_id, slot, kind)) WITHOUT ROWID",
@@ -53,6 +57,13 @@ SCHEMA = (
     " reserved_at REAL)",
     "CREATE TABLE IF NOT EXISTS reservations(ref TEXT PRIMARY KEY, kind TEXT NOT NULL, nets TEXT NOT NULL,"
     " until REAL, at REAL NOT NULL)",
+)
+
+# schema 2 -> 3 (A13-I): the per-piece columns
+MIGRATE_2_3 = (
+    "ALTER TABLE accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'pergb'",
+    "ALTER TABLE lists ADD COLUMN kind TEXT NOT NULL DEFAULT 'pergb'",
+    "ALTER TABLE lists ADD COLUMN piece_net INTEGER",
 )
 
 
@@ -113,6 +124,7 @@ class Store:
         self.write_errors = 0
         self.last_write_error = None
         self.corrupt = False
+        self.migrated = None  # "2->3" when this open migrated the schema
 
     # ---- open / recover ------------------------------------------------------------
 
@@ -184,6 +196,12 @@ class Store:
                 meta["schema"] = SCHEMA_VERSION
                 meta["created_at"] = repr(time.time())
                 conn.executemany("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", list(meta.items()))
+            elif meta.get("schema") == "2":
+                for stmt in MIGRATE_2_3:
+                    conn.execute(stmt)
+                meta["schema"] = SCHEMA_VERSION
+                conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('schema', ?)", (SCHEMA_VERSION,))
+                self.migrated = "2->3"
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")
@@ -195,11 +213,11 @@ class Store:
             "epoch": int(meta["epoch"]),
             "seq": int(meta.get("seq", "0")),
             "accounts": conn.execute(
-                "SELECT id, state, expires_at, limit_json, trial, local_blocked FROM accounts"
+                "SELECT id, state, expires_at, limit_json, trial, local_blocked, kind FROM accounts"
             ).fetchall(),
             "lists": conn.execute(
                 "SELECT id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec, timer_anchor,"
-                " link_epoch, line_epochs, sticky_pause FROM lists"
+                " link_epoch, line_epochs, sticky_pause, kind, piece_net FROM lists"
             ).fetchall(),
             "bindings": conn.execute(
                 "SELECT list_id, slot, kind, addr, net, v4, account_id, created_at, expires_at, last_used_at FROM bindings"
@@ -225,15 +243,16 @@ class Store:
             self._upsert_delete(
                 conn,
                 batch.accounts,
-                "INSERT OR REPLACE INTO accounts(id, state, expires_at, limit_json, trial, local_blocked)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO accounts(id, state, expires_at, limit_json, trial, local_blocked, kind)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 "DELETE FROM accounts WHERE id = ?",
             )
             self._upsert_delete(
                 conn,
                 batch.lists,
                 "INSERT OR REPLACE INTO lists(id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec,"
-                " timer_anchor, link_epoch, line_epochs, sticky_pause) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " timer_anchor, link_epoch, line_epochs, sticky_pause, kind, piece_net)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 "DELETE FROM lists WHERE id = ?",
             )
             if batch.bindings:
