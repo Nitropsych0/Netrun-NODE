@@ -435,6 +435,11 @@ class PList:
         }
 
 
+def _mode_key(p) -> tuple:
+    """What timer / link / pause lines depend on besides the epochs (they carry those)."""
+    return (p.mode, p.ttl, p.anchor, p.pause)
+
+
 def _addr_str(addr: int) -> str:
     return str(ipaddress.IPv6Address(addr))
 
@@ -1089,11 +1094,14 @@ class Engine:
                     dirty_accounts[aid] = None
                     if old.state != "released":
                         t["accounts"].append({"id": aid, "why": "released"})
+            mode_changed = []
             for p in new_lists.values():
                 old = old_lists.get(p.id)
                 self._list_transition(old, p, t)
                 if old is None or old.row() != p.row():
                     dirty_lists[p.id] = p
+                    if old is not None and _mode_key(old) != _mode_key(p):
+                        mode_changed.append(p.id)
             gone = [lid for lid in old_lists if lid not in new_lists]
             for lid in gone:
                 dirty_lists[lid] = None
@@ -1113,15 +1121,8 @@ class Engine:
                 self.by_login, self.by_account = by_login, by_account
                 # A8: a released account keeps nothing reserved and loses nothing either:
                 # its lines' static addresses are derived and come back with a top-up
-                for p in new_lists.values():
-                    old = old_lists.get(p.id)
-                    if old is not None and (old.mode, old.ttl, old.anchor, old.pause) != (
-                        p.mode,
-                        p.ttl,
-                        p.anchor,
-                        p.pause,
-                    ):
-                        a.forget_mode_lines(p.id)
+                for lid in mode_changed:
+                    a.forget_mode_lines(lid)
                 adopted = kept = 0
                 refused = {}
                 for lid, slot, addr in static:
@@ -1215,12 +1216,7 @@ class Engine:
                     self.by_account.setdefault(p.account_id, set()).add(p.id)
                     if old is None or old.row() != p.row():
                         self.dirty_lists[p.id] = p
-                        if old is not None and (old.mode, old.ttl, old.anchor, old.pause) != (
-                            p.mode,
-                            p.ttl,
-                            p.anchor,
-                            p.pause,
-                        ):
+                        if old is not None and _mode_key(old) != _mode_key(p):
                             self.alloc.forget_mode_lines(p.id)
                 self.seq = seq
                 self.dirty_meta["seq"] = str(seq)
