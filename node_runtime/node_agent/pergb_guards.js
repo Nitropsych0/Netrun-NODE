@@ -119,6 +119,7 @@ function createGuards(deps) {
     softAccounts: [],
     ipv4Open: true,
     ipv4PortsPct: null,
+    ipv4AddrOpen: new Map(), // ip -> open (hysteresis per egress IPv4, A7)
     ipv4: [],
     radiusAlive: null,
     probe: { last: null, failures: 0, ok: 0, fail: 0, lastOkAt: null, recoveries: 0, lastRecoverAt: null },
@@ -186,7 +187,12 @@ function createGuards(deps) {
       const n = countLocalPorts(r.stdout, ip, lo, hi);
       per.push({ ip, ports: n, pct: Math.round((n / size) * 1000) / 10 });
     }
-    st.ipv4 = per.map((p) => ({ ...p, range: [lo, hi] }));
+    for (const p of per) {
+      const prev = st.ipv4AddrOpen.has(p.ip) ? st.ipv4AddrOpen.get(p.ip) : true;
+      st.ipv4AddrOpen.set(p.ip, nextIpv4Open(prev, p.pct));
+    }
+    for (const ip of [...st.ipv4AddrOpen.keys()]) if (!ips.includes(ip)) st.ipv4AddrOpen.delete(ip);
+    st.ipv4 = per.map((p) => ({ ...p, range: [lo, hi], open: st.ipv4AddrOpen.get(p.ip) }));
     const pcts = per.map((p) => p.pct).filter((v) => v !== null);
     return pcts.length ? Math.max(...pcts) : null;
   }
@@ -236,7 +242,9 @@ function createGuards(deps) {
       st.ipv4PortsPct = null;
     }
     const wasOpen = st.ipv4Open;
-    st.ipv4Open = nextIpv4Open(st.ipv4Open, st.ipv4PortsPct);
+    // open while any egress IPv4 has ports left; RADIUS gets the per-address
+    // verdicts too (addrs) to pick only among the open ones (A7)
+    st.ipv4Open = st.ipv4AddrOpen.size ? [...st.ipv4AddrOpen.values()].some(Boolean) : nextIpv4Open(st.ipv4Open, st.ipv4PortsPct);
     if (wasOpen !== st.ipv4Open) log.log(`[pergb-guards] IPv4 admission ${st.ipv4Open ? "reopened" : "closed"} (${st.ipv4PortsPct} % of local ports)`);
     try {
       await clock();
@@ -244,7 +252,7 @@ function createGuards(deps) {
     // push (both are in memory only in RADIUS: every tick)
     try {
       await deps.ctl.call("admission", { open: st.admissionOpen, softAccounts: st.softAccounts });
-      await deps.ctl.call("ipv4_admission", { open: st.ipv4Open });
+      await deps.ctl.call("ipv4_admission", { open: st.ipv4Open, addrs: Object.fromEntries(st.ipv4AddrOpen) });
       st.pushed = { admission: st.admissionOpen, ipv4: st.ipv4Open, error: null, at: new Date(now()).toISOString() };
     } catch (e) {
       st.pushed = { ...st.pushed, error: e.code || e.message };

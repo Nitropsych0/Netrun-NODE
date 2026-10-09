@@ -282,3 +282,18 @@ test("expiry: an account whose expiresAt passed is killed once; RADIUS failures 
   assert.ok(e._accounts.get(20).localBlocked, "retried and recorded on the next tick");
   assert.strictEqual(ctl.calls.filter((c) => c.op === "local_block").length, 3);
 });
+
+test("an account the orchestrator blocked: its sessions are killed on every tick (late first records), no local block", async () => {
+  const meter = fakeMeter();
+  const killer = fakeKiller({ v6: [], v4: [], loopUnknown: 0 });
+  killer.kill = async (target) => {
+    killer.kills.push(target);
+    return { killed6: 0, killed4: 1, pending4: 0, matched6: 0, matched4: 1 };
+  };
+  const { e, ctl } = setup({ meter, killer, accounts: [{ id: 20, state: "blocked", limit: { epoch: meter.epoch, bytes: 10, allowance: 0, full: true } }] });
+  meter.add("netrun-bbbb3", 100, 0);
+  await e.tick();
+  await e.tick();
+  assert.deepStrictEqual(killer.kills, [{ accountId: 20 }, { accountId: 20 }]);
+  assert.strictEqual(ctl.calls.filter((c) => c.op === "local_block").length, 0);
+});

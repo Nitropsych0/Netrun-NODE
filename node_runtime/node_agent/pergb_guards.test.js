@@ -44,7 +44,7 @@ test("countLocalPorts: distinct local ports of the address inside the range, any
   assert.strictEqual(guardsLib.countLocalPorts(text, "203.0.113.5", 1024, 8000), 2);
 });
 
-function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessions = new Map(), probe = null } = {}) {
+function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessions = new Map(), probe = null, ips = ["203.0.113.5"], portsByIp = null } = {}) {
   const files = {};
   const set = (m, p) => {
     files[path.join("/cg", SLICE, "memory.current")] = String(Math.round(m * 10 * 1024 * 1024));
@@ -55,7 +55,7 @@ function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessio
   };
   set(mem, pids);
   files["/proc/range"] = "1024\t8000\n";
-  const st = { freePct, lag, portsUsed };
+  const st = { freePct, lag, portsUsed, portsByIp };
   const ctl = T.fakeCtl({ status: { epoch: 1, seq: 0 } });
   const runCalls = [];
   const run = async (cmd, args) => {
@@ -63,7 +63,8 @@ function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessio
     if (cmd === "ss") {
       const ip = args[args.indexOf("src") + 1];
       let out = "";
-      for (let i = 0; i < st.portsUsed; i += 1) out += `ESTAB 0 0 ${ip}:${1024 + i} 93.184.216.34:443\n`;
+      const n = st.portsByIp ? st.portsByIp[ip] || 0 : st.portsUsed;
+      for (let i = 0; i < n; i += 1) out += `ESTAB 0 0 ${ip}:${1024 + i} 93.184.216.34:443\n`;
       return { code: 0, stdout: out, stderr: "" };
     }
     if (cmd === "timedatectl") return { code: 0, stdout: "yes\n", stderr: "" };
@@ -83,7 +84,7 @@ function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessio
     statfs: () => ({ blocks: 1000, bavail: Math.round(st.freePct * 10), bsize: 4096 }),
     settings: { cgroupRoot: "/cg", sliceCgroup: SLICE, logDir: "/logs", portRangeFile: "/proc/range" },
     enable: () => ({ sliceMemMax: 1200 * 1024 * 1024 }),
-    egressIpv4s: () => ["203.0.113.5"],
+    egressIpv4s: () => ips,
     meterLagSec: () => st.lag,
     liveSessions: async () => sessions,
     probe,
@@ -181,4 +182,21 @@ test("probe not configured: liveness from the ctl socket", async () => {
   const e = env({ probe: async () => null });
   assert.strictEqual(await e.g.probeTick(), true);
   assert.strictEqual(e.g.status().probe.last.verdict, "not_configured");
+});
+
+test("A7: several egress IPv4s — the guard works per address; IPv4 stays open while any has ports left", async () => {
+  const size = 8000 - 1024 + 1;
+  const e = env({ ips: ["198.51.100.1", "198.51.100.2"], portsByIp: { "198.51.100.1": Math.ceil(size * 0.7), "198.51.100.2": 10 } });
+  let s = await e.g.tick();
+  assert.strictEqual(s.ipv4AdmissionOpen, true);
+  let push = e.ctl.calls.filter((c) => c.op === "ipv4_admission").pop().body;
+  assert.deepStrictEqual(push, { open: true, addrs: { "198.51.100.1": false, "198.51.100.2": true } });
+  e.st.portsByIp["198.51.100.2"] = Math.ceil(size * 0.65);
+  s = await e.g.tick();
+  assert.strictEqual(s.ipv4AdmissionOpen, false, "all addresses full");
+  e.st.portsByIp["198.51.100.1"] = Math.floor(size * 0.4);
+  s = await e.g.tick();
+  push = e.ctl.calls.filter((c) => c.op === "ipv4_admission").pop().body;
+  assert.deepStrictEqual(push, { open: true, addrs: { "198.51.100.1": true, "198.51.100.2": false } });
+  assert.strictEqual(s.ipv4.length, 2);
 });

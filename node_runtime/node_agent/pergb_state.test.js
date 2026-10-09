@@ -230,6 +230,16 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     assert.strictEqual(mismatch.json.error, "slice_mismatch");
   });
 
+  await t.test("guards push admission and IPv4 admission (with the per-address map) to the real RADIUS", async () => {
+    await pergb.guardTick();
+    const g = pergb.guards.status();
+    assert.strictEqual(g.pushed.error, null, JSON.stringify(g.pushed));
+    assert.strictEqual(g.pushed.admission, true);
+    const st = await pergb.ctl.call("status", {});
+    assert.strictEqual(st.admission.open, true);
+    assert.strictEqual(st.ipv4AdmissionOpen, true);
+  });
+
   await t.test("the RADIUS probe (a 3proxy-shaped Access-Request from JS) is accepted; a wrong password is not", async () => {
     await pergb.guards.probeTick();
     assert.strictEqual(pergb.guards.status().radiusAlive, true, JSON.stringify(pergb.guards.status().probe));

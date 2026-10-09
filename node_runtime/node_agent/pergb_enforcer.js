@@ -230,7 +230,8 @@ function createEnforcer(deps) {
       const near = limit !== null && limit - cum < H;
       pass.push({ a, cum, rate, limit, near });
     }
-    const needSockets = pass.some((p) => p.near || (p.a.localBlocked && p.a.limit && p.a.limit.full));
+    const blockedByState = (a) => a.state === "blocked" || a.state === "released";
+    const needSockets = pass.some((p) => p.near || blockedByState(p.a) || (p.a.localBlocked && p.a.limit && p.a.limit.full));
     let sockView = null;
     let nearStats = null;
     if (needSockets) {
@@ -259,9 +260,21 @@ function createEnforcer(deps) {
       }
       const effective = cum + (p.near ? unlogged : 0);
       view.set(a.id, { cum, limit, rate: Math.round(p.rate), near: p.near, unlogged, effective, sockets: detail ? detail.sockets : null, unrecorded4: detail ? detail.unrecorded : null });
-      // no limit, or blocked / released by the orchestrator (RADIUS refuses
-      // it already; the transition killed its sessions): nothing local to do
-      if (limit === null || a.state !== "active") continue;
+      // blocked / released by the orchestrator: RADIUS refuses it and the
+      // transition killed its sessions; a session that had no record yet is
+      // found (by its tuple) once it has one — the kill repeats every tick
+      if (blockedByState(a)) {
+        if (sockView) {
+          try {
+            const r = await deps.killer.kill({ accountId: a.id }, sockView);
+            if (r.killed6 || r.killed4) out.killed.push({ accountId: a.id, why: a.state, ...r });
+          } catch (e) {
+            lastError = `kill ${a.id}: ${e.message || e}`;
+          }
+        }
+        continue;
+      }
+      if (limit === null) continue;
       const full = Boolean(a.limit && a.limit.full);
       if (effective >= limit) {
         if (!a.localBlocked) {
