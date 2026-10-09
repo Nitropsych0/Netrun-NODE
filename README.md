@@ -337,6 +337,13 @@ restarts 3proxy:
   and after the 22:5x reboots of 2026-10-08 neither node could resolve its IPv6 router.
   `apply` refuses a text, and deletes a loaded table, in which a hooked chain holds
   anything but `meta skuid <uid> jump|goto` (`netrun-proxy-guard check` = that test).
+  **Pay-per-GB v2:** once `install_pergb.sh` created `netrun-pergb` (uid 65533), the
+  default uid list (`NETRUN_PROXY_UIDS`, else `NETRUN_PROXY_UID` + 65533 when that user
+  owns it) adds `meta skuid 65533 jump pergb`: chain `pergb` = the `proxy` rules plus
+  `ip daddr 127.0.0.1 udp dport 1812 accept` (its RADIUS) before the 127/8 reject.
+  Per-piece (65535) reaches neither 1812 nor the per-GB listeners on 127.0.0.3/4;
+  per-GB reaches only DNS and RADIUS on loopback. A dedicated per-GB IPv4 (option B,
+  `dedicatedIpv4` in `/etc/netrun-pergb/enable.json`) joins the own-IPv4 set.
 - **Atomic ruleset saves** — `scripts/netrun-nft-persist.sh`
   (`/usr/local/sbin/netrun-nft-persist`). Every writer of `/etc/nftables.conf` (the
   generator, `/deprovision`, the 5-min `netrun-https sync`, `netrun-harden`, the
@@ -520,6 +527,21 @@ bash scripts/apply_capacity_tuning.sh --apply --only conntrack    # [--conntrack
 The `nf_conntrack_tcp_timeout_established = 7200` already in `99-netrun.conf` also
 starts to apply at boot (it was skipped too); 3proxy closes idle connections after
 1800 s, so no proxied connection is affected.
+
+Pay-per-GB v2 (plan P1) — the per-GB capacity check, only on explicit request:
+
+```bash
+bash scripts/apply_capacity_tuning.sh --conntrack            # dry-run: steps conntrack + maxmap only
+bash scripts/apply_capacity_tuning.sh --apply --conntrack
+```
+
+With per-GB enabled (`/etc/netrun-pergb/enable.json`), the conntrack target is at least
+the per-GB need — 3 entries per session (client→haproxy, haproxy→3proxy on loopback,
+3proxy→target) for `maxConns` sessions plus 120 s of TIME_WAIT at
+`NETRUN_PERGB_CONN_RATE` (300) new sessions/s — as a power of two; a table ≥ 75 % full
+is reported. `maxmap` raises `vm.max_map_count` to 1048576 (the Ubuntu 24.04 default;
+`--max-map-count N`), persisted, never lowered: every 3proxy-pergb connection thread
+holds a stack mapping, and one process serves up to ~20000 connections on the base port.
 
 ## /generate: explicit credentials, reclaim list (Wave FLEET-HEALTH)
 
@@ -741,6 +763,93 @@ Smoke validates `/describe` advertises accounting, plus the negative
 paths (400 missing ports / 404 unknown port / 200 partial empty map).
 Happy-path with a real reserved port is exercised end-to-end by the
 orchestrator integration tests.
+
+## Pay-per-GB v2: the per-GB runtime (lane L2)
+
+Shared ports (1000 per node, two 3proxy processes of 500), per-login credentials and
+the exit address from RADIUS. Fully separate from per-piece: own binary, own units,
+own loopback listeners, own haproxy, own cgroup; nothing per-piece is restarted,
+reloaded or rewritten by it.
+
+```
+client ─► netrun-pergb-haproxy <egress IPv4>:<base>-<base+999>
+   ├ TLS ClientHello ─► own TLS terminator (abns@netrun_pergb_tls, PROXY v2, crt-list
+   │                     /etc/netrun/tls/crt-list) ─► 3proxy-pergb HTTP proxy 127.0.0.3:<port>
+   ├ 0x05 (SOCKS5) ───────────────────────────────────► 3proxy-pergb SOCKS     127.0.0.4:<port>
+   └ anything else: rejected (no plain HTTP)
+3proxy-pergb (uid 65533) ─ Access-Request ─► netrun-radius 127.0.0.1:1812 ─ Framed address ─► egress
+```
+
+| What | Where | Written by |
+|---|---|---|
+| binary (hash-pinned) | `/opt/netrun/pergb/bin/3proxy-pergb` + `.sha256` | `install_pergb.sh` |
+| cfg per range (holds the RADIUS secret) | `/opt/netrun/pergb/cfg/pergb_<sp>.cfg` 0640 root:netrun-pergb | agent (`pergb_runtime.js`) |
+| per-GB haproxy | `/opt/netrun/pergb/haproxy/haproxy.cfg` | agent |
+| RADIUS secret (40 × [A-Za-z0-9]) | `/etc/netrun-pergb/radius.secret` 0640 root:netrun-radius | agent (once) |
+| enable params (incl. secrets; not backed up) | `/etc/netrun-pergb/enable.json` 0600 | agent |
+| logs (own loop filesystem, 16 GiB) | `/var/log/netrun-pergb/p<sp>.log.YYYY.MM.DD-HH`, `haproxy.log` | 3proxy-pergb, rsyslog |
+| units | `netrun-pergb.target`, `netrun.slice` / `netrun-pergb.slice`, `netrun-pergb-3proxy@<sp>.service`, `netrun-pergb-haproxy.service`, `netrun-pergb-certs.path`, `var-log-netrun\x2dpergb.mount` | `install_pergb.sh` (disabled) |
+
+- **Install** (`deploy/node/install_pergb.sh`, standalone, idempotent; `install_node_v2.sh`
+  runs it, `node_followup_v2.sh` does not — on a live node run it ALONE): users
+  `netrun-pergb` (uid/gid 65533; refused when taken) and `netrun-radius`, the directories,
+  the binary (refused unless it matches its pinned sha256 and runs here), `node_runtime/radius`
+  → `/opt/netrun/radius`, the log image (`NETRUN_PERGB_LOG_SIZE`, 16G, refused when free
+  disk < 2 ×) and its mount, rsyslog (`log-tag netrun-pergb-haproxy` → `haproxy.log`) +
+  logrotate 14 d, the units (`daemon-reload`; nothing enabled or started). Slice values:
+  `NETRUN_PERGB_MEM_MAX` (1536M; MemoryHigh 85 %), `NETRUN_PERGB_CPU_WEIGHT` (50),
+  `NETRUN_PERGB_MAX_CONNS` (8000; TasksMax = 2 × 1000 listeners + maxConns + 500).
+- **Enable** (`POST /pergb/enable` → `pergb_runtime.apply`): renders the cfgs and the
+  haproxy (golden files `node_runtime/node_agent/testdata/`), writes `enable.json` and the
+  slice drop-ins, enables + starts `netrun-pergb.target`. Refused before any write on bad
+  params, `pergb_not_installed`, `uid_taken`, `binary_hash_mismatch`, `proxy_guard_missing`.
+  The same params change nothing. A range restarts only when the cfg its process loaded
+  (stamped by `ExecStartPre` in `/run/netrun-pergb/applied/`) differs from the file, one
+  range at a time (a family change: `@<base>` first, `@<base+500>` once the first listens
+  again); the haproxy is reloaded (graceful) when its cfg changed. `disable()` stops and
+  disables the target and keeps `enable.json` with `enabled: false`.
+- **cgroup:** `netrun-pergb.slice` nests in `netrun.slice` (the dash), so the per-GB
+  units live under `/netrun.slice/netrun-pergb.slice/` and the CPU weight that counts
+  against `system.slice` (per-piece) is `netrun.slice`'s.
+- **Certificates:** `netrun-pergb-certs.path` watches the crt-list, `node.pem` and
+  `hosts/`; `netrun-pergb-certs-reload.sh` reloads the per-GB haproxy only when the
+  crt-list or a PEM it names changed (sha256 stamp), after `haproxy -c`.
+- **Recovery** without the agent: `Restart=always`, `RestartSec=1`, `StartLimitIntervalSec=0`
+  on every unit; the target is enabled, so a reboot brings it back.
+
+### The per-GB 3proxy binary (provenance)
+
+`deploy/node/bin/3proxy-pergb` = upstream 3proxy **0.9.3** (GitHub tag tarball, sha256
+`84861f4a…304c72`) + `deploy/node/3proxy-pergb/netrun-pergb.patch`:
+
+1. `authcache none` → `authcachetype 0` (`conf.c` `h_authcache`), so `doauth()` never
+   inserts. Upstream turns 0 into 6, and every cache type leaks: `doauth` inserts after
+   each successful auth and only `cacheauth` (i.e. `auth cache`) ever prunes — one entry
+   per distinct login with the default, per connection with `acl`, each insert a walk of
+   the whole list under the global mutex. Per-GB logins are customer-chosen (`-session-…`).
+2. `IP_BIND_ADDRESS_NO_PORT` before the outbound `bind` (`common.c`): the source port is
+   chosen at `connect()` per 4-tuple, so per-GB sockets from the egress IPv4 to different
+   destinations share source ports.
+
+Per-piece batches keep the stock `deploy/node/bin/3proxy`. The build is reproducible —
+pinned tarball, `ubuntu:24.04` pinned by digest, gcc / libc headers from a fixed
+`snapshot.ubuntu.com` date, `Makefile.Linux` unchanged (the stock flags, splice on),
+only the `3proxy` target, built in `/build/3proxy-0.9.3`:
+
+```bash
+bash scripts/build_3proxy_pergb.sh            # Linux + Docker: writes the binary, its .sha256, toolchain.txt
+bash scripts/build_3proxy_pergb.sh --check    # rebuild and compare with the committed binary
+```
+
+Changing the patch or a pin gives a new binary and a new sha256: commit both (the units'
+`ExecStartPre` and the agent refuse any other binary; `install_pergb.sh` installs it).
+
+Tests: `node --test node_runtime/node_agent/pergb_runtime.test.js` (golden cfgs, the
+0.9.3 ACL names, apply/disable against a fake systemd), `bash scripts/test_install_pergb.sh`,
+`bash scripts/test_netrun_proxy_guard.sh`, `bash scripts/test_pergb_haproxy.sh`,
+`bash scripts/test_build_3proxy_pergb.sh`; the Linux parts (Docker rebuild, 100k-login RSS
+smoke in a netns, the guard with real sockets per uid, live haproxy routing, the real
+installer twice + `systemd-analyze verify`) run in `.github/workflows/pergb-linux.yml`.
 
 ## IPv6 egress rotation (Wave IPV6-ROTATION)
 
