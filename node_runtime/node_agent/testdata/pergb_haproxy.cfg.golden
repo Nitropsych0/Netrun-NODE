@@ -1,0 +1,45 @@
+# NETRUN per-GB haproxy — written by node_agent/pergb_runtime.js (POST /pergb/enable); do not edit.
+# Shared ports 31000-31999 on 203.0.113.10: TLS -> 3proxy-pergb proxy 127.0.0.3:<port>,
+# SOCKS5 -> 3proxy-pergb socks 127.0.0.4:<port>, anything else rejected.
+global
+    log /dev/log local1 info
+    log-tag netrun-pergb-haproxy
+    maxconn 17000
+    nbthread 2
+    ssl-default-bind-options ssl-min-ver TLSv1.2
+    stats socket /run/netrun-pergb/haproxy.sock mode 600 level admin
+    user haproxy
+    group haproxy
+
+defaults
+    mode tcp
+    log global
+    option dontlognull
+    maxconn 17000
+    timeout connect 10s
+    timeout client 1h
+    timeout server 1h
+    timeout tunnel 1h
+    log-format "%ci:%cp %fp %bi:%bp %Tt %B %U"
+
+frontend pergb_in
+    bind 203.0.113.10:31000-31999
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    tcp-request content accept if { req.len gt 0 } { req.payload(0,1) -m bin 05 }
+    tcp-request content reject
+    use_backend pergb_tls_loop if { req.ssl_hello_type 1 }
+    default_backend pergb_socks
+
+backend pergb_socks
+    server socks 127.0.0.4
+
+backend pergb_tls_loop
+    server tls abns@netrun_pergb_tls send-proxy-v2
+
+frontend pergb_tls
+    bind abns@netrun_pergb_tls accept-proxy ssl crt-list /etc/netrun/tls/crt-list alpn http/1.1
+    default_backend pergb_http
+
+backend pergb_http
+    server http 127.0.0.3
