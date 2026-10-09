@@ -774,13 +774,17 @@ It implements the 2026-10-09 amendments: one shared pool (A8: nothing is
 reserved for a per-GB customer, static addresses are derived), the list modes
 per_request / timer / link / static with link epochs (A10), the «липкая
 сессия» pause (A11), smart rotation (A12, ctl `avoid`), several egress IPv4s
-(A7/A9) and `release_nets` without a cool-down (A6).
+(A7/A9), `release_nets` without a cool-down (A6), and per-piece proxies as
+RADIUS piece lists (A13 / contract A13-I: one reserved /64 each, a fixed
+address, no quota, IPv4 from the primary IPv4; the per-record checks and the
+restore of reservations after a lost DB are in the RADIUS README).
 
 Deploying a RADIUS change: `/opt/netrun/radius` is a copy made by
 `deploy/node/install_pergb.sh` (re-run it alone after the checkout moved; it
 enables and starts nothing), then `systemctl restart netrun-radius.service` (the
-socket keeps the queue). The state DB is schema 2: a schema-1 file is moved
-aside like a corrupt one (new epoch, the orchestrator re-pushes everything).
+socket keeps the queue). The state DB is schema 3: a schema-2 file is migrated
+in place (epoch and reservations kept); a schema-1 file is moved aside like a
+corrupt one (new epoch, the orchestrator re-pushes everything).
 
 ## Pay-per-GB v2: the per-GB runtime (lane L2)
 
@@ -899,7 +903,8 @@ Routes (all on `:8086`, I6): `GET /pergb/status`, `POST /pergb/enable`, `POST
 `pergb_tls_only`, except `reserve_nets` / `release_nets` (the generator and
 per-piece deprovision on the node; 404 `pergb_off` without the pool file).
 `/health` carries a `pergb` block (no secrets), `/describe`
-`supports.pergb_radius = 1` and `supports.pergb_tls_port = 8086`, `/generate`
+`supports.pergb_radius = 1`, `supports.pergb_tls_port = 8086` and
+`supports.pergb_pieces = 1` (A13-I), `/generate`
 answers 409 `ports_reserved_pergb` on the shared range or its +10000 shadow
 (option A).
 
@@ -918,6 +923,22 @@ rebind) reserve and release pool /64s through the same service
 every lent /64 at once. The probe password is stored as
 `sha256(salt ‖ password)` in the facts; the salt is derived from the address key.
 
+**Per-piece proxies on RADIUS** (A13-I): the orchestrator reserves a piece's
+/64 with `POST /pergb/reserve_nets {count, owner: "perpiece", ref:
+"piece:<order_ref>"}` and sends the piece as a list record (`kind: "piece"`,
+`pieceNet`) with a `kind: "piece"` account; `PUT`/`PATCH /pergb/state` answer
+`pieces {accepted, rejected, addrs}`. The agent treats every piece /64 (the
+`pieceNet` of the RADIUS logins) as per-piece: a kill of a piece's account or
+list reaches only its sockets, attribution answers `kind: "piece"`, smart
+rotation skips it; usage reports the piece's login with `kind: "piece"` and the
+enforcer never limits it. Every reserve / release answer goes to a journal
+(`<NETRUN_PERGB_STATE_DIR>/reservations.json`, 0600); after a start or a RADIUS
+epoch change the agent re-reserves every entry exactly
+(`reserve_nets {ref, nets}`, also accepted by the route; 409 `net_unavailable`)
+before the next state push, so a lost RADIUS DB never moves a piece. Facts carry
+`primaryIpv4` (the pieces' IPv4 egress, A9); the guards measure its local ports
+per address.
+
 **Loops**: meter → smart rotation → enforcer every 1 s (the meter does not
 advance before it has the RADIUS logins: nothing is lost as unknown), guards
 2 s, probe 5 s, a RADIUS watch every 2 s (a new epoch or `ready:false` → facts
@@ -926,7 +947,7 @@ after every `/generate` job and every 10 min, the canary refresh every 10 min.
 
 Settings (environment; tests point them at temp dirs): `NETRUN_RADIUS_CTL_SOCKET`,
 `NETRUN_RADIUS_ADDR` (127.0.0.1:1812), `NETRUN_PERGB_POOL_FILE`,
-`NETRUN_PERGB_STATE_DIR` (`/var/lib/netrun-pergb`: `meter.json`),
+`NETRUN_PERGB_STATE_DIR` (`/var/lib/netrun-pergb`: `meter.json`, `reservations.json`),
 `NETRUN_PERGB_TLS_PORT` (8086), `NETRUN_PERGB_TLS_HOST`, `NETRUN_PERGB_TLS=0`
 (no listener), `NETRUN_PERGB_TLS_REQUIRE_INSTALLED=0` / `NETRUN_PERGB_TLS_REQUIRE_FIREWALL=0`
 (skip the listener gate; tests only), `NETRUN_PERGB_TLS_CERT` / `_KEY` / `_PEM`, `NETRUN_PERGB_CGROUP_ROOT`,

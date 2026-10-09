@@ -28,7 +28,7 @@ and `netrun-radius.service`.
 | `ctl.py` | `/run/netrun-radius/ctl.sock` server and client |
 | `radctl.py` | operator CLI for the ctl socket |
 | `radclient.py` | sends 3proxy-shaped Access-Requests (checks, load) |
-| `tests/` | unit tests, `feistel_vectors.json` (shared I3 fixture), e2e driver |
+| `tests/` | unit tests, `feistel_vectors.json` (shared I3 fixture), `piece_vectors.json` (A13-I addresses), e2e driver |
 
 ## Threads
 
@@ -51,6 +51,9 @@ password (`sha256(salt‖password)`), list `active` → account `active`, not
 expired, not locally blocked → deadman → admission (hard / soft per account) →
 IPv4 family (`ipv6_only` rejects) and IPv4 admission → near-limit reservation
 (`2·L'`, `L' = logdumpBytes + 64 KiB`) → mode and slot (I1) → address.
+
+A piece list (A13-I, below) leaves this path after the account checks: only
+`-country-<cc>` → admission → its /64 still reserved for it → address.
 
 Reasons (per node and per list): `bad_login`, `bad_params`, `list_off`,
 `account_off`, `quota`, `capacity`; node-only: `not_ready` (no facts yet).
@@ -128,7 +131,67 @@ were not near the limit keep being served (plan V22).
   (≤ 200k entries, soonest expiry evicted first); not persisted — the agent
   pushes the full set after a restart or an epoch change.
 
-## ctl ops (I5 + amendments A1, A6, A7, A10, A12)
+## Per-piece proxies (A13, contract A13-I)
+
+A per-piece IPv6 proxy is issued through this same engine: no 3proxy batch, no
+port of its own (the line is `host:port:login:pass` on any shared port).
+
+- **Records.** List `{id, login, accountId, pwSalt, pwHash, pwRev, status,
+  kind: "piece", mode: "static", lineCount: 1, pieceNet}` — `pieceNet` = the
+  subnet id (integer, relative to the /48) of the piece's own /64; `mode` and
+  `lineCount` may be omitted, anything else is `bad_request` for the op (also
+  `pieceNet` on a per-GB list, or as a string). The A10/A11 fields are ignored.
+  Account `{id, kind: "piece", state, expiresAt}` — a `limit` sent anyway is
+  dropped, `trial` is false. `kind` defaults to `"pergb"` on both. List and
+  account ids are ONE namespace across per-GB and piece (the address tag
+  carries the list id).
+- **The /64.** The orchestrator reserves it before commit:
+  `reserve_nets {count, owner: "perpiece", ref: "piece:<order_ref>"}`
+  (agent `POST /pergb/reserve_nets` on :8086), and releases it with
+  `release_nets` at expiry / refund / replacement. A reserved /64 is never a
+  candidate, so per-GB never uses a piece's /64.
+- **Address**: `prefix | pieceNet << 64 | iid`, `iid` = the I3 tag of the list
+  id with `r16 = HMAC_SHA256(k, "netrun-pergb-pick-r\0" ‖ "piece\0" ‖ id(4) ‖
+  "\0\0" ‖ j(4))[0:2]` for the first `j` whose iid ≥ 2^32 — fixed for the life
+  of the list, on every port, nothing stored (`alloc.piece_addr`). Vectors:
+  `tests/piece_vectors.json` (`tests/gen_piece_vectors.py`); the agent's
+  `pergb_tag.js` and the orchestrator compute the same.
+- **Request**: account active and not expired (`account_off` after
+  `expiresAt`), the list's kind equals the account's (`account_off`), only
+  `-country-<cc>` (`-session`, `-rotate`, `-ttl`, `-static` → `bad_params`),
+  admission (node protection, `capacity`), the /64 still reserved under a
+  `piece:` ref (`list_off` — a released /64 is never served), then IPv6: the
+  fixed address; IPv4: the node's PRIMARY IPv4 (facts `primaryIpv4`; without it
+  `egressIpv4`, which is the primary in option A), refused (`capacity`) while the
+  guard closes that address; `ipv6_only` → `bad_params`. No near / deadman
+  check, no quota: `local_block` on a piece account answers
+  `{ok, ignored: "piece"}`. Traffic is logged under the login like any other
+  (the agent reports it with `kind: "piece"`, never charged).
+- **Per-record checks** on `snapshot` and `apply` (the op goes on; the reply
+  lists what it refused): `account_kind_mismatch` (list kind ≠ its account's,
+  both directions; an account the op does not carry is judged from the
+  installed state, a missing one is accepted), `piece_net_outside_pool`
+  (not in `subnets`, or `ffff`), `piece_net_not_reserved`, `piece_net_not_piece`
+  (reserved, but not under a `piece:` ref — a 3proxy batch's), and
+  `piece_net_duplicate` (one /64 never serves two pieces: unique among all piece
+  lists that are not deleted; between claimants the installed one keeps it,
+  otherwise all are refused). The reservation is required only of a piece that
+  can serve (list active, account active or not sent yet). A refused snapshot
+  record is not installed (a list that was is removed: transition
+  `{id, why: "rejected"}`); a refused delta record leaves the previous one.
+  Reply: `pieces: {accepted: <piece records accepted>, rejected: [{id, login,
+  kind, pieceNet?, error, heldBy?, ref?, accountKind?}], addrs: {"<id>":
+  "<address>"}}` (`addrs` for new or moved pieces only). `status.pieces`
+  keeps the last 20 refusals.
+- **A lost DB** loses the reservations. `reserve_nets {ref, nets: [id…],
+  count?}` ensures exactly these /64s are reserved under `ref` (`restored` = how
+  many were not; no capacity floor; `net_unavailable {nets: [{net, why:
+  outside_pool|per_piece_scan|reserved, ref?}], count}` and nothing changes when
+  one cannot be). The agent keeps a journal of every reserve / release and
+  re-reserves it exactly after a start or an epoch change, before the
+  orchestrator's next snapshot.
+
+## ctl ops (I5 + amendments A1, A6, A7, A10, A12, A13-I)
 
 All of I5. Additions (all additive):
 
@@ -137,6 +200,9 @@ All of I5. Additions (all additive):
   `minFree64ForPerpiece` (facts) / `PERGB_MIN_FREE64_FOR_PERPIECE` (5000) unless
   `force`; never a /64 used by rotation in the last 60 s, preferring /64s no
   remembered line sits on; durable before the reply.
+- `reserve_nets {ref, nets: [subnet id…], count?, owner?}` (A13-I) → `{nets,
+  ref, restored}`; `net_unavailable` (see Per-piece).
+- `reserved` (A13-I) → `{nets: [[net, ref]…], count}` (every reserved /64).
 - `release_nets {nets, ref}` → `{released: <count>, coolDownUntil: null}`;
   releases by net (the ref only makes the call idempotent); a /64 that is not
   reserved is a no-op (a scan-found one leaves through the scans); no cool-down (A6).
@@ -147,21 +213,28 @@ All of I5. Additions (all additive):
   `rotate|sticky`), `ttlSec` 30..86400, `timerAnchor` (unix s), `linkEpoch`,
   `lineEpochs {slot: n}`, `stickyPauseSec`; accounts' `staticCap` /
   `stickyExclCap` and facts' `reserves` are accepted and ignored (A8).
-- `facts` accepts `egressIpv4s` (A7).
+- `facts` accepts `egressIpv4s` (A7) and `primaryIpv4` (A13-I).
+- list records take `kind` and `pieceNet`, accounts `kind` (A13-I); `snapshot`
+  and `apply` also return `pieces {accepted, rejected, addrs}`; a snapshot's
+  `static` entry for a piece is refused (`piece`).
 - `excluded` accepts `"force": true`; a refusal also returns `excluded`,
   `wouldRemove`, `limit`; success returns `removed`.
 - `snapshot` also returns `static: {adopted, kept, refused: {reason: n}}`.
-- `status` also returns `ready`, `secretLoaded`, `facts`, `counters`, `db`,
+- `status` also returns `features` (`pieces`, `reserveExact`, `reserved`,
+  `avoid`, `primaryIpv4`), `counts.pieces`, `pieces {lists, lastRejected,
+  lastRejectedAt}`, `ready`, `secretLoaded`, `facts`, `counters`, `db`,
   `uptimeSec`, `deadman.{afterSec, active}`, `counts.lines`, `ipv4Closed`,
   `smartRotation {avoidedPairs, sites, picksAvoided1h, exhausted1h,
   exhaustedSites}`, `alloc.{reserved, scanExcluded, lines, stickyEvicted,
   staticMoved}` (`boundExclusive`, `sameAccount64`, `coolDown` are always 0).
-- `logins` items also carry the list `mode`.
+- `logins` items also carry the list `mode` and `kind` (+ `pieceNet` for a
+  piece); `accounts` items carry `kind`; `local_block` on a piece account is a
+  no-op `{ok, ignored: "piece"}`.
 - `near_stats` entries also carry `headroom`.
 - `facts` accepts `subnets` as `[lo, hi]` ints, hex strings or `"lo-hi"`, and an
   optional `minFree64ForPerpiece`.
 - Errors: `bad_request` (with `detail`), `unknown_op`, `seq_mismatch`,
-  `excluded_shrink`, `capacity`, `ref_conflict`, `unknown_account`,
+  `excluded_shrink`, `capacity`, `ref_conflict`, `net_unavailable`, `unknown_account`,
   `not_ready`, `db_write_failed`, `internal`.
 
 `heartbeat`, `admission` and `ipv4_admission` are not committed before the
@@ -171,8 +244,10 @@ state-changing op is durable when it replies.
 
 `avoid` is memory only as well.
 
-Schema 2 of `radius.db` (A6/A8/A10): a schema-1 file is treated like a corrupt
-one (moved aside, new epoch, full re-push).
+Schema 3 of `radius.db` (A6/A8/A10, A13-I: `accounts.kind`, `lists.kind`,
+`lists.piece_net`): a schema-2 file is migrated in place (epoch, reservations and
+everything else kept; logged); a schema-1 file is treated like a corrupt one
+(moved aside, new epoch, full re-push).
 
 Types: `epoch` is a random integer in `[2^32, 2^53)` (safe in JavaScript);
 `seq` an integer; list `login` is stored as `netrun-<id>` (a bare id is
