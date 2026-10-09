@@ -482,6 +482,13 @@ function createPergb(deps = {}) {
     }
     const epochChanged = radius.epoch !== null && st.epoch !== radius.epoch;
     const seqChanged = radius.seq !== st.seq;
+    // a restart keeps the epoch but loses what RADIUS holds in memory only
+    // (the A12 avoid set; admission and the heartbeat are re-sent every tick)
+    const restarted = radius.last && Number.isFinite(st.uptimeSec) && Number.isFinite(radius.last.uptimeSec) && st.uptimeSec < radius.last.uptimeSec;
+    if (restarted && !epochChanged) {
+      event("pergb_radius_restarted", { uptimeSec: st.uptimeSec });
+      smart.onRadiusEpoch();
+    }
     Object.assign(radius, { epoch: st.epoch, seq: st.seq, ready: st.ready, dbRecovered: st.dbRecovered, last: st, error: null, at: new Date(now()).toISOString() });
     if (enableDoc && enableDoc.enabled && pool && (force || epochChanged || st.ready === false)) {
       if (epochChanged) event("pergb_radius_epoch_changed", { epoch: st.epoch, dbRecovered: st.dbRecovered });
