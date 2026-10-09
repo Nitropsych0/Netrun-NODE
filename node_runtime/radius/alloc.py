@@ -103,13 +103,14 @@ class Binding:
 class NetHold:
     """Who holds a /64: its bindings, static count, per-account counts, shared flag."""
 
-    __slots__ = ("binds", "static", "accounts", "shared")
+    __slots__ = ("binds", "static", "accounts", "shared", "dups")
 
     def __init__(self):
         self.binds = []
         self.static = 0
         self.accounts = {}
         self.shared = False
+        self.dups = 0  # accounts with two or more bindings here (rule-5 exceptions)
 
     @property
     def n(self) -> int:
@@ -195,6 +196,7 @@ class Allocator:
         self.last_used = _u32_array()
         self.prev_net = OrderedDict()  # (list_id, slot) -> (net, until), oldest first
         self.same_account_events = 0
+        self.same64 = 0  # /64s where one account holds two or more bindings
         # persistence journal, drained by the engine's flush
         self.dirty_bindings = {}  # key -> Binding | None
         self.events = []  # (op, list_id, slot, addr, reason, at)
@@ -407,7 +409,12 @@ class Allocator:
             h = self.holds[b.net] = NetHold()
             self.free.discard(b.net)
         h.binds.append(b)
-        h.accounts[b.account_id] = h.accounts.get(b.account_id, 0) + 1
+        c = h.accounts.get(b.account_id, 0) + 1
+        h.accounts[b.account_id] = c
+        if c == 2:
+            h.dups += 1
+            if h.dups == 1:
+                self.same64 += 1
         if b.kind == STATIC:
             h.static += 1
             self.acct_static[b.account_id] = self.acct_static.get(b.account_id, 0) + 1
@@ -443,6 +450,11 @@ class Allocator:
         if h is None:
             return
         h.binds.remove(b)
+        c = h.accounts.get(b.account_id, 0)
+        if c == 2:
+            h.dups -= 1
+            if h.dups == 0:
+                self.same64 -= 1
         self._dec(h.accounts, b.account_id)
         if b.kind == STATIC:
             h.static -= 1
@@ -782,16 +794,10 @@ class Allocator:
         return n
 
     def stats(self, now: float) -> dict:
-        bound_excl = 0
-        bound_shared = 0
-        same64 = 0
-        for h in self.holds.values():
-            if h.shared:
-                bound_shared += h.n
-            else:
-                bound_excl += 1
-            if h.n > 1 and any(c > 1 for c in h.accounts.values()):
-                same64 += 1
+        """O(1) apart from the cool-down count (exclusive /64s hold exactly one binding)."""
+        bound_excl = len(self.holds) - len(self.shared_nets)
+        bound_shared = self.n_static + self.n_sticky - bound_excl
+        same64 = self.same64
         return {
             "sliceSize": self.pool_size(),
             "candidates": len(self.cand),
@@ -846,3 +852,7 @@ class Allocator:
                 assert (b.expires_at, b.list_id, b.slot) in self.sticky_heap, b.key()
         assert sticky_per_acct == self.acct_sticky, (sticky_per_acct, self.acct_sticky)
         assert set(self.shared_nets.items) == {n for n, h in self.holds.items() if h.shared}
+        same = sum(1 for h in self.holds.values() if any(c > 1 for c in h.accounts.values()))
+        assert same == self.same64, (same, self.same64)
+        for h in self.holds.values():
+            assert h.dups == sum(1 for c in h.accounts.values() if c > 1)

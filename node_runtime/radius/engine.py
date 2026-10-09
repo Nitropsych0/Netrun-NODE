@@ -500,11 +500,15 @@ class Engine:
             log("state DB recovered: new epoch %d, broken copy %s" % (self.epoch, self.store.broken_path))
 
     def _reindex(self):
-        self.by_login = {p.login: p for p in self.lists.values()}
+        self.by_login, self.by_account = self._indexes(self.lists)
+
+    @staticmethod
+    def _indexes(lists: dict):
+        by_login = {p.login: p for p in lists.values()}
         by_acct = {}
-        for p in self.lists.values():
-            by_acct.setdefault(p.account_id, []).append(p.id)
-        self.by_account = by_acct
+        for p in lists.values():
+            by_acct.setdefault(p.account_id, set()).add(p.id)
+        return by_login, by_acct
 
     def _set_facts(self, f: Facts, now: float):
         self.alloc.configure(f.prefix, f.prefix_str, f.lo, f.hi, f.key, now)
@@ -967,87 +971,74 @@ class Engine:
     def op_snapshot(self, req):
         seq = _int(req, "seq", 0)
         accs, lsts, static = self._parse_state(req, True)
-        new_accounts = {}
-        for a in accs:
-            new_accounts[a.id] = a
+        new_accounts = {a.id: a for a in accs}
         new_lists = {}
         logins = {}
-        deleted_in_snapshot = []
+        deleted_ids = set()
         for p in lsts:
             if p.status == "deleted":
-                deleted_in_snapshot.append(p)
+                deleted_ids.add(p.id)
                 continue
             if p.login in logins and logins[p.login] != p.id:
                 raise _bad("duplicate login %s" % p.login)
             logins[p.login] = p.id
             new_lists[p.id] = p
         with self.ctl_lock:
+            # Only ctl ops (serialised by ctl_lock) change accounts and lists, so the
+            # O(n) diff runs without the engine lock; the UDP thread keeps serving.
+            old_accounts, old_lists = self.accounts, self.lists
+            t = {"accounts": [], "lists": []}
+            dirty_accounts, dirty_lists = {}, {}
+            for a in new_accounts.values():
+                old = old_accounts.get(a.id)
+                if old is not None:
+                    a.local_blocked = old.local_blocked
+                self._account_transition(old, a, t)
+                if old is None or old.row() != a.row():
+                    dirty_accounts[a.id] = a
+            for aid, old in old_accounts.items():
+                if aid not in new_accounts:
+                    dirty_accounts[aid] = None
+                    if old.state != "released":
+                        t["accounts"].append({"id": aid, "why": "released"})
+            for p in new_lists.values():
+                old = old_lists.get(p.id)
+                self._list_transition(old, p, t)
+                if old is None or old.row() != p.row():
+                    dirty_lists[p.id] = p
+            gone = [lid for lid in old_lists if lid not in new_lists]
+            for lid in gone:
+                dirty_lists[lid] = None
+                t["lists"].append({"id": lid, "why": "deleted"})
+            by_login, by_account = self._indexes(new_lists)
+            released = {aid for aid, a in new_accounts.items() if a.state == "released"}
             with self.lock:
                 now = self.clock()
-                t = {"accounts": [], "lists": []}
-                for a in new_accounts.values():
-                    old = self.accounts.get(a.id)
-                    if old is not None:
-                        a.local_blocked = old.local_blocked
-                    self._account_transition(old, a, t)
-                for aid, old in self.accounts.items():
-                    if aid not in new_accounts and old.state != "released":
-                        t["accounts"].append({"id": aid, "why": "released"})
-                for p in new_lists.values():
-                    self._list_transition(self.lists.get(p.id), p, t)
-                for p in deleted_in_snapshot:
-                    old = self.lists.get(p.id)
-                    if old is not None:
-                        t["lists"].append({"id": p.id, "why": "deleted"})
-                for lid, old in self.lists.items():
-                    if (
-                        lid not in new_lists
-                        and old.status != "deleted"
-                        and all(d.id != lid for d in deleted_in_snapshot)
-                    ):
-                        t["lists"].append({"id": lid, "why": "deleted"})
-                for lid in list(self.alloc.by_list):
-                    if lid not in new_lists:
-                        self.alloc.release_list(lid, "list_deleted", now)
-                # swap
-                for aid, a in new_accounts.items():
-                    old = self.accounts.get(aid)
-                    if old is None or old.row() != a.row():
-                        self.dirty_accounts[aid] = a
-                for aid in self.accounts:
-                    if aid not in new_accounts:
-                        self.dirty_accounts[aid] = None
-                for lid, p in new_lists.items():
-                    old = self.lists.get(lid)
-                    if old is None or old.row() != p.row():
-                        self.dirty_lists[lid] = p
-                for lid in self.lists:
-                    if lid not in new_lists:
-                        self.dirty_lists[lid] = None
-                        if lid in self.rejects:
-                            del self.rejects[lid]
-                            self.dirty_rejects.add(lid)
-                self.accounts = new_accounts
-                self.lists = new_lists
-                self._reindex()
-                released = [aid for aid, a in new_accounts.items() if a.state == "released"]
-                released += [aid for aid in self.alloc.acct_static if aid not in new_accounts]
+                a = self.alloc
+                for lid in [lid for lid in a.by_list if lid not in new_lists]:
+                    a.release_list(lid, "list_deleted", now)
+                for lid in gone:
+                    if self.rejects.pop(lid, None) is not None:
+                        self.dirty_rejects.add(lid)
+                self.dirty_accounts.update(dirty_accounts)
+                self.dirty_lists.update(dirty_lists)
+                self.accounts, self.lists = new_accounts, new_lists
+                self.by_login, self.by_account = by_login, by_account
+                released.update(aid for aid in a.acct_static if aid not in new_accounts)
                 self._drop_released_static(released, now)
                 adopted = kept = 0
                 refused = {}
                 for lid, slot, addr in static:
                     p = new_lists.get(lid)
+                    acct = new_accounts.get(p.account_id) if p is not None else None
                     if p is None:
-                        refused["no_list"] = refused.get("no_list", 0) + 1
-                        continue
-                    acct = new_accounts.get(p.account_id)
-                    if acct is not None and acct.state == "released":
-                        refused["released"] = refused.get("released", 0) + 1
-                        continue
-                    if not self.alloc.configured:
-                        refused["not_ready"] = refused.get("not_ready", 0) + 1
-                        continue
-                    r = self.alloc.adopt_static(lid, slot, p.account_id, addr, now)
+                        r = "no_list"
+                    elif acct is not None and acct.state == "released":
+                        r = "released"
+                    elif not a.configured:
+                        r = "not_ready"
+                    else:
+                        r = a.adopt_static(lid, slot, p.account_id, addr, now)
                     if r == "adopted":
                         adopted += 1
                     elif r == "kept":
@@ -1077,48 +1068,63 @@ class Engine:
         seq = _int(req, "seq", 0)
         accs, lsts, _ = self._parse_state(req, False)
         with self.ctl_lock:
+            if base_seq != self.seq:
+                raise CtlRefused("seq_mismatch", epoch=self.epoch, seq=self.seq)
+            # validate against the merged state before changing anything
+            batch_logins = {}
+            for p in lsts:
+                if p.status == "deleted":
+                    continue
+                holder = self.by_login.get(p.login)
+                if (holder is not None and holder.id != p.id) or batch_logins.get(p.login, p.id) != p.id:
+                    raise _bad("duplicate login %s" % p.login)
+                batch_logins[p.login] = p.id
+            t = {"accounts": [], "lists": []}
+            released = []
+            for a in accs:
+                old = self.accounts.get(a.id)
+                if old is not None:
+                    a.local_blocked = old.local_blocked
+                self._account_transition(old, a, t)
+                if a.state == "released":
+                    released.append(a.id)
+            for p in lsts:
+                old = self.lists.get(p.id)
+                if p.status == "deleted":
+                    if old is not None:
+                        t["lists"].append({"id": p.id, "why": "deleted"})
+                else:
+                    self._list_transition(old, p, t)
             with self.lock:
-                if base_seq != self.seq:
-                    raise CtlRefused("seq_mismatch", epoch=self.epoch, seq=self.seq)
-                # login uniqueness against the merged state
-                logins = {p.login: p.id for p in self.lists.values()}
-                for p in lsts:
-                    if p.status == "deleted":
-                        continue
-                    other = logins.get(p.login)
-                    if other is not None and other != p.id:
-                        raise _bad("duplicate login %s" % p.login)
-                    logins[p.login] = p.id
                 now = self.clock()
-                t = {"accounts": [], "lists": []}
-                released = []
                 for a in accs:
                     old = self.accounts.get(a.id)
-                    if old is not None:
-                        a.local_blocked = old.local_blocked
-                    self._account_transition(old, a, t)
                     self.accounts[a.id] = a
                     if old is None or old.row() != a.row():
                         self.dirty_accounts[a.id] = a
-                    if a.state == "released":
-                        released.append(a.id)
                 for p in lsts:
                     old = self.lists.get(p.id)
+                    if old is not None:
+                        if self.by_login.get(old.login) is old:
+                            del self.by_login[old.login]
+                        ids = self.by_account.get(old.account_id)
+                        if ids is not None:
+                            ids.discard(p.id)
+                            if not ids:
+                                del self.by_account[old.account_id]
                     if p.status == "deleted":
                         if old is not None:
-                            t["lists"].append({"id": p.id, "why": "deleted"})
                             del self.lists[p.id]
                             self.dirty_lists[p.id] = None
                         self.alloc.release_list(p.id, "list_deleted", now)
-                        if p.id in self.rejects:
-                            del self.rejects[p.id]
+                        if self.rejects.pop(p.id, None) is not None:
                             self.dirty_rejects.add(p.id)
                         continue
-                    self._list_transition(old, p, t)
                     self.lists[p.id] = p
+                    self.by_login[p.login] = p
+                    self.by_account.setdefault(p.account_id, set()).add(p.id)
                     if old is None or old.row() != p.row():
                         self.dirty_lists[p.id] = p
-                self._reindex()
                 self._drop_released_static(released, now)
                 self.seq = seq
                 self.dirty_meta["seq"] = str(seq)
@@ -1224,12 +1230,13 @@ class Engine:
         ]
         return {"items": items, "last": items[-1]["seq"] if items else after}
 
+    # lists and accounts change only under ctl_lock: these views never block the UDP thread
     def op_logins(self, req):
-        with self.lock:
+        with self.ctl_lock:
             return {"lists": [p.view() for p in self.lists.values()]}
 
     def op_accounts(self, req):
-        with self.lock:
+        with self.ctl_lock:
             return {"accounts": [a.view() for a in self.accounts.values()]}
 
     def op_rejects(self, req):
