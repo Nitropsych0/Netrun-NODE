@@ -87,7 +87,7 @@ export NETRUN_PROXY_GUARD_FILE="$TMP/etc/netrun/nft-proxy-guard.nft" NETRUN_PROX
        NETRUN_PROXY_GUARD_SELF="$TMP/sbin/netrun-proxy-guard"
 DROPIN="$TMP/systemd/nftables.service.d/netrun-proxy-guard.conf"
 run() { bash "$GUARD" "$@"; }
-mode_of() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
 # ── 1. the sets: networks only ────────────────────────────────────
 out="$(NODE_KIND=jnb run print)" || fail "print (jnb)"

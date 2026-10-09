@@ -18,7 +18,7 @@ trap 'rm -rf "$TMP"' EXIT
 PASS=0
 fail() { echo "FAIL: $1"; exit 1; }
 ok() { PASS=$((PASS + 1)); echo "ok: $1"; }
-mode_of() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
 command -v python3 >/dev/null 2>&1 || { echo "SKIP: no python3"; exit 0; }
 bash -n "$H" || fail "bash -n netrun-harden.sh"

@@ -200,7 +200,7 @@ jobs:
       - name: per-GB agent suites (python3 + openssl present, so nothing may skip)
         run: |
           node --test node_runtime/node_agent/pergb_*.test.js node_runtime/node_agent/server.pergb.test.js | tee "$RUNNER_TEMP/l3.out"
-          grep -q '^ℹ skipped 0$' "$RUNNER_TEMP/l3.out"
+          grep -qE '^(ℹ|#) skipped 0$' "$RUNNER_TEMP/l3.out"   # spec (TTY / node ≥23) or TAP (piped node 20/22)
       - name: the whole agent suite
         run: node --test node_runtime/node_agent/*.test.js
 

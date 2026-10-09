@@ -17,7 +17,7 @@ trap 'rm -rf "$TMP"' EXIT
 PASS=0
 fail() { echo "FAIL: $1"; exit 1; }
 ok() { PASS=$((PASS + 1)); echo "ok: $1"; }
-mode_of() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
 bash -n "$P" || fail "bash -n netrun-nft-persist.sh"
 

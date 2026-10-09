@@ -227,7 +227,7 @@ grep -qx 'address add 2001:db8:0:1::a/128 dev eth9 nodad preferred_lft 0' "$TMP/
 grep -qE '^[[:space:]]*maxconn 512$' "$TMP/h1/proxyserver/3proxy/3proxy_18100.cfg" || fail "cfg maxconn 512"
 # Audit 2026-10-08 — the cfg names customer logins / passwords: root-only,
 # also when an older 0644 cfg is overwritten; the generator itself runs umask 077.
-cfgmode() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+cfgmode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 [ "$(cfgmode "$TMP/h1/proxyserver/3proxy/3proxy_18100.cfg")" = 600 ] || fail "cfg mode $(cfgmode "$TMP/h1/proxyserver/3proxy/3proxy_18100.cfg")"
 chmod 0644 "$TMP/h1/proxyserver/3proxy/3proxy_18100.cfg"
 PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$S" >/dev/null 2>&1 || fail "start-up script rerun"
@@ -277,7 +277,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 cat >> "$CURL_BODIES"; echo >> "$CURL_BODIES"
-mode="$(stat -f %Lp "$hdr" 2>/dev/null || stat -c %a "$hdr")"
+mode="$(stat -c %a "$hdr" 2>/dev/null || stat -f %Lp "$hdr")"
 printf 'url=%s mode=%s hdr=%s\n' "$url" "$mode" "$(tr '\n' '|' < "$hdr")" >> "$CURL_SEEN"
 cat "$FAKE_REPLY" > "$out"
 printf '%s' "${FAKE_CODE:-200}"
