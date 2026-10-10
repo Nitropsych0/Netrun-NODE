@@ -1353,7 +1353,8 @@ and `netrun-bgp apply --install` (or `node_followup_v2.sh`, which runs it when
 - `apply` is idempotent, in an order that never announces a prefix without its local
   route (without it Vultr's traffic for the prefix would bounce between the host and its
   gateway): local routes of every prefix → `netrun-bgp-prefix.service` + a `bird.service`
-  drop-in (`Requires=`/`After=` that unit, so at boot BIRD starts only after the routes)
+  drop-in (`Requires=`/`After=` that unit, so at boot BIRD starts only after the routes;
+  `Restart=always`, `RestartSec=5` — Debian ships `on-abort`, which left BIRD down on an error exit)
   → the generated `/etc/bird/bird.conf`, checked by `bird -p` first (rejected: nothing in
   BIRD changes), loaded by `birdc configure` → `NETRUN_BGP_WITHDRAW_WAIT` (10 s) later
   the local routes of prefixes no longer announced. An unchanged config is not reloaded.
@@ -1390,6 +1391,24 @@ Tests: `bash scripts/test_netrun_bgp.sh` (stubs for ip/bird/birdc/systemctl/nft;
 order, the :179 guard, idempotence, the dry run, a rejected config, a failed configure and its rerun,
 `none`, write failures, quoting, and that the generated bird.conf equals Chicago's
 hand-made one).
+
+## HQ watch: the node watches the bot / site / orchestrator server (2026-10-10)
+
+The bot, the site and the orchestrator share one server (95.217.98.125); when
+it dies nothing on it can tell anyone. `deploy/node/netrun-hq-watch.sh`
+(`/usr/local/sbin/netrun-hq-watch`, `netrun-hq-watch.timer` every minute)
+checks it from the node — the site (`HQ_URL`, 2xx/3xx in 15 s) and the host's
+SSH port — and posts to the admins' alerts topic through the Telegram Bot API:
+one alert after `HQ_FAILS` (3) bad checks in a row (`host_down`: neither
+answers; `site_down`: the site fails while SSH answers), a reminder every
+`HQ_REMIND_MIN` (60) minutes, one «back» message. Nothing is judged while the
+node's own internet is down (`HQ_REF_URL`, Cloudflare's trace) — it could not
+reach Telegram anyway, so a node never raises a false alarm about HQ.
+
+Config `/etc/netrun/hq-watch.env` (0600, root): `TG_TOKEN` (the admin bot),
+`TG_CHAT`, `TG_TOPIC`, `NODE_LABEL`; without it the unit is a no-op. The
+token reaches curl through its config on stdin, never argv. Test:
+`bash scripts/test_hq_watch.sh` (curl / timeout stubbed).
 
 ## Smoke Generate
 

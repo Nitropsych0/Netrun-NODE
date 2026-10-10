@@ -162,6 +162,12 @@ jobs:
       - run: bash scripts/test_3proxy_spawn.sh
       - run: bash scripts/test_capacity_18k_node.sh
       - run: bash scripts/test_fleet_health_node.sh
+      - name: BGP apply (stubbed) — the bird drop-in restarts BIRD whatever the exit
+        run: bash scripts/test_netrun_bgp.sh
+      - name: HQ watch (stubbed curl/timeout) + shellcheck
+        run: |
+          shellcheck -S warning deploy/node/netrun-hq-watch.sh scripts/test_hq_watch.sh
+          bash scripts/test_hq_watch.sh
 
   # Lane L9 — node shields: the A1 address pool (generator, egress.js,
   # deprovision), option A / B shields (accounting, firewall, deprovision,
