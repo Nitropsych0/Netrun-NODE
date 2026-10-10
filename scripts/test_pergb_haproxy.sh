@@ -22,7 +22,7 @@
 #      without a login or with a wrong password they get 407 exactly like
 #      over TLS, TLS and SOCKS5 work as before; RADIUS gets the same
 #      Access-Request from the plain and the TLS path (NAS-Port = the dialed
-#      port, NAS-IP 127.0.0.3, client 127.0.0.1), 3proxy writes the same
+#      port, NAS-IP 127.0.0.3, client = a hop source 127.0.1.x), 3proxy writes the same
 #      record (the meter's input) and haproxy's line joins the client to it
 #      (attribution).
 # --require-all turns a skipped section into a failure.
@@ -160,20 +160,27 @@ for k in text ssh binary lower h2; do g+=("$k=$(nsx python3 client.py "$k" 31002
 st="$(nsx python3 client.py stall 31003)"
 sleep 0.5
 kill "$BACK" 2>/dev/null
-[ "$r1" = "http:31003:127.0.0.1" ] || fail "TLS on 31003 -> $r1 (want http:31003 via 127.0.0.3); haproxy: $(tail -n 5 haproxy.log)"
-[ "$r2" = "socks:31001:127.0.0.1" ] || fail "SOCKS5 on 31001 -> $r2"
-[ "$r4" = "socks:31000:127.0.0.1" ] || fail "SOCKS5 on the base port -> $r4"
-[ "$h1" = "http:31002:127.0.0.1" ] || fail "plain HTTP CONNECT on 31002 -> $h1 (want the HTTP proxy 127.0.0.3:31002)"
-[ "$h2" = "http:31004:127.0.0.1" ] || fail "absolute-URI GET on 31004 -> $h2"
-[ "$h3" = "http:31001:127.0.0.1" ] || fail "absolute-URI OPTIONS on 31001 -> $h3"
-[ "$h4" = "http:31000:127.0.0.1" ] || fail "a CONNECT split inside the method on the base port -> $h4"
+# the hop leaves from one of the 8 loopback sources of its backend
+# (pergb_runtime.HOP_SOURCES: 127.0.1.<k> to the HTTP proxy, 127.0.2.<k> to SOCKS)
+HTTP_SRC='127\.0\.1\.[1-8]'
+SOCKS_SRC='127\.0\.2\.[1-8]'
+[[ "$r1" =~ ^http:31003:${HTTP_SRC}$ ]] || fail "TLS on 31003 -> $r1 (want http:31003 via 127.0.0.3 from 127.0.1.x); haproxy: $(tail -n 5 haproxy.log)"
+[[ "$r2" =~ ^socks:31001:${SOCKS_SRC}$ ]] || fail "SOCKS5 on 31001 -> $r2"
+[[ "$r4" =~ ^socks:31000:${SOCKS_SRC}$ ]] || fail "SOCKS5 on the base port -> $r4"
+[[ "$h1" =~ ^http:31002:${HTTP_SRC}$ ]] || fail "plain HTTP CONNECT on 31002 -> $h1 (want the HTTP proxy 127.0.0.3:31002)"
+[[ "$h2" =~ ^http:31004:${HTTP_SRC}$ ]] || fail "absolute-URI GET on 31004 -> $h2"
+[[ "$h3" =~ ^http:31001:${HTTP_SRC}$ ]] || fail "absolute-URI OPTIONS on 31001 -> $h3"
+[[ "$h4" =~ ^http:31000:${HTTP_SRC}$ ]] || fail "a CONNECT split inside the method on the base port -> $h4"
+# leastconn over equal (idle) servers rotates: the hop really spreads
+srcs="$(printf '%s\n' "$r1" "$h1" "$h2" "$h3" "$h4" | cut -d: -f3 | sort -u | wc -l)"
+[ "$srcs" -ge 2 ] || fail "every HTTP hop left from one source ($r1 $h1 $h2 $h3 $h4): the 6976-per-port cap is back"
 for x in "${g[@]}"; do
   case "${x#*=}" in "closed"|"closed ("*) ;; *) fail "${x%%=*} must be rejected at once, got: ${x#*=}" ;; esac
 done
 read -r st_what st_secs <<< "$st"
 [ "$st_what" = closed ] && awk -v s="$st_secs" 'BEGIN { exit !(s >= 3 && s <= 9) }' \
   || fail "an incomplete method must be dropped at the 5 s inspect-delay, got: $st"
-grep -q '^http 31003 127.0.0.1:' backend.log || fail "the HTTP backend saw no TLS-terminated session: $(cat backend.log)"
+grep -Eq '^http 31003 127\.0\.1\.[1-8]:' backend.log || fail "the HTTP backend saw no TLS-terminated session: $(cat backend.log)"
 grep -q '^http 31003 .* 434f4e4e45435420$' backend.log || fail "the HTTP backend got the decrypted CONNECT: $(cat backend.log)"
 grep -q '^http 31002 .* 434f4e4e45435420$' backend.log || fail "the HTTP backend got the plain CONNECT as sent: $(cat backend.log)"
 grep -q '^http 31004 .* 4745542068747470$' backend.log || fail "the HTTP backend got the plain 'GET http': $(cat backend.log)"
@@ -408,10 +415,14 @@ def one(port, accept):
     r = [x for x in radius if x.get("nas_port") == port and x["user"] == login and x["accept"] is accept]
     return r[0] if r else die(f"no {'accepted' if accept else 'rejected'} Access-Request from port {port}: {radius}")
 plain, tls = one(31006, True), one(31007, True)
-for want in (("nas_port", 31006), ("nas_ip", "127.0.0.3"), ("client", "127.0.0.1"), ("dst", "198.51.100.20")):
+for want in (("nas_port", 31006), ("nas_ip", "127.0.0.3"), ("dst", "198.51.100.20")):
     if plain.get(want[0]) != want[1]:
         die(f"plain HTTP Access-Request: {want[0]} = {plain.get(want[0])}, want {want[1]}: {plain}")
-strip = lambda r: {k: v for k, v in r.items() if k != "nas_port"}
+# the client is the hop's loopback source (one of 127.0.1.1-8), per connection
+for r in (plain, tls):
+    if not re.fullmatch(r"127\.0\.1\.[1-8]", str(r.get("client"))):
+        die(f"Access-Request client {r.get('client')} is no hop source 127.0.1.x: {r}")
+strip = lambda r: {k: v for k, v in r.items() if k not in ("nas_port", "client")}
 if strip(plain) != strip(tls):
     die(f"the plain and the TLS CONNECT differ beyond NAS-Port:\n plain {plain}\n tls   {tls}")
 one(31006, False)  # the wrong password went to RADIUS too
@@ -421,18 +432,18 @@ def rec(port):
     r = [x for x in recs if x["ok"] and x["port"] == port and x["user"] == login and x["dstIp"] == "198.51.100.20" and x["inBytes"] > 0 and x["outBytes"] > 0]
     return r[0] if r else die(f"no 3proxy record with bytes for {login} on {port}: {recs}")
 p3, t3 = rec(31006), rec(31007)
-for k in ("service", "user", "login", "clientIp", "localIp", "bound", "dstIp", "dstPort"):
+for k in ("service", "user", "login", "localIp", "bound", "dstIp", "dstPort"):
     if p3[k] != t3[k]:
         die(f"3proxy records differ in {k}: plain {p3} / tls {t3}")
-if (p3["login"], p3["localIp"], p3["clientIp"], p3["bound"]) != (login, "127.0.0.3", "127.0.0.1", "203.0.113.10"):
+if (p3["login"], p3["localIp"], p3["bound"]) != (login, "127.0.0.3", "203.0.113.10") or not re.fullmatch(r"127\.0\.1\.[1-8]", p3["clientIp"]):
     die(f"3proxy record of the plain CONNECT: {p3}")
 rec(31008); rec(31009)
 hap = open(f"{tmp}/haproxy.log").read()
-if not re.search(r"^203\.0\.113\.10:\d+ 31006 127\.0\.0\.1:%d \d+ \d+ \d+$" % p3["clientPort"], hap, re.M):
-    die(f"no haproxy line '<client> 31006 127.0.0.1:{p3['clientPort']} ...' for the plain CONNECT 3proxy logged:\n{hap}")
+if not re.search(r"^203\.0\.113\.10:\d+ 31006 %s:%d \d+ \d+ \d+$" % (re.escape(p3["clientIp"]), p3["clientPort"]), hap, re.M):
+    die(f"no haproxy line '<client> 31006 {p3['clientIp']}:{p3['clientPort']} ...' for the plain CONNECT 3proxy logged:\n{hap}")
 print(f"radius {plain} | 3proxy {p3['service']} {p3['port']} {p3['clientIp']}:{p3['clientPort']} -> {p3['localIp']} as {p3['login']}")
 PY
 res="$(python3 -I check.py "$TMP" "$LOGIN")" || fail "$res"
 echo "  $res"
-ok "e2e: RADIUS gets the same Access-Request from plain HTTP as from TLS (NAS-Port = the dialed port, NAS-IP 127.0.0.3, client 127.0.0.1; a wrong password reaches RADIUS), 3proxy logs the same record, haproxy's line joins the client to it"
+ok "e2e: RADIUS gets the same Access-Request from plain HTTP as from TLS (NAS-Port = the dialed port, NAS-IP 127.0.0.3, client = the hop source 127.0.1.x; a wrong password reaches RADIUS), 3proxy logs the same record, haproxy's line joins the client to it"
 echo "PASS ($PASS)"

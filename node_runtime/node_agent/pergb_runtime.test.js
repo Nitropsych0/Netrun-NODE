@@ -113,8 +113,14 @@ test("haproxy: maxconn 2 x maxConns + 1000, the range bind, TLS/SOCKS5/plain HTT
   assert.match(t, /^    bind 198\.51\.100\.7:10000-10999$/m);
   assert.match(t, /^    bind abns@netrun_pergb_tls accept-proxy ssl crt-list \/x\/crt-list alpn http\/1\.1$/m);
   assert.match(t, /^    stats socket \/run\/x\/haproxy\.sock mode 600 level admin$/m);
-  assert.match(t, /^    server socks 127\.0\.0\.4$/m);
-  assert.match(t, /^    server http 127\.0\.0\.3$/m);
+  // the hop to 3proxy-pergb from HOP_SOURCES loopback sources per backend
+  // (2026-10-10: one source capped the base port at ~6976 connections)
+  for (let k = 1; k <= rt.HOP_SOURCES; k += 1) {
+    assert.match(t, new RegExp(`^    server socks${k} 127\\.0\\.0\\.4 source 127\\.0\\.2\\.${k}$`, "m"));
+    assert.match(t, new RegExp(`^    server http${k} 127\\.0\\.0\\.3 source 127\\.0\\.1\\.${k}$`, "m"));
+  }
+  assert.strictEqual((t.match(/^    balance leastconn$/gm) || []).length, 2);
+  assert.ok(!/^    server (http|socks) /m.test(t), "no hop server without a source");
   assert.match(t, /^    server tls abns@netrun_pergb_tls send-proxy-v2$/m);
   assert.match(t, /^    log-format "%ci:%cp %fp %bi:%bp %Tt %B %U"$/m);
   assert.match(t, /^    log \/dev\/log local1 info$/m);
@@ -137,7 +143,7 @@ test("haproxy: maxconn 2 x maxConns + 1000, the range bind, TLS/SOCKS5/plain HTT
   const acls = fe.filter((l) => /^    acl /.test(l));
   assert.ok(acls.length > 0 && acls.every((l) => /^    acl plain_http req\.payload\(0,\d\) -m bin [0-9a-f ]+$/.test(l)), acls.join("\n"));
   assert.ok(fe.indexOf(acls.at(-1)) < fe.indexOf(rules[0]), "the ACL is declared before the rules use it");
-  assert.match(t, /\nbackend pergb_http\n    server http 127\.0\.0\.3\n/, "one HTTP backend for both paths, port-less (the dialed port)");
+  assert.match(t, /\nbackend pergb_http\n    balance leastconn\n    server http1 127\.0\.0\.3 source 127\.0\.1\.1\n/, "one HTTP backend for both paths, port-less (the dialed port)");
   assert.strictEqual(t.match(/^backend pergb_http$/gm).length, 1);
   // the header says what the shared ports take (an internal file, not advertised anywhere)
   assert.match(t, /^# SOCKS5 -> 3proxy-pergb socks 127\.0\.0\.4:<port>, a plain HTTP-proxy request -> 127\.0\.0\.3:<port>$/m);

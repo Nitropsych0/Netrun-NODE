@@ -811,6 +811,18 @@ client ─► netrun-pergb-haproxy <egress IPv4>:<base>-<base+999>
 3proxy-pergb (uid 65533) ─ Access-Request ─► netrun-radius 127.0.0.1:1812 ─ Framed address ─► egress
 ```
 
+The haproxy → 3proxy-pergb hop leaves from 8 loopback sources per backend
+(`127.0.1.1`–`.8` to the HTTP proxy, `127.0.2.1`–`.8` to SOCKS, `balance leastconn`;
+`pergb_runtime.HOP_SOURCES`). The kernel gives that hop one ephemeral port per
+(source, `127.0.0.3|4`, port), `ip_local_port_range 1024 8000` holds ~6976, and every
+session line of every list dials the base port: from `127.0.0.1` alone the base port
+stopped at 6976 concurrent connections (load test 2026-10-10: 999 + 6976 = 7975, haproxy
+`Connect() failed for backend pergb_http: no free ports`). haproxy binds the source with
+`IP_BIND_ADDRESS_NO_PORT`, so each source adds another ~6976 per destination port
+(~55 800 for the base port) and leaves the ports free for 3proxy's own egress. 3proxy
+sees the source as the client (RADIUS client, `%C`, haproxy's `%bi`): nothing keys on
+`127.0.0.1`.
+
 | What | Where | Written by |
 |---|---|---|
 | binary (hash-pinned) | `/opt/netrun/pergb/bin/3proxy-pergb` + `.sha256` | `install_pergb.sh` |

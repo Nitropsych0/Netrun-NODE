@@ -82,6 +82,19 @@ const DROPIN_NAME = "50-netrun-enable.conf";
 
 const HTTP_LISTEN = "127.0.0.3";
 const SOCKS_LISTEN = "127.0.0.4";
+// The haproxy -> 3proxy-pergb hop leaves from HOP_SOURCES loopback addresses
+// per backend (127.0.1.<k> to the HTTP proxy, 127.0.2.<k> to SOCKS), not from
+// 127.0.0.1 alone: the kernel gives the hop one ephemeral port per (source,
+// 127.0.0.3|4, port) and ip_local_port_range 1024-8000 holds ~6976 of them,
+// while every session line of every list dials the base port — the 2026-10-10
+// load test capped at 999 + 6976 = 7975 concurrent connections there
+// (haproxy "Connect() failed for backend pergb_http: no free ports"). haproxy
+// binds the source with IP_BIND_ADDRESS_NO_PORT, so each address adds another
+// ~6976 per destination port. 3proxy sees the source as the client
+// (RADIUS client, %C in its log, %bi in haproxy's): nothing keys on 127.0.0.1.
+const HOP_SOURCES = 8;
+const HOP_HTTP_NET = "127.0.1";
+const HOP_SOCKS_NET = "127.0.2";
 const RADIUS_ADDR = "127.0.0.1";
 const DEFAULT_COUNT = 1000;
 const DEFAULT_PROCS = 2;
@@ -377,7 +390,8 @@ ${plainHttpAcl()}
     default_backend pergb_socks
 
 backend pergb_socks
-    server socks ${SOCKS_LISTEN}
+    balance leastconn
+${hopServers("socks", SOCKS_LISTEN, HOP_SOCKS_NET)}
 
 backend pergb_tls_loop
     server tls abns@netrun_pergb_tls send-proxy-v2
@@ -387,8 +401,17 @@ frontend pergb_tls
     default_backend pergb_http
 
 backend pergb_http
-    server http ${HTTP_LISTEN}
+    balance leastconn
+${hopServers("http", HTTP_LISTEN, HOP_HTTP_NET)}
 `;
+}
+
+// HOP_SOURCES port-less servers to one 3proxy-pergb listener, each from its
+// own loopback source (see HOP_SOURCES).
+function hopServers(name, listen, net) {
+  const out = [];
+  for (let k = 1; k <= HOP_SOURCES; k += 1) out.push(`    server ${name}${k} ${listen} source ${net}.${k}`);
+  return out.join("\n");
 }
 
 function tasksMax(params) {
@@ -1155,6 +1178,9 @@ module.exports = {
   RADIUS_SERVICE,
   HTTP_LISTEN,
   SOCKS_LISTEN,
+  HOP_SOURCES,
+  HOP_HTTP_NET,
+  HOP_SOCKS_NET,
   ACL_OPERATIONS,
   PLAIN_HTTP_METHODS,
   LOGFORMAT,
