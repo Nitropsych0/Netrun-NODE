@@ -152,9 +152,10 @@ grep -qx "ExecStop=-/sbin/ip -6 route del local 2602:f2dc:a9::/48 dev lo" "$unit
 grep -q "^Before=netrun-3proxy-restore.service bird.service" "$unit" || fail "unit ordering"
 dropin="$NETRUN_BGP_UNIT_DIR/bird.service.d/netrun.conf"
 grep -qx "Requires=netrun-bgp-prefix.service" "$dropin" && grep -qx "After=netrun-bgp-prefix.service" "$dropin" || fail "bird drop-in"
+grep -qx "Restart=always" "$dropin" && grep -qx "RestartSec=5" "$dropin" || fail "bird drop-in restarts BIRD whatever the exit"
 [ "$(cat "$NETRUN_BGP_LIST_FILE")" = "2602:f2dc:a9::/48" ] || fail "prefix list file"
 cmp -s "$BGP" "$NETRUN_BGP_SELF" && [ -x "$NETRUN_BGP_SELF" ] || fail "netrun-bgp copy installed"
-ok "apply: route first, checked config, 0640 bird.conf, boot unit, bird drop-in, list file, netrun-bgp copy"
+ok "apply: route first, checked config, 0640 bird.conf, boot unit, bird drop-in (+ Restart=always), list file, netrun-bgp copy"
 
 # The :179 guard: only the neighbour, loaded (after nft -c) before BIRD starts,
 # re-applied at boot; the 3proxy egress guard refreshed after the apply.

@@ -274,6 +274,12 @@ bird_dropin_text() {
 [Unit]
 Requires=${UNIT}
 After=${UNIT}
+
+# Debian ships Restart=on-abort: BIRD exiting with an error stayed down, the
+# prefixes were withdrawn and every exit address dead until someone restarted it.
+[Service]
+Restart=always
+RestartSec=5
 EOF
 }
 
