@@ -317,6 +317,10 @@ Tests: `bash scripts/test_3proxy_spawn.sh`, `bash scripts/test_generator_flags.s
 
 ## Security hardening (audit 2026-10-08)
 
+2026-10-10: `agent-firewall` also limits SSH (22) to the orchestrator IP — reach a
+node with `ssh -J root@<orchestrator> root@<node>` (the Vultr console when the
+orchestrator is gone); `NETRUN_SSH_GUARD=0` leaves SSH open (keys only either way).
+
 `bash scripts/netrun-harden.sh secure` (installer and `node_followup_v2.sh` run it;
 existing nodes: `apply_capacity_tuning.sh --apply --only security`) — idempotent, never
 restarts 3proxy:

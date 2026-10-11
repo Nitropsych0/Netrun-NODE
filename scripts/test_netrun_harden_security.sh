@@ -167,6 +167,8 @@ ok "agent-firewall: persisted through netrun-nft-persist"
 # ── 5. pay-per-GB: the agent guard covers 8086 (plan D16) ─────────
 grep -q 'tcp dport { 8085, 8086 } ip saddr 95.217.98.125 accept' "$TMP_FLAGS/nft_stdin" \
   && grep -q 'tcp dport { 8085, 8086 } drop' "$TMP_FLAGS/nft_stdin" || fail "applied guard: $(cat "$TMP_FLAGS/nft_stdin")"
+grep -qx '    tcp dport 22 ip saddr 95.217.98.125 accept' "$TMP_FLAGS/nft_stdin" && grep -qx '    tcp dport 22 drop' "$TMP_FLAGS/nft_stdin" \
+  || fail "SSH only from the orchestrator: $(cat "$TMP_FLAGS/nft_stdin")"
 grep -qx 'table inet netrun_agent_guard|delete table inet netrun_agent_guard|' <<< "$(head -n2 "$TMP_FLAGS/nft_stdin" | tr '\n' '|')" \
   || fail "the guard is not replaced in one transaction: $(head -n3 "$TMP_FLAGS/nft_stdin")"
 grep -q '^nft delete table' "$STUB_LOG" && fail "a separate delete leaves the agent open between two nft calls"
@@ -188,9 +190,16 @@ rm -f "$TMP_FLAGS/nft_stdin"
 grep -qx REFRESH <<< "$(NETRUN_HARDEN_SOURCED=1 bash -c 'source <(sed "/^case \"\${1:-}\" in/,\$d" "$1"); if [ -n "$(agent_guard_ip)" ] && ! agent_guard_covers_all; then echo REFRESH; fi' _ "$H")" \
   || fail "secure's check: an 8085-only guard must be refreshed"
 printf 'table inet netrun_agent_guard {\n\tchain input {\n\t\ttcp dport { 8085, 8086 } ip saddr 95.217.98.125 accept\n\t\ttcp dport { 8085, 8086 } drop\n\t}\n}\n' > "$TMP_FLAGS/guard_table"
+grep -qx REFRESH <<< "$(NETRUN_HARDEN_SOURCED=1 bash -c 'source <(sed "/^case \"\${1:-}\" in/,\$d" "$1"); if [ -n "$(agent_guard_ip)" ] && ! agent_guard_covers_all; then echo REFRESH; fi' _ "$H")" \
+  || fail "secure's check: a guard without SSH must be refreshed (2026-10-10)"
+grep -qx COVERED <<< "$(NETRUN_SSH_GUARD=0 NETRUN_HARDEN_SOURCED=1 bash -c 'source <(sed "/^case \"\${1:-}\" in/,\$d" "$1"); agent_guard_covers_all && echo COVERED' _ "$H")" \
+  || fail "NETRUN_SSH_GUARD=0: a guard with 8086 counts as covered"
+printf 'table inet netrun_agent_guard {\n\tchain input {\n\t\ttcp dport { 8085, 8086 } ip saddr 95.217.98.125 accept\n\t\ttcp dport { 8085, 8086 } drop\n\t\ttcp dport 22 ip saddr 95.217.98.125 accept\n\t\ttcp dport 22 drop\n\t}\n}\n' > "$TMP_FLAGS/guard_table"
 grep -qx COVERED <<< "$(NETRUN_HARDEN_SOURCED=1 bash -c 'source <(sed "/^case \"\${1:-}\" in/,\$d" "$1"); agent_guard_covers_all && echo COVERED' _ "$H")" \
-  || fail "a guard with 8086 counts as covered"
+  || fail "a guard with 8086 and SSH counts as covered"
+out="$(NETRUN_SSH_GUARD=0 bash "$H" agent-firewall 95.217.98.125 --dry-run 2>&1)"
+echo "$out" | grep -q 'dport 22' && fail "NETRUN_SSH_GUARD=0 must leave SSH out: $out"
 rm -f "$TMP_FLAGS/guard_table"
-ok "agent-firewall: 8085 + 8086 only from the orchestrator (one transaction, --dry-run, refresh from the live table, secure upgrades an 8085-only guard)"
+ok "agent-firewall: 8085 + 8086 + SSH only from the orchestrator (one transaction, --dry-run, refresh from the live table, secure upgrades an older guard, NETRUN_SSH_GUARD=0)"
 
 echo "PASS ($PASS)"
