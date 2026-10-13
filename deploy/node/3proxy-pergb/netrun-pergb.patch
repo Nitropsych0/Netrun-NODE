@@ -1,4 +1,4 @@
-NETRUN per-GB 3proxy: 3proxy 0.9.3 (upstream tag 0.9.3) + three changes.
+NETRUN per-GB 3proxy: 3proxy 0.9.3 (upstream tag 0.9.3) + four changes.
 Applied with `patch -p1` in the extracted 3proxy-0.9.3/ tree by
 scripts/build_3proxy_pergb.sh; the result is deploy/node/bin/3proxy-pergb
 (sha256 pinned in deploy/node/bin/3proxy-pergb.sha256). Per-piece batches keep
@@ -23,6 +23,12 @@ the stock deploy/node/bin/3proxy.
    outbound socket, so the source port is chosen at connect() for the full
    4-tuple: sockets from one egress address to different destinations share
    source ports instead of each holding one of ip_local_port_range.
+4. common.c (doconnect, #4 OS fingerprint): from the login's -os-<profile>, set
+   the outbound hop limit (128 for windows, 64 for macos — IP_TTL /
+   IPV6_UNICAST_HOPS, no privilege) and SO_MARK (1 windows, 2 macos) for the
+   egress fingerprint rewriter (deploy/node/osfp); SO_MARK needs CAP_NET_ADMIN
+   and fails harmlessly without it (only the TTL applies). The window / scale /
+   option / timestamp rewrite is done by that rewriter, not in 3proxy.
 
 diff -ru a/src/common.c b/src/common.c
 --- a/src/common.c
@@ -46,7 +52,7 @@ diff -ru a/src/common.c b/src/common.c
  		}
  		return 0;
  }
-@@ -443,11 +455,44 @@
+@@ -443,11 +455,56 @@
  			param->sinsl = param->srv->extsa;
  	}
  	*SAPORT(&param->sinsl) = 0;
@@ -73,20 +79,32 @@ diff -ru a/src/common.c b/src/common.c
 +		   here. Set on the outbound socket before connect so the SYN
 +		   carries it; no privilege needed. The TCP window / scale / option
 +		   part of the fingerprint is done by the tc-bpf egress program. */
-+		if(param->username && strstr((char *)param->username, "-os-windows")){
-+			int hops = 128;
-+			if(*SAFAMILY(&param->sinsr) == AF_INET){
++		if(param->username){
++			int osmark = 0, hops = 0;
++			if(strstr((char *)param->username, "-os-windows")){ osmark = 1; hops = 128; }
++			else if(strstr((char *)param->username, "-os-macos")){ osmark = 2; hops = 64; }
++			if(osmark){
++				if(hops){
++					if(*SAFAMILY(&param->sinsr) == AF_INET){
 +#ifdef IP_TTL
-+				so._setsockopt(param->remsock, IPPROTO_IP, IP_TTL, (char *)&hops, sizeof(hops));
++						so._setsockopt(param->remsock, IPPROTO_IP, IP_TTL, (char *)&hops, sizeof(hops));
 +#endif
-+			}
++					}
 +#ifndef NOIPV6
-+			else if(*SAFAMILY(&param->sinsr) == AF_INET6){
++					else if(*SAFAMILY(&param->sinsr) == AF_INET6){
 +#ifdef IPV6_UNICAST_HOPS
-+				so._setsockopt(param->remsock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (char *)&hops, sizeof(hops));
++						so._setsockopt(param->remsock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (char *)&hops, sizeof(hops));
++#endif
++					}
++#endif
++				}
++				/* mark for the egress fingerprint helper (tc/NFQUEUE):
++				   1 windows, 2 macos. Needs CAP_NET_ADMIN; without it the
++				   setsockopt fails harmlessly and only the TTL applies. */
++#ifdef SO_MARK
++				so._setsockopt(param->remsock, SOL_SOCKET, SO_MARK, (char *)&osmark, sizeof(osmark));
 +#endif
 +			}
-+#endif
 +		}
  		if(connectwithpoll(param->remsock,(struct sockaddr *)&param->sinsr,SASIZE(&param->sinsr),CONNECT_TO)) {
  			return 13;

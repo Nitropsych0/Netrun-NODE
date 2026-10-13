@@ -1,0 +1,20 @@
+[Unit]
+Description=NETRUN per-GB OS-fingerprint egress rewriter (NFQUEUE)
+After=network-online.target netrun-pergb.slice
+# The nft rule uses `queue ... bypass`, so a stopped/dead daemon lets marked
+# SYNs pass UNMODIFIED — egress never breaks when this unit is down.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/netrun/osfp/netrun-osfp-daemon.py 0
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+Restart=always
+RestartSec=2
+# resource guard — SYN-rate only (opt-in -os- clients), keep it small
+MemoryMax=128M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

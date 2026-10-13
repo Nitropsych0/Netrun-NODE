@@ -1,0 +1,11 @@
+# NETRUN per-GB OS-fingerprint: send only our own marked, pure SYNs to the
+# rewriter queue, with `bypass` (no daemon -> unmodified). 3proxy (patched)
+# sets meta mark 1 (windows) / 2 (macos) on the outbound socket via SO_MARK.
+# Scope: egress on the uplink NIC, TCP SYN (not SYN-ACK), mark in {1,2}.
+table inet netrun_osfp {
+    chain egress {
+        type filter hook output priority 0; policy accept;
+        meta mark != { 1, 2 } return
+        meta l4proto tcp tcp flags & (syn|ack) == syn queue num 0 bypass
+    }
+}
