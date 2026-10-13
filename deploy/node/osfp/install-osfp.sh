@@ -50,6 +50,11 @@ log "5) start the rewriter, then the nft rule (bypass: safe if the daemon dies)"
 systemctl enable --now netrun-osfp.service
 sleep 1
 systemctl is-active --quiet netrun-osfp.service || { log "ABORT: daemon not active"; exit 1; }
+# Drop any existing table first: `nft -f` MERGES into an existing table, so a
+# re-run (or an upgrade over an older table whose rule matched a different mark)
+# would stack rules — an older `meta mark != {…} return` left in front of ours
+# short-circuits every one of our marked SYNs. Delete → re-add = exactly one rule.
+nft delete table inet netrun_osfp 2>/dev/null || true
 nft -f "$(dirname "$0")/netrun-osfp.nft"
 
 log "6) restart 3proxy so SO_MARK takes effect"
