@@ -55,8 +55,14 @@ class LoginError(Exception):
         self.base = base  # the base login when it parsed, for per-list reject records
 
 
+#: #4 OS-fingerprint profiles accepted in the login (``-os-<profile>``). The
+#: address derivation ignores os; 3proxy applies the TCP/IP fingerprint on the
+#: outbound socket. RADIUS only has to accept the suffix.
+OS_PROFILES = ("linux", "windows", "macos")
+
+
 class Login:
-    __slots__ = ("base", "login_id", "session", "ttl", "static", "rotate", "country", "probe")
+    __slots__ = ("base", "login_id", "session", "ttl", "static", "rotate", "country", "os", "probe")
 
     def __init__(self, base: str, login_id: str):
         self.base = base
@@ -66,12 +72,13 @@ class Login:
         self.static = False
         self.rotate = False
         self.country = None
+        self.os = None
         self.probe = base == PROBE_LOGIN
 
     def __repr__(self):
         return (
             f"Login({self.base!r}, session={self.session!r}, ttl={self.ttl!r}, "
-            f"static={self.static}, rotate={self.rotate}, country={self.country!r})"
+            f"static={self.static}, rotate={self.rotate}, country={self.country!r}, os={self.os!r})"
         )
 
 
@@ -114,11 +121,15 @@ def parse(raw, geo: str | None = None) -> Login:
         elif key == "rotate":
             out.rotate = True
             i += 1
-        elif key in ("session", "ttl", "country"):
+        elif key in ("session", "ttl", "country", "os"):
             if i + 1 >= n:
                 raise LoginError("bad_params", base)
             val = tokens[i + 1]
-            if key == "session":
+            if key == "os":
+                if val not in OS_PROFILES:
+                    raise LoginError("bad_params", base)
+                out.os = val
+            elif key == "session":
                 if not _SESSION_RE.match(val):
                     raise LoginError("bad_params", base)
                 out.session = val

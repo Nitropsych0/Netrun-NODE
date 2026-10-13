@@ -31,6 +31,13 @@ class Grammar(unittest.TestCase):
             "netrun-abcdefghijkl": dict(),
             "netrun-7k2f9ab-session-" + "s" * 32: dict(session="s" * 32),
             "netrun-7k2f9ab-session-static": dict(session="static"),
+            # #4 OS fingerprint: -os-<profile> is accepted; it does not change
+            # the address (3proxy applies the TCP/IP fingerprint on egress).
+            "netrun-7k2f9ab-os-windows": dict(os="windows"),
+            "netrun-7k2f9ab-os-macos": dict(os="macos"),
+            "netrun-7k2f9ab-os-linux": dict(os="linux"),
+            "netrun-7k2f9ab-session-job1-os-windows": dict(session="job1", os="windows"),
+            "netrun-7k2f9ab": dict(os=None),
         }
         for name, want in cases.items():
             got = p(name)
@@ -77,6 +84,10 @@ class Grammar(unittest.TestCase):
             "netrun-7k2f9ab-ttl-10",
             "netrun-7k2f9ab-ttl-10d",
             "netrun-7k2f9ab-ttl-9999999s",
+            "netrun-7k2f9ab-os",
+            "netrun-7k2f9ab-os-android",
+            "netrun-7k2f9ab-os-win",
+            "netrun-7k2f9ab-os-windows-os-macos",
             "netrun-7k2f9ab-rotate-session-x",
             "netrun-7k2f9ab-rotate-ttl-1h",
             "netrun-7k2f9ab-rotate-static",

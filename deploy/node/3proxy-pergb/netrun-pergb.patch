@@ -46,7 +46,7 @@ diff -ru a/src/common.c b/src/common.c
  		}
  		return 0;
  }
-@@ -443,6 +455,18 @@
+@@ -443,11 +455,44 @@
  			param->sinsl = param->srv->extsa;
  	}
  	*SAPORT(&param->sinsl) = 0;
@@ -65,6 +65,32 @@ diff -ru a/src/common.c b/src/common.c
  	if(so._bind(param->remsock, (struct sockaddr*)&param->sinsl, SASIZE(&param->sinsl))==-1) {
  		return 12;
  	}
+ 	
+ 	if(param->operation >= 256 || (param->operation & CONNECT)){
++		/* netrun-pergb #4: per-client OS fingerprint from the login's
++		   -os-<profile>. Windows advertises hop limit 128 (the main p0f
++		   tell); macOS and Linux keep 64, so only Windows is rewritten
++		   here. Set on the outbound socket before connect so the SYN
++		   carries it; no privilege needed. The TCP window / scale / option
++		   part of the fingerprint is done by the tc-bpf egress program. */
++		if(param->username && strstr((char *)param->username, "-os-windows")){
++			int hops = 128;
++			if(*SAFAMILY(&param->sinsr) == AF_INET){
++#ifdef IP_TTL
++				so._setsockopt(param->remsock, IPPROTO_IP, IP_TTL, (char *)&hops, sizeof(hops));
++#endif
++			}
++#ifndef NOIPV6
++			else if(*SAFAMILY(&param->sinsr) == AF_INET6){
++#ifdef IPV6_UNICAST_HOPS
++				so._setsockopt(param->remsock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (char *)&hops, sizeof(hops));
++#endif
++			}
++#endif
++		}
+ 		if(connectwithpoll(param->remsock,(struct sockaddr *)&param->sinsr,SASIZE(&param->sinsr),CONNECT_TO)) {
+ 			return 13;
+ 		}
 diff -ru a/src/conf.c b/src/conf.c
 --- a/src/conf.c
 +++ b/src/conf.c
