@@ -15,6 +15,16 @@ the stock deploy/node/bin/3proxy.
    outbound socket, so the source port is chosen at connect() for the full
    4-tuple: sockets from one egress address to different destinations share
    source ports instead of each holding one of ip_local_port_range.
+3. socks.c (SOCKS listener): consume an optional HAProxy PROXY v2 header at the
+   start of sockschild and set sincr = the real client, sincl = the public
+   address the client dialed. The per-GB haproxy sends send-proxy-v2 on the
+   pergb_socks backend (loopback-only, trusted). The existing SOCKS5 UDP
+   ASSOCIATE relay then advertises the PUBLIC sincl (not the 127.0.0.4 the
+   listener binds) and validates incoming datagrams against the REAL client
+   sincr (not haproxy's loopback hop source) -- so UDP works on the same
+   ports, natively, with the same domain/login. A SOCKS greeting (first byte
+   5/4) never matches the magic (0x0D), so a connection without the header is
+   untouched.
 
 diff -ru a/src/common.c b/src/common.c
 --- a/src/common.c
@@ -52,3 +62,73 @@ diff -ru a/src/conf.c b/src/conf.c
  	if(strstr((char *) *(argv + 1), "ip")) conf.authcachetype |= 1;
  	if(strstr((char *) *(argv + 1), "user")) conf.authcachetype |= 2;
  	if(strstr((char *) *(argv + 1), "pass")) conf.authcachetype |= 4;
+diff -ru a/src/socks.c b/src/socks.c
+--- a/src/socks.c
++++ b/src/socks.c
+@@ -40,6 +40,66 @@
+ 
+  if(!(buf = myalloc(BUFSIZE))) {RETURN(21);}
+  memset(buf, 0, BUFSIZE);
++ /* netrun-pergb: consume an optional HAProxy PROXY v2 header (send-proxy-v2
++    on the pergb_socks backend; loopback-only listener, so it is trusted) and
++    set sincr = the real client and sincl = the public address the client
++    dialed. The SOCKS5 UDP ASSOCIATE relay (command 3 below) then advertises
++    that public sincl and checks datagrams against the real sincr, so UDP
++    works on the same ports without any extra client setup. A SOCKS greeting
++    (first byte 5/4) never equals the magic (0x0D), so a header-less
++    connection is left byte-for-byte untouched. */
++#ifndef MSG_PEEK
++#define MSG_PEEK 2
++#endif
++ {
++	static const unsigned char pp2sig[12] =
++		{0x0D,0x0A,0x0D,0x0A,0x00,0x0D,0x0A,0x51,0x55,0x49,0x54,0x0A};
++	unsigned char pp[16];
++	struct pollfd ppfd;
++	int ppg = 0, pptries;
++	ppfd.fd = param->clisock; ppfd.events = POLLIN;
++	for(pptries = 0; pptries < 8; pptries++){
++		if(so._poll(&ppfd, 1, conf.timeouts[SINGLEBYTE_L]*1000) <= 0){ppg = 0; break;}
++		ppg = (int)so._recv(param->clisock, (void *)pp, 16, MSG_PEEK);
++		if(ppg <= 0){ppg = 0; break;}
++		if(memcmp(pp, pp2sig, (ppg < 12) ? ppg : 12)){ppg = 0; break;}
++		if(ppg >= 16) break;
++	}
++	if(ppg >= 16 && (pp[12] & 0xf0) == 0x20){
++		int ppalen = (pp[14] << 8) | pp[15];
++		int ppcmd = pp[12] & 0x0f;
++		int ppfam = pp[13];
++		int pptot = 16 + ppalen, ppoff = 0, ppr;
++		if(pptot >= 16 && pptot <= (int)BUFSIZE){
++			while(ppoff < pptot){
++				ppr = (int)so._recv(param->clisock, (void *)(buf + ppoff), pptot - ppoff, 0);
++				if(ppr <= 0) break;
++				ppoff += ppr;
++			}
++			if(ppoff == pptot && ppcmd == 1){
++				unsigned char *ppa = buf + 16;
++				if(ppfam == 0x11 && ppalen >= 12){
++					*SAFAMILY(&param->sincr) = AF_INET;
++					memcpy(SAADDR(&param->sincr), ppa, 4);
++					memcpy(SAPORT(&param->sincr), ppa + 8, 2);
++					*SAFAMILY(&param->sincl) = AF_INET;
++					memcpy(SAADDR(&param->sincl), ppa + 4, 4);
++					memcpy(SAPORT(&param->sincl), ppa + 10, 2);
++				}
++#ifndef NOIPV6
++				else if(ppfam == 0x21 && ppalen >= 36){
++					*SAFAMILY(&param->sincr) = AF_INET6;
++					memcpy(SAADDR(&param->sincr), ppa, 16);
++					memcpy(SAPORT(&param->sincr), ppa + 32, 2);
++					*SAFAMILY(&param->sincl) = AF_INET6;
++					memcpy(SAADDR(&param->sincl), ppa + 16, 16);
++					memcpy(SAPORT(&param->sincl), ppa + 34, 2);
++				}
++#endif
++			}
++		}
++	}
++ }
+  if ((ver = sockgetcharcli(param, conf.timeouts[SINGLEBYTE_L], 0)) != 5 && ver != 4) {
+ 	RETURN(401);
+  } /* version */
