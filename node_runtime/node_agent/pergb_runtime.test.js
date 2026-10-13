@@ -116,12 +116,15 @@ test("haproxy: maxconn 2 x maxConns + 1000, the range bind, TLS/SOCKS5/plain HTT
   // the hop to 3proxy-pergb from HOP_SOURCES loopback sources per backend
   // (2026-10-10: one source capped the base port at ~6976 connections)
   for (let k = 1; k <= rt.HOP_SOURCES; k += 1) {
-    assert.match(t, new RegExp(`^    server socks${k} 127\\.0\\.0\\.4 source 127\\.0\\.2\\.${k}$`, "m"));
+    assert.match(t, new RegExp(`^    server socks${k} 127\\.0\\.0\\.4 source 127\\.0\\.2\\.${k} send-proxy-v2$`, "m"));
     assert.match(t, new RegExp(`^    server http${k} 127\\.0\\.0\\.3 source 127\\.0\\.1\\.${k}$`, "m"));
   }
   assert.strictEqual((t.match(/^    balance leastconn$/gm) || []).length, 2);
   assert.ok(!/^    server (http|socks) /m.test(t), "no hop server without a source");
   assert.match(t, /^    server tls abns@netrun_pergb_tls send-proxy-v2$/m);
+  // SOCKS5 UDP ASSOCIATE needs the real client IP → send-proxy-v2 on the socks
+  // hop only; the HTTP/TLS backend must stay clean (UDP is a SOCKS-only command)
+  assert.doesNotMatch(t, /^    server http\d.*send-proxy-v2/m, "http hop must not send PROXY protocol");
   assert.match(t, /^    log-format "%ci:%cp %fp %bi:%bp %Tt %B %U"$/m);
   assert.match(t, /^    log \/dev\/log local1 info$/m);
   assert.doesNotMatch(t, /abns@netrun_tls\b/, "never the per-piece TLS socket");

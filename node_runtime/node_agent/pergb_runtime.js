@@ -391,7 +391,7 @@ ${plainHttpAcl()}
 
 backend pergb_socks
     balance leastconn
-${hopServers("socks", SOCKS_LISTEN, HOP_SOCKS_NET)}
+${hopServers("socks", SOCKS_LISTEN, HOP_SOCKS_NET, " send-proxy-v2")}
 
 backend pergb_tls_loop
     server tls abns@netrun_pergb_tls send-proxy-v2
@@ -408,9 +408,13 @@ ${hopServers("http", HTTP_LISTEN, HOP_HTTP_NET)}
 
 // HOP_SOURCES port-less servers to one 3proxy-pergb listener, each from its
 // own loopback source (see HOP_SOURCES).
-function hopServers(name, listen, net) {
+function hopServers(name, listen, net, extra) {
+  // `extra` (socks backend: " send-proxy-v2") makes haproxy prepend a PROXY v2
+  // header so 3proxy-pergb learns the real client IP (SOCKS5 UDP ASSOCIATE
+  // needs it to advertise the public relay addr and check datagram sources).
+  const suffix = extra || "";
   const out = [];
-  for (let k = 1; k <= HOP_SOURCES; k += 1) out.push(`    server ${name}${k} ${listen} source ${net}.${k}`);
+  for (let k = 1; k <= HOP_SOURCES; k += 1) out.push(`    server ${name}${k} ${listen} source ${net}.${k}${suffix}`);
   return out.join("\n");
 }
 
