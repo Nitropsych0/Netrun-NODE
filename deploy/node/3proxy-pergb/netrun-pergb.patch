@@ -1,4 +1,4 @@
-NETRUN per-GB 3proxy: 3proxy 0.9.3 (upstream tag 0.9.3) + two changes.
+NETRUN per-GB 3proxy: 3proxy 0.9.3 (upstream tag 0.9.3) + three changes.
 Applied with `patch -p1` in the extracted 3proxy-0.9.3/ tree by
 scripts/build_3proxy_pergb.sh; the result is deploy/node/bin/3proxy-pergb
 (sha256 pinned in deploy/node/bin/3proxy-pergb.sha256). Per-piece batches keep
@@ -11,7 +11,15 @@ the stock deploy/node/bin/3proxy.
    type 6, one per connection with `acl`, each insert a walk of the whole list
    under the global hash mutex. Upstream turns 0 into 6, so the cache could not
    be switched off from the cfg.
-2. common.c (outbound connect): IP_BIND_ADDRESS_NO_PORT before the bind of the
+2. common.c (connectwithpoll): after poll() reports the non-blocking connect
+   finished, check SO_ERROR before declaring success. poll() returns the socket
+   writable on a FAILED connect too (POLLOUT|POLLERR for an RST or an
+   unreachable host), so stock 3proxy answers "200 Connection established" (and
+   a SOCKS success) for a dead upstream, then the relay closes at once — a
+   client sees a TLS error instead of an honest 502/SOCKS reject, and proxy
+   checkers read the dead tunnel as alive. A non-zero SO_ERROR now fails the
+   connect (code 13 -> 502 / SOCKS reply 5).
+3. common.c (outbound connect): IP_BIND_ADDRESS_NO_PORT before the bind of the
    outbound socket, so the source port is chosen at connect() for the full
    4-tuple: sockets from one egress address to different destinations share
    source ports instead of each holding one of ip_local_port_range.
@@ -19,7 +27,26 @@ the stock deploy/node/bin/3proxy.
 diff -ru a/src/common.c b/src/common.c
 --- a/src/common.c
 +++ b/src/common.c
-@@ -443,6 +443,18 @@
+@@ -382,6 +382,18 @@
+ 	        fds[0].events = POLLOUT;
+ 		if(so._poll(fds, 1, to*1000) <= 0) {
+ 			return (13);
++		}
++		/* netrun-pergb: poll() reports the socket writable on a FAILED
++		   connect too (POLLOUT|POLLERR for an RST / unreachable host), so
++		   stock 3proxy answers "200 Connection established" / a SOCKS
++		   success for a dead upstream. Check SO_ERROR and fail the connect
++		   (13) when it did not actually succeed. */
++		{
++			int so_err = 0;
++			SASIZETYPE so_errlen = sizeof(so_err);
++			if(so._getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&so_err, &so_errlen) || so_err) {
++				return (13);
++			}
+ 		}
+ 		return 0;
+ }
+@@ -443,6 +455,18 @@
  			param->sinsl = param->srv->extsa;
  	}
  	*SAPORT(&param->sinsl) = 0;
