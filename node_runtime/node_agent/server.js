@@ -21,6 +21,7 @@ const supervisorLib = require("./supervisor.js");
 const firewallLib = require("./firewall.js");
 const proxySpawn = require("./proxy_spawn.js");
 const httpsHostnamesLib = require("./https_hostnames.js");
+const osfpLib = require("./osfp.js");
 const { nodeSetting } = require("./node_settings.js");
 // Pay-per-GB v2 (lane L9) — the A1 address pool (release of per-piece /64s)
 // and /health clock.ntpSynchronized.
@@ -4606,6 +4607,13 @@ const server = http.createServer(async (req, res) => {
   // certificates); netrun-https does the ACME work (https_hostnames.js).
   if (pathname === "/https/hostnames") {
     if (await httpsHostnames.handleHttp(req, res, url, { sendJson, parseJsonBody, ensureAuthorized })) return;
+  }
+
+  // #4 OS fingerprint v2 — the p0f signature table synced from the orchestrator
+  // (osfp.run_due) to /opt/netrun/osfp/signatures.json; the rewriter daemon
+  // hot-reloads it (osfp.js).
+  if (pathname === "/osfp/signatures") {
+    if (await osfpLib.handleHttp(req, res, url, { sendJson, parseJsonBody, ensureAuthorized })) return;
   }
 
   // Wave IPV6-ROTATION — per-port egress IPv6 (rotate / per-connection /
