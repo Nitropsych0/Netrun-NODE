@@ -80,30 +80,30 @@ diff -ru a/src/common.c b/src/common.c
 +		   carries it; no privilege needed. The TCP window / scale / option
 +		   part of the fingerprint is done by the tc-bpf egress program. */
 +		if(param->username){
-+			int osmark = 0, hops = 0;
-+			if(strstr((char *)param->username, "-os-windows")){ osmark = 1; hops = 128; }
-+			else if(strstr((char *)param->username, "-os-macos")){ osmark = 2; hops = 64; }
-+			if(osmark){
-+				if(hops){
-+					if(*SAFAMILY(&param->sinsr) == AF_INET){
-+#ifdef IP_TTL
-+						so._setsockopt(param->remsock, IPPROTO_IP, IP_TTL, (char *)&hops, sizeof(hops));
-+#endif
-+					}
-+#ifndef NOIPV6
-+					else if(*SAFAMILY(&param->sinsr) == AF_INET6){
-+#ifdef IPV6_UNICAST_HOPS
-+						so._setsockopt(param->remsock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (char *)&hops, sizeof(hops));
-+#endif
-+					}
++			/* netrun-pergb #4 v2: per-client OS fingerprint. Mark the
++			   outbound socket with FNV-1a(name) from the login's
++			   -os-<name>; the egress helper (deploy/node/osfp) maps the
++			   mark to a p0f signature and rewrites the SYN (ttl, window,
++			   scale, options). SO_MARK needs CAP_NET_ADMIN; without it the
++			   setsockopt fails harmlessly (no spoof). Must match the FNV in
++			   osfp_rewrite.py / the orchestrator byte for byte. */
++			char *osn = strstr((char *)param->username, "-os-");
++			if(osn){
++				unsigned int h = 2166136261u;
++				int n = 0;
++				osn += 4;
++				while(osn[n] && osn[n] != '-' && n < 32){
++					unsigned char c = (unsigned char)osn[n];
++					if(c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
++					h = (h ^ c) * 16777619u;
++					n++;
++				}
++				if(n > 0){
++					int mark = (int)(0x10000000u | (h & 0x0FFFFFFFu));
++#ifdef SO_MARK
++					so._setsockopt(param->remsock, SOL_SOCKET, SO_MARK, (char *)&mark, sizeof(mark));
 +#endif
 +				}
-+				/* mark for the egress fingerprint helper (tc/NFQUEUE):
-+				   1 windows, 2 macos. Needs CAP_NET_ADMIN; without it the
-+				   setsockopt fails harmlessly and only the TTL applies. */
-+#ifdef SO_MARK
-+				so._setsockopt(param->remsock, SOL_SOCKET, SO_MARK, (char *)&osmark, sizeof(osmark));
-+#endif
 +			}
 +		}
  		if(connectwithpoll(param->remsock,(struct sockaddr *)&param->sinsr,SASIZE(&param->sinsr),CONNECT_TO)) {

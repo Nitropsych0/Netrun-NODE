@@ -32,6 +32,8 @@ log "2) code -> $OSFP"
 install -d -m 0755 "$OSFP"
 install -m 0644 "$(dirname "$0")/osfp_rewrite.py" "$OSFP/osfp_rewrite.py"
 install -m 0755 "$(dirname "$0")/netrun-osfp-daemon.py" "$OSFP/netrun-osfp-daemon.py"
+# seed signatures.json only if absent (never clobber a synced table)
+[ -f "$OSFP/signatures.json" ] || install -m 0644 "$(dirname "$0")/signatures.json" "$OSFP/signatures.json"
 
 log "3) unit"
 install -m 0644 "$(dirname "$0")/netrun-osfp.service" /etc/systemd/system/netrun-osfp.service

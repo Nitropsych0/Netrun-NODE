@@ -1,0 +1,37 @@
+{
+  "windows": {
+    "sig": "*:128:0:*:64240,8:mss,nop,ws,nop,nop,sok:df,id+:0",
+    "label": "Windows 10/11",
+    "enabled": true
+  },
+  "win7": {
+    "sig": "*:128:0:*:8192,8:mss,nop,ws,nop,nop,sok:df,id+:0",
+    "label": "Windows 7/8",
+    "enabled": true
+  },
+  "winxp": {
+    "sig": "*:128:0:*:16384,0:mss,nop,nop,sok:df,id+:0",
+    "label": "Windows XP",
+    "enabled": false
+  },
+  "macos": {
+    "sig": "*:64:0:*:65535,6:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0",
+    "label": "macOS",
+    "enabled": true
+  },
+  "iphone": {
+    "sig": "*:64:0:*:65535,6:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0",
+    "label": "iPhone (iOS)",
+    "enabled": true
+  },
+  "android": {
+    "sig": "*:64:0:*:65535,8:mss,sok,ts,nop,ws:df,id+:0",
+    "label": "Android",
+    "enabled": true
+  },
+  "linux": {
+    "sig": "*:64:0:*:mss*20,10:mss,sok,ts,nop,ws:df,id+:0",
+    "label": "Linux",
+    "enabled": true
+  }
+}

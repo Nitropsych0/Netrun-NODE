@@ -37,6 +37,8 @@ class Grammar(unittest.TestCase):
             "netrun-7k2f9ab-os-macos": dict(os="macos"),
             "netrun-7k2f9ab-os-linux": dict(os="linux"),
             "netrun-7k2f9ab-session-job1-os-windows": dict(session="job1", os="windows"),
+            "netrun-7k2f9ab-os-win7": dict(os="win7"),
+            "netrun-7k2f9ab-os-android": dict(os="android"),
             "netrun-7k2f9ab": dict(os=None),
         }
         for name, want in cases.items():
@@ -85,8 +87,7 @@ class Grammar(unittest.TestCase):
             "netrun-7k2f9ab-ttl-10d",
             "netrun-7k2f9ab-ttl-9999999s",
             "netrun-7k2f9ab-os",
-            "netrun-7k2f9ab-os-android",
-            "netrun-7k2f9ab-os-win",
+            "netrun-7k2f9ab-os-win.dows",
             "netrun-7k2f9ab-os-windows-os-macos",
             "netrun-7k2f9ab-rotate-session-x",
             "netrun-7k2f9ab-rotate-ttl-1h",

@@ -1,83 +1,151 @@
-"""netrun OS-fingerprint SYN rewriter (phase 2 core).
+"""netrun OS-fingerprint SYN rewriter (#4 phase 2, v2: p0f-signature driven).
 
-Given a client SYN that our 3proxy sends (Linux stack), rewrite its TCP options,
-window and (hop limit via phase-1 setsockopt already) so the on-the-wire SYN
-matches a Windows or macOS fingerprint. Used by the NFQUEUE daemon; this module
-is the pure rewrite so it can be unit-tested without netfilter.
+The daemon marks each -os-<name> connection with SO_MARK = osfp_mark(name)
+(set by the patched 3proxy, same FNV formula as here and as the orchestrator).
+A synced table (signatures.json) maps that mark to a p0f-v3 TCP SYN signature;
+this module parses the signature and rewrites the client's (Linux) SYN to match,
+so the on-the-wire fingerprint reads as the chosen OS. IPv4 and IPv6.
 
-Profiles (p0f-style, the values real stacks send):
-  windows: win 64240, opts [MSS, NOP, WS(8), NOP, NOP, SACK], no timestamps, ttl 128
-  macos:   win 65535, opts [MSS, NOP, WS(6), NOP, NOP, TS, SACK, EOL], ttl 64
-Linux (what we start from): win 64240, opts [MSS, SACK, TS, NOP, WS(7)], ttl 64
+p0f v3 SYN signature: `ver:ittl:olen:mss:wsize,scale:olayout:quirks:pclass`
+  ittl   initial TTL/hop-limit (64/128/255; a trailing -N distance is ignored; * keeps it)
+  mss    MSS to force, or * to keep the SYN's own (path-dependent)
+  wsize  window: a literal, mss*N, mtu*N, %N, or * (keep original)
+  scale  window scale value, or * (keep original)
+  olayout  option order: mss, sok, ts, nop, ws, eol+N
+  quirks   df (set DF), ... (others best-effort/ignored for generation)
 """
 from __future__ import annotations
 
 from scapy.all import IP, IPv6, TCP  # type: ignore
 
-# option list builders. scapy TCP.options is a list of (name, value) / strings.
-# MSS value is taken from the incoming SYN (path MTU), not forced.
+FNV_OFFSET = 2166136261
+FNV_PRIME = 16777619
 
 
-def _mss(opts):
+def osfp_mark(name: str) -> int:
+    """Stable 0x1xxxxxxx fwmark for a profile name. MUST match the 3proxy C
+    (netrun-pergb.patch) and the orchestrator byte for byte: FNV-1a 32, then
+    the low 28 bits with the 0x10000000 prefix (non-zero, distinctive range)."""
+    h = FNV_OFFSET
+    for b in name.encode("ascii", "ignore").lower():
+        h = ((h ^ b) * FNV_PRIME) & 0xFFFFFFFF
+    return 0x10000000 | (h & 0x0FFFFFFF)
+
+
+# ── p0f parsing ──────────────────────────────────────────────────────────────
+
+
+def _mss_of(opts):
     for o in opts:
         if o[0] == "MSS":
-            return o[1]
+            return int(o[1])
     return 1460
 
 
-def _ts(opts):
+def _ws_of(opts):
+    for o in opts:
+        if o[0] == "WScale":
+            return int(o[1])
+    return 0
+
+
+def _ts_of(opts):
     for o in opts:
         if o[0] == "Timestamp":
             return o[1]
     return (0, 0)
 
 
-def windows_opts(src_opts):
-    # MSS, NOP, WScale 8, NOP, NOP, SAckOK  (no Timestamp)
-    return [("MSS", _mss(src_opts)), ("NOP", None), ("WScale", 8), ("NOP", None), ("NOP", None), ("SAckOK", b"")]
+def parse_p0f(sig: str) -> dict:
+    """p0f SYN signature string -> a dict the applier uses. Raises ValueError."""
+    f = sig.strip().split(":")
+    if len(f) != 8:
+        raise ValueError(f"p0f sig needs 8 fields, got {len(f)}: {sig!r}")
+    _ver, ittl, _olen, mss, winscale, olayout, quirks, _pclass = f
+    win, _, scale = winscale.partition(",")
+    return {
+        "ittl": None if ittl in ("", "*") else int(ittl.split("-")[0]),
+        "mss": None if mss in ("", "*") else int(mss),
+        "win": win.strip(),  # literal | mss*N | mtu*N | %N | *
+        "scale": None if scale in ("", "*") else int(scale),
+        "olayout": [t for t in olayout.split(",") if t],
+        "quirks": set(q for q in quirks.split(",") if q),
+    }
 
 
-def macos_opts(src_opts):
-    # MSS, NOP, WScale 6, NOP, NOP, Timestamp, SAckOK, EOL
-    return [
-        ("MSS", _mss(src_opts)),
-        ("NOP", None),
-        ("WScale", 6),
-        ("NOP", None),
-        ("NOP", None),
-        ("Timestamp", _ts(src_opts)),
-        ("SAckOK", b""),
-        ("EOL", None),
-    ]
+def _window(win_spec: str, mss: int, orig_win: int) -> int:
+    s = win_spec.strip()
+    if s in ("", "*"):
+        return orig_win
+    if s.startswith("mss*"):
+        return mss * int(s[4:])
+    if s.startswith("mtu*"):
+        return (mss + 40) * int(s[4:])
+    if s.startswith("%"):
+        m = int(s[1:])
+        return (orig_win // m) * m if m else orig_win
+    return int(s)
 
 
-PROFILES = {
-    1: ("windows", windows_opts, 64240),
-    2: ("macos", macos_opts, 65535),
-}
+def _options(layout, mss, scale, ts):
+    out = []
+    for tok in layout:
+        if tok == "mss":
+            out.append(("MSS", mss))
+        elif tok == "sok":
+            out.append(("SAckOK", b""))
+        elif tok == "ts":
+            out.append(("Timestamp", ts))
+        elif tok == "nop":
+            out.append(("NOP", None))
+        elif tok == "ws":
+            out.append(("WScale", scale))
+        elif tok.startswith("eol"):
+            out.append(("EOL", None))
+        # unknown tokens are skipped
+    return out
 
 
-def rewrite(pkt, profile_id: int):
-    """Return the rewritten packet (new bytes) for a SYN, or pkt unchanged.
-    profile_id: 1 windows, 2 macos. Only touches SYN (not SYN-ACK)."""
-    prof = PROFILES.get(profile_id)
-    if prof is None:
-        return pkt
-    name, optf, win = prof
+def apply_p0f(pkt, sig: str):
+    """Rewrite a SYN (only; SYN-ACK left as is) to the p0f signature. Returns
+    the rebuilt packet with lengths/checksums recomputed, or pkt unchanged."""
     if TCP not in pkt:
         return pkt
     tcp = pkt[TCP]
-    # SYN only, not SYN-ACK
-    if not (tcp.flags & 0x02) or (tcp.flags & 0x10):
+    if not (tcp.flags & 0x02) or (tcp.flags & 0x10):  # SYN only, not SYN-ACK
         return pkt
-    tcp.options = optf(tcp.options)
-    tcp.window = win
-    # force scapy to recompute length + checksums (and IP len/csum)
+    p = parse_p0f(sig)
+    mss = p["mss"] if p["mss"] is not None else _mss_of(tcp.options)
+    scale = p["scale"] if p["scale"] is not None else _ws_of(tcp.options)
+    tcp.options = _options(p["olayout"], mss, scale, _ts_of(tcp.options))
+    tcp.window = _window(p["win"], mss, int(tcp.window))
     del tcp.chksum
     del tcp.dataofs
     if IP in pkt:
-        del pkt[IP].len
-        del pkt[IP].chksum
+        ip = pkt[IP]
+        if p["ittl"] is not None:
+            ip.ttl = p["ittl"]
+        ip.flags = "DF" if "df" in p["quirks"] else 0
+        del ip.len
+        del ip.chksum
     if IPv6 in pkt:
+        if p["ittl"] is not None:
+            pkt[IPv6].hlim = p["ittl"]
         del pkt[IPv6].plen
-    return pkt.__class__(bytes(pkt))  # rebuild so lengths/checksums are filled
+    return pkt.__class__(bytes(pkt))
+
+
+# built-in fallback signatures (used only if signatures.json is missing a mark);
+# concrete values, no "*", so generation is unambiguous.
+DEFAULT_SIGNATURES = {
+    "windows": "*:128:0:*:64240,8:mss,nop,ws,nop,nop,sok:df,id+:0",
+    "macos": "*:64:0:*:65535,6:mss,nop,ws,nop,nop,ts,sok,eol+1:df,id+:0",
+}
+
+
+def rewrite(pkt, sig: str):
+    """Entry point: apply a p0f signature string to a SYN."""
+    try:
+        return apply_p0f(pkt, sig)
+    except Exception:
+        return pkt

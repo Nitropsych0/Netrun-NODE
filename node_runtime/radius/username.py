@@ -55,10 +55,13 @@ class LoginError(Exception):
         self.base = base  # the base login when it parsed, for per-list reject records
 
 
-#: #4 OS-fingerprint profiles accepted in the login (``-os-<profile>``). The
-#: address derivation ignores os; 3proxy applies the TCP/IP fingerprint on the
-#: outbound socket. RADIUS only has to accept the suffix.
-OS_PROFILES = ("linux", "windows", "macos")
+#: #4 OS fingerprint: any ``-os-<name>`` whose name matches this is accepted.
+#: The address derivation ignores os; 3proxy marks the socket with FNV(name)
+#: and the egress rewriter maps the mark to a p0f signature (the enabled set
+#: lives in the orchestrator / the node's signatures.json). An unknown name is
+#: harmless — the rewriter just leaves the fingerprint untouched (Linux). So
+#: RADIUS validates only the FORMAT here, not membership.
+_OS_RE = __import__("re").compile(r"[a-z0-9]{1,32}\Z")
 
 
 class Login:
@@ -126,7 +129,7 @@ def parse(raw, geo: str | None = None) -> Login:
                 raise LoginError("bad_params", base)
             val = tokens[i + 1]
             if key == "os":
-                if val not in OS_PROFILES:
+                if not _OS_RE.match(val):
                     raise LoginError("bad_params", base)
                 out.os = val
             elif key == "session":
