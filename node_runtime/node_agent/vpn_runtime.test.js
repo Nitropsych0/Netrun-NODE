@@ -86,7 +86,7 @@ test("renderConfig: an inbound and a marked outbound per entry, the guards in ro
     { type: "field", inboundTag: ["vpn-in-0"], outboundTag: "vpn-out-0" },
     { type: "field", inboundTag: ["vpn-in-1"], outboundTag: "vpn-out-1" },
   ]);
-  assert.strictEqual(cfg.api.listen, "127.0.0.1:62790");
+  assert.strictEqual(cfg.api.listen, "127.0.0.1:8087");
   assert.ok(cfg.policy.levels[0].statsUserUplink && cfg.policy.levels[0].statsUserDownlink);
   assert.strictEqual(cfg.log.access, "/run/netrun-vpn/access.log");
 });

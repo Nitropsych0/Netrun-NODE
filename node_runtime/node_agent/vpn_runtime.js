@@ -79,7 +79,9 @@ function readSettings(env = process.env) {
     bin: String(env.NETRUN_VPN_BIN || "/opt/netrun/vpn/bin/xray"),
     binSha: String(env.NETRUN_VPN_BIN_SHA256 || "/opt/netrun/vpn/bin/xray.sha256"),
     pinnedSha: String(env.NETRUN_VPN_PINNED_SHA256 || path.resolve(__dirname, "../../deploy/node/bin/xray.sha256")),
-    api: String(env.NETRUN_VPN_API || "127.0.0.1:62790"),
+    // below the proxy ports (>= 10000; a high one sat in proxy_accounting's
+    // pergb_blocked set and was dropped even on lo — Chicago 2026-10-15)
+    api: String(env.NETRUN_VPN_API || "127.0.0.1:8087"),
     uid: Number(env.NETRUN_VPN_UID || 65532),
     group: String(env.NETRUN_VPN_GROUP || "netrun-vpn"),
     meterSec: Math.max(2, Number(env.NETRUN_VPN_METER_SEC || 10)),
