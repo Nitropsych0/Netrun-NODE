@@ -112,7 +112,7 @@ CFG="$WORK/pergb_${BASE}.cfg"
   if [[ -n "$AUTHCACHE" ]]; then echo "$AUTHCACHE"; fi
   echo "radius $SECRET 127.0.0.1"
   echo "auth radius"
-  echo "deny * * * 25,465,587"
+  echo "deny * * * 25,465,587 CONNECT,HTTP_GET,HTTP_PUT,HTTP_POST,HTTP_HEAD,HTTP_OTHER,HTTP_CONNECT"
   echo "allow *"
   for ((p = BASE; p <= LAST; p++)); do
     if [[ $p -eq $BASE ]]; then echo "maxconn 20000"; elif [[ $p -eq $((BASE + 1)) ]]; then echo "maxconn 2000"; fi

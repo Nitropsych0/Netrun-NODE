@@ -197,12 +197,17 @@ def udp_hdr(dst, port):
 
 
 def raw_exchange(host, port, data, timeout=5.0, size=4096):
+    """What the peer answers to `data`: up to `size` bytes, until it closes or
+    goes quiet for `timeout` (an HTTP proxy may keep the connection)."""
     s = socket.create_connection((host, port), timeout=timeout)
     try:
         s.sendall(data)
         out = b""
         while len(out) < size:
-            chunk = s.recv(size - len(out))
+            try:
+                chunk = s.recv(size - len(out))
+            except socket.timeout:
+                break
             if not chunk:
                 break
             out += chunk
@@ -595,7 +600,9 @@ def udp_checks(env: Env, want):
     check("udp: RADIUS counts the piece accepts and the per-GB refusal", rej.get("udpAccepts", 0) >= 2 and rej.get("udpRefused", 0) >= 1, rej)
     greet = raw_exchange(SOCKS_HOST, b, b"\x05\x01\x00", size=2)
     check("no fingerprint: a greeting without user/pass gets 0xFF (RFC 1928)", greet == b"\x05\xff", greet)
-    resp = raw_exchange(HTTP_HOST, b + HTTP_OFFSET, b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    # an address, not a name: the namespace has no DNS and 3proxy resolves first
+    url = "http://[%s]:%d/" % (t6, TARGET_PORT)
+    resp = raw_exchange(HTTP_HOST, b + HTTP_OFFSET, ("GET %s HTTP/1.1\r\nHost: [%s]\r\n\r\n" % (url, t6)).encode())
     text = resp.decode("latin1")
     check(
         "no fingerprint: our own 407 (realm Netrun, X-Proxy-Error, no 3proxy text)",

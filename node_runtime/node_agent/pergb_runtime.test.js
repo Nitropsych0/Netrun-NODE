@@ -60,7 +60,7 @@ test("cfg: header marker, 0.9.3 ACL names only, no daemon/setuid, maxconn layout
   for (const bad of [/^daemon\b/m, /^setuid\b/m, /^setgid\b/m, /^users\b/m, /^flush\b/m, /^monitor\b/m]) {
     assert.doesNotMatch(text, bad);
   }
-  for (const want of ["authcache none", `radius ${SECRET} 127.0.0.1`, "auth radius", "deny * * * 25,465,587", "deny *",
+  for (const want of ["authcache none", `radius ${SECRET} 127.0.0.1`, "auth radius", "deny * * * 25,465,587 CONNECT,HTTP_GET,HTTP_PUT,HTTP_POST,HTTP_HEAD,HTTP_OTHER,HTTP_CONNECT", "deny *",
     "timeouts 1 3 30 60 180 1800 15 60", "logdump 262144 262144", "log /var/log/netrun-pergb/p31000.log H",
     'logformat "- +_G%Y%m%d%H%M%S.%. %N %p %E %U %C %c %i %e %R %r %I %O %n"', "nserver 127.0.0.1", "nserver ::1"]) {
     assert.ok(lines.includes(want), `missing line: ${want}`);

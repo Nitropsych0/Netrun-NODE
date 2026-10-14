@@ -125,6 +125,9 @@ const ACL_OPERATIONS = [
   "HTTP_OTHER",
   "HTTP_CONNECT",
 ];
+// The operations the port deny (denyPorts) applies to: every allowed one but
+// UDPASSOC (see renderCfg).
+const DENY_PORT_OPERATIONS = ACL_OPERATIONS.filter((op) => op !== "UDPASSOC");
 // Plain HTTP-proxy requests on the shared ports (accepted, never advertised:
 // clients differ in what they call an "HTTP" / "HTTPS" proxy). The per-GB
 // haproxy recognises one by its first bytes, "<METHOD> " of these RFC 9110 /
@@ -314,7 +317,11 @@ function renderCfg(params, range, secret, logDir = "/var/log/netrun-pergb") {
     `radius ${secret} ${RADIUS_ADDR}`,
     "auth radius",
   ];
-  if (params.denyPorts.length) lines.push(`deny * * * ${params.denyPorts.join(",")}`);
+  // The port deny names its operations: a UDP ASSOCIATE asks with port 0, and
+  // 3proxy skips the port test for port 0 (auth.c ACLmatches), so a bare
+  // `deny * * * 25,465,587` refused every association. Datagrams to those
+  // ports are the UDP relay's business (3proxy-pergb change 7).
+  if (params.denyPorts.length) lines.push(`deny * * * ${params.denyPorts.join(",")} ${DENY_PORT_OPERATIONS.join(",")}`);
   lines.push(`allow * * * * ${ACL_OPERATIONS.join(",")}`, "deny *");
   let current = null;
   for (let port = range.first; port <= range.last; port += 1) {

@@ -86,14 +86,30 @@ cat > backends.py <<'PY'
 # 3proxy-pergb stand-ins: 127.0.0.3:<p> (HTTP proxy) and 127.0.0.4:<p> (SOCKS)
 import socket, sys, threading
 log = open(sys.argv[1], "a", buffering=1)
+PP2 = bytes.fromhex("0d0a0d0a000d0a515549540a")
+def first_bytes(c):
+    """The client's first bytes; a leading PROXY v2 header (the socks hop's
+    send-proxy-v2) is taken off and reported as «pp2»."""
+    first = c.recv(64)
+    if not first.startswith(PP2[: len(first)]):
+        return "", first
+    while len(first) < 16:
+        first += c.recv(64)
+    total = 16 + int.from_bytes(first[14:16], "big")
+    while len(first) <= total:
+        more = c.recv(64)
+        if not more:
+            break
+        first += more
+    return "pp2 ", first[total:]
 def serve(addr, port, kind):
     s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((addr, port)); s.listen(64)
     while True:
         c, peer = s.accept()
         try:
             c.settimeout(3)
-            first = c.recv(64)
-            log.write(f"{kind} {port} {peer[0]}:{peer[1]} {first[:8].hex()}\n")
+            pp, first = first_bytes(c)
+            log.write(f"{kind} {port} {peer[0]}:{peer[1]} {pp}{first[:8].hex()}\n")
             c.sendall(f"{kind}:{port}:{peer[0]}\n".encode())
         except OSError:
             pass
@@ -187,8 +203,11 @@ grep -q '^http 31004 .* 4745542068747470$' backend.log || fail "the HTTP backend
 grep -q '^http 31000 .* 434f4e4e45435420$' backend.log || fail "the split CONNECT arrived whole: $(cat backend.log)"
 [ "$(grep -c ' 31002 ' backend.log)" = 1 ] || fail "only the CONNECT may reach a backend on 31002 (the rejected kinds must not): $(cat backend.log)"
 [ "$(grep -c '^http 31003 ' backend.log)" = 1 ] || fail "the stalled method reached a backend: $(cat backend.log)"
-[ "$(grep -c '^socks ' backend.log)" = 2 ] && [ "$(grep -c '^socks .* 050100$' backend.log)" = 2 ] \
-  || fail "the SOCKS backend must see the two SOCKS5 greetings and nothing else: $(cat backend.log)"
+# the socks hop sends PROXY v2 (3proxy-pergb change 6: the UDP relay's real
+# client); the HTTP hop never does
+[ "$(grep -c '^socks ' backend.log)" = 2 ] && [ "$(grep -c '^socks .* pp2 050100$' backend.log)" = 2 ] \
+  || fail "the SOCKS backend must see the two SOCKS5 greetings behind a PROXY v2 header and nothing else: $(cat backend.log)"
+! grep -q '^http .* pp2 ' backend.log || fail "the HTTP backend must get no PROXY header: $(cat backend.log)"
 bp="$(awk '$1 == "socks" && $2 == 31001 { print $3 }' backend.log)"
 grep -Eq "^203\.0\.113\.10:[0-9]+ 31001 ${bp//./\\.} [0-9]+ [0-9]+ [0-9]+$" haproxy.log \
   || fail "no log line '%ci:%cp %fp %bi:%bp %Tt %B %U' joining the client to the loopback tuple $bp: $(cat haproxy.log)"

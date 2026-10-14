@@ -9,7 +9,7 @@ logdump 262144 262144
 authcache none
 radius GoldenSecretGoldenSecretGoldenSecret0123 127.0.0.1
 auth radius
-deny * * * 25,465,587
+deny * * * 25,465,587 CONNECT,HTTP_GET,HTTP_PUT,HTTP_POST,HTTP_HEAD,HTTP_OTHER,HTTP_CONNECT
 allow * * * * CONNECT,UDPASSOC,HTTP_GET,HTTP_PUT,HTTP_POST,HTTP_HEAD,HTTP_OTHER,HTTP_CONNECT
 deny *
 maxconn 20000
