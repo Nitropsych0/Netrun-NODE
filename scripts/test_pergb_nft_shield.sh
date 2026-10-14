@@ -113,8 +113,9 @@ bash "$H" agent-firewall 192.0.2.11 --dry-run | nft -f - || fail "replacing an e
 t="$(nft list table inet netrun_agent_guard)"
 grep -q 'tcp dport { 8085, 8086 } ip saddr 192.0.2.11 accept' <<< "$t" && grep -q 'tcp dport { 8085, 8086 } drop' <<< "$t" \
   && ! grep -q '192.0.2.10' <<< "$t" || fail "guard table: $t"
+grep -q 'tcp dport 22 ip saddr 192.0.2.11 accept' <<< "$t" && grep -q 'tcp dport 22 drop' <<< "$t" || fail "SSH only from the orchestrator: $t"
 [ "$(nft list tables | grep -c netrun_agent_guard)" = 1 ] || fail "two guard tables"
-ok "agent guard: 8085 + 8086 from the orchestrator only; the text loads and replaces an older table in one transaction"
+ok "agent guard: 8085 + 8086 + SSH from the orchestrator only; the text loads and replaces an older table in one transaction"
 
 nft flush ruleset
 echo "test_pergb_nft_shield.sh — all $PASS checks passed"

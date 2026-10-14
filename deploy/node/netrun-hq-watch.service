@@ -1,0 +1,13 @@
+# NETRUN — this node watches HQ (the bot / site / orchestrator server) from
+# outside and tells the admins on Telegram when it stops answering
+# (deploy/node/netrun-hq-watch.sh). Started by netrun-hq-watch.timer.
+[Unit]
+Description=NETRUN: watch the bot / site / orchestrator server from this node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/netrun-hq-watch
+TimeoutStartSec=90
+Nice=10

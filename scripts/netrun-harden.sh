@@ -14,8 +14,10 @@
 #                          restarted (KillMode=process).
 #   agent-firewall <ip> [--dry-run]
 #                          A3: the agent's ports — 8085 (plain) and 8086 (the
-#                          pay-per-GB TLS listener, plan D16) — reachable only
-#                          from the orchestrator <ip> and localhost; one atomic
+#                          pay-per-GB TLS listener, plan D16) — and SSH (22,
+#                          2026-10-10; NETRUN_SSH_GUARD=0 leaves it open)
+#                          reachable only from the orchestrator <ip> and
+#                          localhost; one atomic
 #                          `nft -f`, persisted to /etc/nftables.conf. Without
 #                          <ip>: re-applied with the IP the live table already
 #                          allows (a node guarded before 8086 existed).
@@ -189,7 +191,7 @@ cmd_status() {
   log "A1/A2 3proxy configs: $open of $total still open"
   if [ -f "$AGENT_KEY_FILE" ]; then log "A3 agent key: set"; else log "A3 agent key: NOT set"; fi
   if nft list table inet "$NFT_GUARD_TABLE" >/dev/null 2>&1; then
-    if agent_guard_covers_all; then log "A3 agent firewall ($AGENT_PORTS): on"; else log "A3 agent firewall: on, but not for every agent port ($AGENT_PORTS) — rerun: netrun-harden agent-firewall"; fi
+    if agent_guard_covers_all; then log "A3 agent firewall ($(guarded_ports)): on"; else log "A3 agent firewall: on, but not for every agent port ($(guarded_ports)) — rerun: netrun-harden agent-firewall"; fi
   else
     log "A3 agent firewall ($AGENT_PORTS): OFF"
   fi
@@ -253,10 +255,22 @@ cmd_agent_key() {
 # pay-per-GB TLS listener: /pergb/* for the orchestrator only, plan D16).
 AGENT_PORTS="8085, 8086"
 
+# 2026-10-10 (owner, after a competitor check: their entry IP shows no SSH):
+# SSH too only from the orchestrator — every node operation comes from its
+# host (the node key); a human jumps through it
+# (`ssh -J root@<orchestrator> root@<node>`); the Vultr console is the way in
+# when the orchestrator is gone. NETRUN_SSH_GUARD=0 leaves SSH open to
+# everyone (keys only either way).
+SSH_GUARD="${NETRUN_SSH_GUARD:-1}"
+
 # The guard table for orchestrator IPv4 $1, as ONE nft transaction: the
 # add + delete + definition idiom replaces whatever table is there (or none)
 # without a moment in which the agent ports are open to everyone.
 agent_guard_nft() {
+  local ssh=""
+  [ "$SSH_GUARD" = 1 ] && ssh="
+    tcp dport 22 ip saddr $1 accept
+    tcp dport 22 drop"
   cat <<NFT
 table inet $NFT_GUARD_TABLE
 delete table inet $NFT_GUARD_TABLE
@@ -265,7 +279,7 @@ table inet $NFT_GUARD_TABLE {
     type filter hook input priority -5; policy accept;
     iifname "lo" accept
     tcp dport { $AGENT_PORTS } ip saddr $1 accept
-    tcp dport { $AGENT_PORTS } drop
+    tcp dport { $AGENT_PORTS } drop$ssh
   }
 }
 NFT
@@ -286,12 +300,16 @@ agent_guard_ip() {
   sed -n 's/.*ip saddr \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\) accept.*/\1/p' <<< "$t" | sed -n 1p
 }
 
-# 0 when the live guard table drops every agent port (8086 included).
+# 0 when the live guard table drops every agent port (8086 included) and,
+# with SSH_GUARD, SSH.
 agent_guard_covers_all() {
   local t
   t="$(nft list table inet "$NFT_GUARD_TABLE" 2>/dev/null)" || return 1
-  grep -q 'dport { 8085, 8086 } drop' <<< "$t" || grep -q 'dport { 8085-8086 } drop' <<< "$t"
+  grep -q 'dport { 8085, 8086 } drop' <<< "$t" || grep -q 'dport { 8085-8086 } drop' <<< "$t" || return 1
+  [ "$SSH_GUARD" != 1 ] || grep -q 'tcp dport 22 drop' <<< "$t"
 }
+
+guarded_ports() { if [ "$SSH_GUARD" = 1 ]; then echo "$AGENT_PORTS, ssh 22"; else echo "$AGENT_PORTS"; fi; }
 
 cmd_agent_firewall() {
   local ip="" dry=0 a
@@ -313,7 +331,7 @@ cmd_agent_firewall() {
   fi
   agent_guard_nft "$ip" | nft -f - || die "agent-firewall: nft refused the guard table (nothing changed)"
   nft_persist || log "WARNING: the ruleset was not persisted (rerun: netrun-nft-persist save)"
-  log "agent ports ($AGENT_PORTS) now open only to $ip and localhost (persisted to /etc/nftables.conf)"
+  log "agent ports ($(guarded_ports)) now open only to $ip and localhost (persisted to /etc/nftables.conf)"
 }
 
 # KEY DEFAULT -> the environment wins, then $NETRUN_ENV (KEY=VALUE lines).
