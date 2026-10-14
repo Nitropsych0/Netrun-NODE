@@ -176,7 +176,8 @@ def socks5_udp(port, user, password, dst, dst_port=TARGET_PORT, junk=(), timeout
         for hdr in junk:
             u.sendto(b"\x00\x00\x00" + hdr + b"junk", (str(relay), bport))
         ip = ipaddress.ip_address(dst)
-        u.sendto(b"\x00\x00\x04" + ip.packed + struct.pack("!H", dst_port) + b"ping", (str(relay), bport))
+        # RSV RSV FRAG(0) ATYP — a non-zero FRAG ends the association (3proxy)
+        u.sendto(b"\x00\x00\x00\x04" + ip.packed + struct.pack("!H", dst_port) + b"ping", (str(relay), bport))
         data, _ = u.recvfrom(2048)
         off = 4 + (16 if data[3] == 4 else 4) + 2
         return ipaddress.ip_address(data[off:].decode().strip()), relay
