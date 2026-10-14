@@ -297,15 +297,12 @@ class Probe(unittest.TestCase):
     def setUp(self):
         self.clock = rtest.FakeClock()
         salt = os.urandom(16)
-        self.eng = rtest.make_engine(
-            self,
-            clock=self.clock,
-            probe={
-                "pwSalt": salt.hex(),
-                "pwHash": hashlib.sha256(salt + b"ProbePassword123").hexdigest(),
-                "canary": [["2001:db8:ffff::1", 443], ["198.51.100.7", 80]],
-            },
-        )
+        self.probe_facts = {
+            "pwSalt": salt.hex(),
+            "pwHash": hashlib.sha256(salt + b"ProbePassword123").hexdigest(),
+            "canary": [["2001:db8:ffff::1", 443], ["198.51.100.7", 80]],
+        }
+        self.eng = rtest.make_engine(self, clock=self.clock, probe=self.probe_facts)
 
     def test_probe(self):
         r = ask(self.eng, "netrun-svcprobe", "ProbePassword123", dst=DST6, dst_port=443)
@@ -315,6 +312,19 @@ class Probe(unittest.TestCase):
         r4 = ask(self.eng, "netrun-svcprobe", "ProbePassword123", dst=DST4, dst_port=80)
         self.assertEqual(r4.attrs, [(8, ipaddress.IPv4Address(rtest.EGRESS4).packed)])
         self.assertEqual(self.eng.counters["probeAccepts"], 2)
+
+    def test_probe_on_ipv6_only_answers_an_ipv4_canary_with_ipv6(self):
+        """The node agent probes the first canary of its sorted list — an IPv4 one. On
+        an ipv6_only node a reject there would fail the guards' probe and restart
+        RADIUS every 30 s; it is answered with the IPv6 egress instead, uncounted."""
+        facts = rtest.facts(family="ipv6_only", egressIpv4=None, probe=self.probe_facts)
+        self.assertEqual(self.eng.dispatch({"op": "facts", "facts": facts}), {"ok": True})
+        r4 = ask(self.eng, "netrun-svcprobe", "ProbePassword123", dst=DST4, dst_port=80)
+        self.assertTrue(r4.accepted)
+        self.assertEqual(r4.addr.version, 6)
+        st = self.eng.dispatch({"op": "status"})
+        self.assertEqual(st["counters"]["v4OnIpv6Only"], 0, "the probe is not a customer")
+        self.assertEqual(st["counters"]["probeAccepts"], 1)
 
     def test_probe_only_towards_the_canary(self):
         self.assertFalse(ask(self.eng, "netrun-svcprobe", "ProbePassword123", dst=DST6, dst_port=444).accepted)

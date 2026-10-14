@@ -867,11 +867,14 @@ class Engine:
             return self._reject("capacity", None, now)
         self.probe_tokens = tokens - 1.0
         self.counters["probeAccepts"] += 1
-        if fam == 4:
-            if f.family == "ipv6_only" or not f.egress_v4s:
+        if fam == 4 and f.family != "ipv6_only":
+            if not f.egress_v4s:
                 return self._reject("bad_params", None, now)
             v4s = self._open_v4s(f) or list(f.egress_v4s)
             return None, None, v4s[self.rng.randrange(len(v4s))]
+        # An ipv6_only node answers an IPv4 canary like a customer's IPv4 destination
+        # (the IPv6 egress, not counted): the agent probes the FIRST canary of its sorted
+        # list, an IPv4 one, and a reject would fail the guards' probe -> RADIUS restarts.
         try:
             addr = self.alloc.rotate_addr(0, now)
         except AllocError as e:
