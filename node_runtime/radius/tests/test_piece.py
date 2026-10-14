@@ -123,6 +123,35 @@ class PieceAccess(PieceBase):
         iid = int(want) & ((1 << 64) - 1)
         self.assertEqual(self.eng.alloc.tagger.list_of(iid), 500)  # attribution by tag, like per-GB
 
+    def test_udp_associate_gets_the_fixed_address(self):
+        """Owner 2026-10-14: SOCKS5 UDP on per-piece proxies. 3proxy asks with
+        Login-Service 1003 and a placeholder destination (:: or 0.0.0.0 —
+        ::ffff:0.0.0.0 on a -6 listener); the piece's own address answers, on
+        ipv6_only too."""
+        want = ipaddress.IPv6Address(expected_addr(rtest.KEY, rtest.PREFIX, 500, self.net))
+        mapped0 = ipaddress.IPv6Address("::ffff:0.0.0.0").packed
+        for dst in (None, mapped0):
+            r = ask(self.eng, "netrun-pieceaa", dst=dst, dst_port=0, op=rtest.OP_UDPASSOC)
+            self.assertTrue(r.accepted, dst)
+            self.assertEqual(r.addr, want)
+        self.eng.dispatch({"op": "facts", "facts": rtest.facts(family="ipv6_only", egressIpv4=None)})
+        r = ask(self.eng, "netrun-pieceaa", dst=None, dst_port=0, op=rtest.OP_UDPASSOC)
+        self.assertEqual(r.addr, want)
+        status = self.eng.dispatch({"op": "status"})
+        self.assertEqual(status["counters"]["udpAccepts"], 3)
+        self.assertEqual(status["noDst"], 0, "an ASSOCIATE names no destination by design")
+
+    def test_udp_is_per_piece_only_and_bind_never(self):
+        r = ask(self.eng, "netrun-rotaaaa", dst=None, dst_port=0, op=rtest.OP_UDPASSOC)
+        self.assertFalse(r.accepted)
+        self.assertEqual(self.eng.reject_counts.get("udp_off"), 1)
+        self.assertEqual(self.eng.dispatch({"op": "status"})["counters"]["udpRefused"], 1)
+        for user in ("netrun-pieceaa", "netrun-rotaaaa"):
+            self.assertFalse(ask(self.eng, user, dst=None, dst_port=0, op=rtest.OP_BIND).accepted, user)
+        # CONNECT and HTTP CONNECT are untouched
+        self.assertTrue(ask(self.eng, "netrun-rotaaaa").accepted)
+        self.assertTrue(ask(self.eng, "netrun-pieceaa", op=rtest.OP_HTTP_CONNECT).accepted)
+
     def test_country_is_the_only_param(self):
         self.assertIsNone(self.reason_of("netrun-pieceaa-country-us"))
         for user in (

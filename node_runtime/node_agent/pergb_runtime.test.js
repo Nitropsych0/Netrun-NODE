@@ -69,10 +69,12 @@ test("cfg: header marker, 0.9.3 ACL names only, no daemon/setuid, maxconn layout
   assert.strictEqual(allow.length, 1);
   const ops = allow[0].split(/\s+/)[5].split(",");
   for (const op of ops) assert.ok(OPS_093.has(op), `${op} is not a 3proxy 0.9.3 operation`);
-  for (const forbidden of ["BIND", "UDPASSOC", "ICMPASSOC", "ADMIN", "DNSRESOLVE", "FTP", "FTP_GET", "FTP_PUT", "FTP_LIST", "FTP_DATA", "HTTP", "HTTPS"]) {
+  for (const forbidden of ["BIND", "ICMPASSOC", "ADMIN", "DNSRESOLVE", "FTP", "FTP_GET", "FTP_PUT", "FTP_LIST", "FTP_DATA", "HTTP", "HTTPS"]) {
     assert.ok(!ops.includes(forbidden), `${forbidden} must not be allowed`);
   }
-  assert.deepStrictEqual(ops, ["CONNECT", "HTTP_GET", "HTTP_PUT", "HTTP_POST", "HTTP_HEAD", "HTTP_OTHER", "HTTP_CONNECT"]);
+  // UDPASSOC (owner 2026-10-14): SOCKS5 UDP on the same ports; netrun-radius
+  // decides which logins get an association (per-piece proxies for now)
+  assert.deepStrictEqual(ops, ["CONNECT", "UDPASSOC", "HTTP_GET", "HTTP_PUT", "HTTP_POST", "HTTP_HEAD", "HTTP_OTHER", "HTTP_CONNECT"]);
   // order: log / auth / ACL before the first service line (3proxy copies them per service)
   const firstSvc = lines.findIndex((l) => /^(socks|proxy) /.test(l));
   for (const k of ["log ", "logformat ", "auth radius", "allow ", "deny *", "authcache none", "radius "]) {
@@ -81,11 +83,11 @@ test("cfg: header marker, 0.9.3 ACL names only, no daemon/setuid, maxconn layout
   // maxconn: 20000 right before the base port, 2000 before 31001, never again
   const mc = lines.map((l, i) => [l, i]).filter(([l]) => l.startsWith("maxconn "));
   assert.deepStrictEqual(mc.map(([l]) => l), ["maxconn 20000", "maxconn 2000"]);
-  assert.strictEqual(lines[mc[0][1] + 1], `socks -64 -a -p31000 -i127.0.0.4 -e${IPV4} -e::1`);
+  assert.strictEqual(lines[mc[0][1] + 1], `socks -64 -a -u2 -p31000 -i127.0.0.4 -e${IPV4} -e::1`);
   assert.strictEqual(lines[mc[0][1] + 2], `proxy -64 -n -a -p31000 -i127.0.0.3 -e${IPV4} -e::1`);
-  assert.strictEqual(lines[mc[1][1] + 1], `socks -64 -a -p31001 -i127.0.0.4 -e${IPV4} -e::1`);
+  assert.strictEqual(lines[mc[1][1] + 1], `socks -64 -a -u2 -p31001 -i127.0.0.4 -e${IPV4} -e::1`);
   for (let port = 31000; port <= 31499; port += 1) {
-    assert.ok(lines.includes(`socks -64 -a -p${port} -i127.0.0.4 -e${IPV4} -e::1`), `socks ${port}`);
+    assert.ok(lines.includes(`socks -64 -a -u2 -p${port} -i127.0.0.4 -e${IPV4} -e::1`), `socks ${port}`);
     assert.ok(lines.includes(`proxy -64 -n -a -p${port} -i127.0.0.3 -e${IPV4} -e::1`), `proxy ${port}`);
   }
   assert.strictEqual(lines.filter((l) => /^(socks|proxy) /.test(l)).length, 1000);
@@ -98,7 +100,7 @@ test("cfg: header marker, 0.9.3 ACL names only, no daemon/setuid, maxconn layout
 test("cfg: family ipv6_only renders -6, no deny line without deny ports, custom logdump", () => {
   const p = params({ family: "ipv6_only", denyPorts: [], logdumpBytes: 131072 });
   const text = rt.renderCfg(p, rt.procRanges(31000, 1000, 2)[0], SECRET);
-  assert.match(text, new RegExp(`^socks -6 -a -p31000 -i127\\.0\\.0\\.4 -e${IPV4.replace(/\./g, "\\.")} -e::1$`, "m"));
+  assert.match(text, new RegExp(`^socks -6 -a -u2 -p31000 -i127\\.0\\.0\\.4 -e${IPV4.replace(/\./g, "\\.")} -e::1$`, "m"));
   assert.match(text, /^proxy -6 -n -a -p31000 -i127\.0\.0\.3 /m);
   assert.doesNotMatch(text, / -64 /);
   assert.doesNotMatch(text, /^deny \* \* \* /m);
@@ -116,12 +118,15 @@ test("haproxy: maxconn 2 x maxConns + 1000, the range bind, TLS/SOCKS5/plain HTT
   // the hop to 3proxy-pergb from HOP_SOURCES loopback sources per backend
   // (2026-10-10: one source capped the base port at ~6976 connections)
   for (let k = 1; k <= rt.HOP_SOURCES; k += 1) {
-    assert.match(t, new RegExp(`^    server socks${k} 127\\.0\\.0\\.4 source 127\\.0\\.2\\.${k}$`, "m"));
+    // send-proxy-v2 on the socks hop: 3proxy-pergb (change 6) takes the UDP
+    // relay's real client from it; the HTTP/TLS hop stays clean
+    assert.match(t, new RegExp(`^    server socks${k} 127\\.0\\.0\\.4 source 127\\.0\\.2\\.${k} send-proxy-v2$`, "m"));
     assert.match(t, new RegExp(`^    server http${k} 127\\.0\\.0\\.3 source 127\\.0\\.1\\.${k}$`, "m"));
   }
   assert.strictEqual((t.match(/^    balance leastconn$/gm) || []).length, 2);
   assert.ok(!/^    server (http|socks) /m.test(t), "no hop server without a source");
   assert.match(t, /^    server tls abns@netrun_pergb_tls send-proxy-v2$/m);
+  assert.doesNotMatch(t, /^    server http\d.*send-proxy-v2/m, "the http hop sends no PROXY header");
   assert.match(t, /^    log-format "%ci:%cp %fp %bi:%bp %Tt %B %U"$/m);
   assert.match(t, /^    log \/dev\/log local1 info$/m);
   assert.doesNotMatch(t, /abns@netrun_tls\b/, "never the per-piece TLS socket");

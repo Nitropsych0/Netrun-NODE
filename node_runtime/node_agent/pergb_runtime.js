@@ -111,9 +111,20 @@ const SECRET_RE = /^[A-Za-z0-9]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const FAMILIES = new Set(["dualstack", "ipv6_only"]);
 // 3proxy 0.9.3 conf.c (h_ace) operation names. The per-GB ACL allows SOCKS
-// CONNECT and the HTTP-proxy operations (plain HTTP methods + CONNECT); never
-// BIND / UDPASSOC / ICMPASSOC, FTP, ADMIN or DNSRESOLVE.
-const ACL_OPERATIONS = ["CONNECT", "HTTP_GET", "HTTP_PUT", "HTTP_POST", "HTTP_HEAD", "HTTP_OTHER", "HTTP_CONNECT"];
+// CONNECT, SOCKS5 UDP ASSOCIATE (owner 2026-10-14: UDP on the same ports;
+// netrun-radius decides which logins get one — per-piece proxies for now —
+// and 3proxy-pergb change 7 relays it) and the HTTP-proxy operations (plain
+// HTTP methods + CONNECT); never BIND / ICMPASSOC, FTP, ADMIN or DNSRESOLVE.
+const ACL_OPERATIONS = [
+  "CONNECT",
+  "UDPASSOC",
+  "HTTP_GET",
+  "HTTP_PUT",
+  "HTTP_POST",
+  "HTTP_HEAD",
+  "HTTP_OTHER",
+  "HTTP_CONNECT",
+];
 // Plain HTTP-proxy requests on the shared ports (accepted, never advertised:
 // clients differ in what they call an "HTTP" / "HTTPS" proxy). The per-GB
 // haproxy recognises one by its first bytes, "<METHOD> " of these RFC 9110 /
@@ -312,7 +323,9 @@ function renderCfg(params, range, secret, logDir = "/var/log/netrun-pergb") {
       lines.push(`maxconn ${want}`);
       current = want;
     }
-    lines.push(`socks ${fam} -a -p${port} -i${SOCKS_LISTEN} ${ext}`);
+    // -u2: a SOCKS5 greeting without the username/password method gets
+    // «no acceptable methods» (0xFF, RFC 1928), not «no auth» and a refusal
+    lines.push(`socks ${fam} -a -u2 -p${port} -i${SOCKS_LISTEN} ${ext}`);
     lines.push(`proxy ${fam} -n -a -p${port} -i${HTTP_LISTEN} ${ext}`);
   }
   return lines.join("\n") + "\n";
@@ -391,7 +404,7 @@ ${plainHttpAcl()}
 
 backend pergb_socks
     balance leastconn
-${hopServers("socks", SOCKS_LISTEN, HOP_SOCKS_NET)}
+${hopServers("socks", SOCKS_LISTEN, HOP_SOCKS_NET, " send-proxy-v2")}
 
 backend pergb_tls_loop
     server tls abns@netrun_pergb_tls send-proxy-v2
@@ -407,10 +420,14 @@ ${hopServers("http", HTTP_LISTEN, HOP_HTTP_NET)}
 }
 
 // HOP_SOURCES port-less servers to one 3proxy-pergb listener, each from its
-// own loopback source (see HOP_SOURCES).
-function hopServers(name, listen, net) {
+// own loopback source (see HOP_SOURCES). `extra` (the socks backend:
+// " send-proxy-v2") prepends a PROXY v2 header: 3proxy-pergb (change 6) takes
+// the real client and the dialed public address from it for the SOCKS5 UDP
+// relay only — its log, RADIUS and the meter keep the loopback hop tuple. The
+// HTTP/TLS backend stays clean (UDP ASSOCIATE is a SOCKS-only command).
+function hopServers(name, listen, net, extra = "") {
   const out = [];
-  for (let k = 1; k <= HOP_SOURCES; k += 1) out.push(`    server ${name}${k} ${listen} source ${net}.${k}`);
+  for (let k = 1; k <= HOP_SOURCES; k += 1) out.push(`    server ${name}${k} ${listen} source ${net}.${k}${extra}`);
   return out.join("\n");
 }
 

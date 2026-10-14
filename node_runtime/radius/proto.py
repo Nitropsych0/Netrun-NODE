@@ -43,6 +43,13 @@ A_NAS_IPV6_ADDRESS = 95
 A_LOGIN_IPV6_HOST = 98
 A_FRAMED_IPV6_ADDRESS = 168
 
+# Login-Service as 3proxy sends it: 1000 + the bit length of its operation
+# (structures.h: CONNECT 0x1, BIND 0x2, UDPASSOC 0x4; the HTTP methods are
+# higher bits).
+LOGIN_SERVICE_CONNECT = 1001
+LOGIN_SERVICE_BIND = 1002
+LOGIN_SERVICE_UDPASSOC = 1003
+
 MAX_PACKET = 4096
 MAX_PASSWORD = 128
 _HDR = struct.Struct("!BBH")

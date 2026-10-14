@@ -75,6 +75,23 @@ def serve_target(addrs):
         threading.Thread(target=loop, args=(s,), daemon=True).start()
 
 
+def serve_target_udp(addrs):
+    """A UDP echo of the source address it sees (the SOCKS5 UDP relay checks)."""
+
+    def loop(s):
+        while True:
+            data, peer = s.recvfrom(2048)
+            try:
+                s.sendto((peer[0] + "\n").encode(), peer)
+            except OSError:
+                pass
+
+    for a in addrs:
+        u = socket.socket(socket.AF_INET6 if ":" in a else socket.AF_INET, socket.SOCK_DGRAM)
+        u.bind((a, TARGET_PORT))
+        threading.Thread(target=loop, args=(u,), daemon=True).start()
+
+
 # ---- clients ---------------------------------------------------------------------------
 
 
@@ -123,6 +140,73 @@ def socks5(port, user, password, dst, dst_port=TARGET_PORT, timeout=10.0):
         if not line:
             raise ProxyError("no data from the target")
         return ipaddress.ip_address(line)
+    finally:
+        s.close()
+
+
+class SocksRefused(ProxyError):
+    def __init__(self, code, bnd):
+        super().__init__("socks reply %d" % code)
+        self.code, self.bnd = code, bnd
+
+
+def socks5_udp(port, user, password, dst, dst_port=TARGET_PORT, junk=(), timeout=5.0):
+    """SOCKS5 UDP ASSOCIATE through 127.0.0.4:port (placeholder 0.0.0.0:0); the
+    `junk` datagrams (atype + address + port headers) go first and must be dropped
+    without ending the association; then one to dst. Returns (the source the
+    target saw, the relay address)."""
+    s = socket.create_connection((SOCKS_HOST, port), timeout=timeout)
+    u = None
+    try:
+        s.sendall(b"\x05\x01\x02")
+        if _recv_exact(s, 2) != b"\x05\x02":
+            raise ProxyError("no user/pass method")
+        un, pw = user.encode(), password.encode()
+        s.sendall(bytes([1, len(un)]) + un + bytes([len(pw)]) + pw)
+        _recv_exact(s, 2)
+        s.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+        head = _recv_exact(s, 4)
+        addr = _recv_exact(s, 16 if head[3] == 4 else 4)
+        bport = struct.unpack("!H", _recv_exact(s, 2))[0]
+        relay = ipaddress.ip_address(addr)
+        if head[1] != 0:
+            raise SocksRefused(head[1], (relay, bport))
+        u = socket.socket(socket.AF_INET6 if relay.version == 6 else socket.AF_INET, socket.SOCK_DGRAM)
+        u.settimeout(timeout)
+        for hdr in junk:
+            u.sendto(b"\x00\x00\x00" + hdr + b"junk", (str(relay), bport))
+        ip = ipaddress.ip_address(dst)
+        u.sendto(b"\x00\x00\x04" + ip.packed + struct.pack("!H", dst_port) + b"ping", (str(relay), bport))
+        data, _ = u.recvfrom(2048)
+        off = 4 + (16 if data[3] == 4 else 4) + 2
+        return ipaddress.ip_address(data[off:].decode().strip()), relay
+    finally:
+        s.close()
+        if u is not None:
+            u.close()
+
+
+def udp_hdr(dst, port):
+    """A SOCKS5 UDP request header (atype, address, port) for `dst` (an IP or a name)."""
+    try:
+        ip = ipaddress.ip_address(dst)
+        return (b"\x04" if ip.version == 6 else b"\x01") + ip.packed + struct.pack("!H", port)
+    except ValueError:
+        name = dst.encode()
+        return b"\x03" + bytes([len(name)]) + name + struct.pack("!H", port)
+
+
+def raw_exchange(host, port, data, timeout=5.0, size=4096):
+    s = socket.create_connection((host, port), timeout=timeout)
+    try:
+        s.sendall(data)
+        out = b""
+        while len(out) < size:
+            chunk = s.recv(size - len(out))
+            if not chunk:
+                break
+            out += chunk
+        return out
     finally:
         s.close()
 
@@ -431,6 +515,9 @@ def run_checks(env: Env):
     rot = {(int(socks5(b, "netrun-e2erota", PW, t6)) >> 64) & 0xFFFF for _ in range(12)}
     check("piece: per-GB rotation never draws the piece's /64", env.piece_net not in rot, rot)
 
+    if not a.no_target:
+        udp_checks(env, want)
+
     # static across a RADIUS restart
     env.restart(signal.SIGHUP)
     check("static survives a graceful RADIUS restart", socks5(b + 2, "netrun-e2estat", PW, t6) == st1)
@@ -476,6 +563,48 @@ def run_checks(env: Env):
     check("RADIUS back: accepts again", env.list_of(socks5(b, "netrun-e2erota", PW, t6)) == 101)
 
     restart_under_load(env)
+
+
+def udp_checks(env: Env, want):
+    """Owner 2026-10-14: SOCKS5 UDP on the same ports for per-piece proxies
+    (3proxy-pergb change 7, netrun-radius: per-piece only); no 3proxy fingerprint
+    for whoever connects (change 8, socks -u2)."""
+    a = env.a
+    b, t6 = a.base, a.target6
+    try:
+        src, relay = socks5_udp(b + 1, "netrun-e2epiec", PW, t6)
+        check("udp: a piece's association leaves from its fixed address", src == want, (src, want))
+        check("udp: the relay is the listener's address (no PROXY header here)", str(relay) == SOCKS_HOST, relay)
+    except (ProxyError, OSError) as e:
+        check("udp: a piece's association leaves from its fixed address", False, e)
+    junk = [udp_hdr("nosuch.invalid", TARGET_PORT), udp_hdr("::1", TARGET_PORT), udp_hdr(t6, 1900), b"\x09\x00"]
+    try:
+        src, _ = socks5_udp(b, "netrun-e2epiec", PW, t6, junk=junk)
+        check("udp: unresolvable / loopback / denied-port / bad-type datagrams are dropped, not fatal", src == want, src)
+    except (ProxyError, OSError) as e:
+        check("udp: unresolvable / loopback / denied-port / bad-type datagrams are dropped, not fatal", False, e)
+    try:
+        socks5_udp(b, "netrun-e2erota", PW, t6)
+        check("udp: per-GB logins get no association", False, "accepted")
+    except SocksRefused as e:
+        check("udp: per-GB logins get no association", True)
+        check("no fingerprint: a refused SOCKS request carries 0.0.0.0:0", str(e.bnd[0]) == "0.0.0.0" and e.bnd[1] == 0, e.bnd)
+    except (ProxyError, OSError) as e:
+        check("udp: per-GB logins get no association", False, e)
+    rej = env.call({"op": "status"})["counters"]
+    check("udp: RADIUS counts the piece accepts and the per-GB refusal", rej.get("udpAccepts", 0) >= 2 and rej.get("udpRefused", 0) >= 1, rej)
+    greet = raw_exchange(SOCKS_HOST, b, b"\x05\x01\x00", size=2)
+    check("no fingerprint: a greeting without user/pass gets 0xFF (RFC 1928)", greet == b"\x05\xff", greet)
+    resp = raw_exchange(HTTP_HOST, b + HTTP_OFFSET, b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    text = resp.decode("latin1")
+    check(
+        "no fingerprint: our own 407 (realm Netrun, X-Proxy-Error, no 3proxy text)",
+        text.startswith("HTTP/1.1 407 ")
+        and 'realm="Netrun"' in text
+        and "X-Proxy-Error: auth_required" in text
+        and "disallowed by administrator" not in text,
+        text[:200],
+    )
 
 
 def load_while(env: Env, signals, workers=16):
@@ -629,6 +758,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     if not a.no_target:
         serve_target([a.target6, a.target4])
+        serve_target_udp([a.target6])
     env = Env(a)
     env.wait_ctl(20)
     env.facts()

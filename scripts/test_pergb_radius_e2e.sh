@@ -19,7 +19,10 @@
 # connection, sticky, static across a restart and a crash, IPv4 Framed, a per-piece
 # list (A13-I: its fixed address in its own /64, IPv4 from the primary IPv4, no
 # -session/-rotate), ipv6_only reject, the probe login, a hung RADIUS = SINGLEBYTE_L then reject, restarts
-# under load with no failed connection; then real Access-Requests are captured
+# under load with no failed connection; SOCKS5 UDP for a piece (its fixed address,
+# bad datagrams dropped without ending the association) and not for per-GB; no
+# 3proxy fingerprint (0xFF without user/pass, 0.0.0.0:0 in refusals, our own 407);
+# then real Access-Requests are captured
 # to $OUT/3proxy_captured.json (fixture for tests/test_proto.py).
 set -euo pipefail
 
@@ -113,7 +116,7 @@ CFG="$WORK/pergb_${BASE}.cfg"
   echo "allow *"
   for ((p = BASE; p <= LAST; p++)); do
     if [[ $p -eq $BASE ]]; then echo "maxconn 20000"; elif [[ $p -eq $((BASE + 1)) ]]; then echo "maxconn 2000"; fi
-    echo "socks -64 -a -p$p -i127.0.0.4 -e10.200.0.2 -e::1"
+    echo "socks -64 -a -u2 -p$p -i127.0.0.4 -e10.200.0.2 -e::1"
     echo "proxy -64 -n -a -p$p -i127.0.0.3 -e10.200.0.2 -e::1"
   done
 } >"$CFG"

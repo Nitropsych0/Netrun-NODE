@@ -313,6 +313,11 @@ class Probe(unittest.TestCase):
         self.assertEqual(r4.attrs, [(8, ipaddress.IPv4Address(rtest.EGRESS4).packed)])
         self.assertEqual(self.eng.counters["probeAccepts"], 2)
 
+    def test_probe_never_gets_udp(self):
+        r = ask(self.eng, "netrun-svcprobe", "ProbePassword123", dst=None, dst_port=0, op=rtest.OP_UDPASSOC)
+        self.assertFalse(r.accepted)
+        self.assertEqual(self.eng.counters["probeAccepts"], 0)
+
     def test_probe_on_ipv6_only_answers_an_ipv4_canary_with_ipv6(self):
         """The node agent probes the first canary of its sorted list — an IPv4 one. On
         an ipv6_only node a reject there would fail the guards' probe and restart

@@ -576,6 +576,8 @@ class Engine:
             "noDst": 0,
             "v4OnIpv6Only": 0,
             "probeAccepts": 0,
+            "udpAccepts": 0,
+            "udpRefused": 0,
             "sendErrors": 0,
         }
         self.lat = array("d", bytes(8 * LAT_SAMPLES))
@@ -747,11 +749,21 @@ class Engine:
             login = uname.parse(req.username, f.geo)
         except uname.LoginError as e:
             return self._reject(e.reason, self.by_login.get(e.base) if e.base else None, now)
+        # SOCKS5 UDP ASSOCIATE (owner 2026-10-14): per-piece proxies only for
+        # now — a per-GB association would outlive a quota kill (the node agent
+        # kills TCP sockets). BIND (an inbound listener) never.
+        udp = req.login_service == proto.LOGIN_SERVICE_UDPASSOC
+        if req.login_service == proto.LOGIN_SERVICE_BIND:
+            return self._reject("bad_params", None, now)
         fam = req.dst_family
         if fam == 0:
-            self.counters["noDst"] += 1
+            if not udp:  # an ASSOCIATE names no destination by design
+                self.counters["noDst"] += 1
             fam = 6
         if login.probe:
+            if udp:
+                self.counters["udpRefused"] += 1
+                return self._reject("udp_off", None, now)
             return self._probe(req, password, fam, now)
         lst = self.by_login.get(login.base)
         port = req.nas_port
@@ -769,7 +781,13 @@ class Engine:
         if acct.kind != lst.kind:
             return self._reject("account_off", lst, now)  # a piece list needs a piece account and vice versa
         if lst.kind == PIECE:
-            return self._authorize_piece(req, login, lst, acct, fam, now)
+            out = self._authorize_piece(req, login, lst, acct, fam, now)
+            if udp and out[0] is None:
+                self.counters["udpAccepts"] += 1
+            return out
+        if udp:
+            self.counters["udpRefused"] += 1
+            return self._reject("udp_off", lst, now)
         if acct.local_blocked:
             return self._reject("quota", lst, now)
         aid = acct.id

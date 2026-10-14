@@ -80,8 +80,20 @@ Suites: noble noble-updates noble-security
 Components: main
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SRC
-apt-get -o Acquire::Retries=5 -o Acquire::Check-Valid-Until=false update -qq
-apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends gcc make libc6-dev patch >/dev/null
+# snapshot.ubuntu.com answers 502/503 for minutes at a time (2026-10-14): the
+# whole update / install is retried, not just each file (Acquire::Retries gives
+# up after 5 quick tries). The packages are the snapshot's either way.
+retry() {
+  local n
+  for n in 1 2 3 4 5 6; do
+    "$@" && return 0
+    [ "$n" = 6 ] && return 1
+    echo "apt failed (try $n/6) — again in 30 s" >&2
+    sleep 30
+  done
+}
+retry apt-get -o Acquire::Retries=5 -o Acquire::Check-Valid-Until=false update -qq
+retry apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends gcc make libc6-dev patch >/dev/null
 mkdir -p /build
 tar -xzf /in/3proxy-0.9.3.tar.gz -C /build
 cd /build/3proxy-0.9.3

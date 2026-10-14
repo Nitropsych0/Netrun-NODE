@@ -120,6 +120,7 @@ def request(
     dst_port: int = 443,
     secret: bytes = SECRET,
     ident: int = 7,
+    operation_bits: int = 1,
 ):
     ra = os.urandom(16)
     pkt = proto.build_3proxy_request(
@@ -131,6 +132,7 @@ def request(
         nas_port=port,
         dst=dst,
         dst_port=dst_port,
+        operation_bits=operation_bits,
     )
     return pkt, ra
 
@@ -159,6 +161,12 @@ class Reply:
         return (int(a) >> 64) & 0xFFFF if a is not None and a.version == 6 else None
 
 
-def ask(eng, user, password="Passw0rdPassw0rd", port=BASE, dst=DST6, dst_port=443, secret=SECRET) -> Reply:
-    pkt, ra = request(user, password, port, dst, dst_port, secret)
+# 3proxy operation bits (structures.h) for request(operation_bits=…)
+OP_CONNECT, OP_BIND, OP_UDPASSOC, OP_HTTP_CONNECT = 0x1, 0x2, 0x4, 0x1000
+
+
+def ask(
+    eng, user, password="Passw0rdPassw0rd", port=BASE, dst=DST6, dst_port=443, secret=SECRET, op=OP_CONNECT
+) -> Reply:
+    pkt, ra = request(user, password, port, dst, dst_port, secret, operation_bits=op)
     return Reply(eng.handle(pkt), ra, secret)

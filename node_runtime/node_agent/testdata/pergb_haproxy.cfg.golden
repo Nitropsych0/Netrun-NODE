@@ -41,14 +41,14 @@ frontend pergb_in
 
 backend pergb_socks
     balance leastconn
-    server socks1 127.0.0.4 source 127.0.2.1
-    server socks2 127.0.0.4 source 127.0.2.2
-    server socks3 127.0.0.4 source 127.0.2.3
-    server socks4 127.0.0.4 source 127.0.2.4
-    server socks5 127.0.0.4 source 127.0.2.5
-    server socks6 127.0.0.4 source 127.0.2.6
-    server socks7 127.0.0.4 source 127.0.2.7
-    server socks8 127.0.0.4 source 127.0.2.8
+    server socks1 127.0.0.4 source 127.0.2.1 send-proxy-v2
+    server socks2 127.0.0.4 source 127.0.2.2 send-proxy-v2
+    server socks3 127.0.0.4 source 127.0.2.3 send-proxy-v2
+    server socks4 127.0.0.4 source 127.0.2.4 send-proxy-v2
+    server socks5 127.0.0.4 source 127.0.2.5 send-proxy-v2
+    server socks6 127.0.0.4 source 127.0.2.6 send-proxy-v2
+    server socks7 127.0.0.4 source 127.0.2.7 send-proxy-v2
+    server socks8 127.0.0.4 source 127.0.2.8 send-proxy-v2
 
 backend pergb_tls_loop
     server tls abns@netrun_pergb_tls send-proxy-v2
