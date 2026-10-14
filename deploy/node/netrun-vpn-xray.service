@@ -1,0 +1,33 @@
+# NETRUN VPN — Xray-core (VLESS + REALITY), owner 2026-10-15. Installed by
+# deploy/node/install_vpn.sh, enabled and (re)started by the node agent's
+# POST /vpn/enable (node_runtime/node_agent/vpn_runtime.js), which writes
+# /etc/netrun-vpn/xray.json. XRAY_BUF_SPLICE=disable: with splice a long
+# download reaches the per-user traffic counters only when it closes.
+[Unit]
+Description=NETRUN VPN (Xray, VLESS + REALITY)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=netrun-vpn
+Group=netrun-vpn
+Slice=netrun-vpn.slice
+Environment=XRAY_BUF_SPLICE=disable
+Environment=XRAY_LOCATION_ASSET=/opt/netrun/vpn/share
+ExecStartPre=+/bin/sh -c 'cd /opt/netrun/vpn/bin && sha256sum -c --quiet xray.sha256'
+ExecStart=/opt/netrun/vpn/bin/xray run -c /etc/netrun-vpn/xray.json
+RuntimeDirectory=netrun-vpn
+RuntimeDirectoryMode=0700
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+LimitNOFILE=1048576
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

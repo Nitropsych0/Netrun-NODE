@@ -1,0 +1,11 @@
+# NETRUN VPN — the Xray process (deploy/node/install_vpn.sh). netrun.slice
+# (CPU weight against the per-piece batches) is its parent by name.
+[Unit]
+Description=NETRUN VPN slice
+Before=slices.target
+
+[Slice]
+CPUWeight=50
+MemoryHigh=1280M
+MemoryMax=1536M
+TasksMax=4096

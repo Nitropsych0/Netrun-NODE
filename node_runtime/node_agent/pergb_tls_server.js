@@ -45,6 +45,8 @@ function readSettings(env = process.env) {
     keyPath: env.NETRUN_PERGB_TLS_KEY ? String(env.NETRUN_PERGB_TLS_KEY) : null,
     ip: env.NETRUN_PERGB_TLS_IP ? String(env.NETRUN_PERGB_TLS_IP) : null,
     installedDir: String(env.NETRUN_PERGB_ETC_DIR || "/etc/netrun-pergb"),
+    // VPN (owner 2026-10-15): /vpn/* share this listener; a VPN-only node opens it too
+    vpnInstalledDir: String(env.NETRUN_VPN_ETC_DIR || "/etc/netrun-vpn"),
     requireInstalled: !/^(0|off|false|no)$/i.test(String(env.NETRUN_PERGB_TLS_REQUIRE_INSTALLED || "1")),
     requireFirewall: !/^(0|off|false|no)$/i.test(String(env.NETRUN_PERGB_TLS_REQUIRE_FIREWALL || "1")),
   };
@@ -142,11 +144,12 @@ function defaultPrimaryIp(run) {
   };
 }
 
-// deps: { pergb, apiKeyMatches(given) -> bool, env, log, run, primaryIp() }
+// deps: { pergb, vpn?, apiKeyMatches(given) -> bool, env, log, run, primaryIp() }
 function createTlsServer(deps) {
   const settings = { ...readSettings(deps.env || process.env), ...(deps.settings || {}) };
   const log = deps.log || console;
   const pergb = deps.pergb;
+  const vpn = deps.vpn || null;
   const keyOk = deps.apiKeyMatches;
   const run = deps.run || require("./pergb_runtime.js").execCapture;
   const primaryIp = deps.primaryIp || defaultPrimaryIp(run);
@@ -216,6 +219,7 @@ function createTlsServer(deps) {
       else if (req.method === "GET" && p === "/pergb/port_check") out = await pergb.portCheck(q);
       else if (req.method === "POST" && p === "/pergb/reserve_nets") out = await pergb.reserveNets(body);
       else if (req.method === "POST" && p === "/pergb/release_nets") out = await pergb.releaseNets(body);
+      else if (vpn && (p === "/vpn" || p.startsWith("/vpn/"))) out = await require("./vpn_runtime.js").handleRoute(vpn, req.method, p, q, body);
       else out = { status: 404, body: { success: false, error: "not_found" } };
     } catch (e) {
       log.error(`[pergb-tls] ${req.method} ${p}: ${(e && e.stack) || e}`);
@@ -261,7 +265,7 @@ function createTlsServer(deps) {
   // May the listener open? (see the module doc)
   async function checkGate() {
     const out = { open: true, reason: null, firewall: null, checkedAt: new Date().toISOString() };
-    if (settings.requireInstalled && !fs.existsSync(settings.installedDir)) {
+    if (settings.requireInstalled && !fs.existsSync(settings.installedDir) && !(vpn && fs.existsSync(settings.vpnInstalledDir))) {
       Object.assign(out, { open: false, reason: "pergb_not_installed" });
     } else if (settings.requireFirewall) {
       let r;

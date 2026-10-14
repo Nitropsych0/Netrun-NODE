@@ -33,6 +33,9 @@ const clockSync = require("./clock_sync.js");
 // (pergb_state.js). Nothing runs while per-GB is not enabled on the node.
 const pergbStateLib = require("./pergb_state.js");
 const pergbTlsLib = require("./pergb_tls_server.js");
+// VPN (owner 2026-10-15) — VLESS + REALITY on Xray, driven over the TLS
+// listener's /vpn/* (vpn_runtime.js). Nothing runs until /vpn/enable.
+const vpnLib = require("./vpn_runtime.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 // Wave FLEET-HEALTH (RES-10) — bind address. The unit template has always set
@@ -158,7 +161,8 @@ function ensureAuthorized(req) {
 }
 
 const pergb = pergbStateLib.createPergb();
-const pergbServer = pergbTlsLib.createTlsServer({ pergb, apiKeyMatches: (given) => apiKeyMatches(given) });
+const vpn = vpnLib.createVpn();
+const pergbServer = pergbTlsLib.createTlsServer({ pergb, vpn, apiKeyMatches: (given) => apiKeyMatches(given) });
 // Per-piece allocators (egress.js, deprovision, rebind) reserve and release
 // pool /64s through the agent's per-GB service: one ctl client, and the
 // excluded set the kills and attribution skip learns each /64 at once.
@@ -4692,6 +4696,8 @@ if (require.main === module) {
     // enabled here (facts + excluded to RADIUS at start).
     pergbServer.start().catch((err) => console.error(`[node-agent] pergb TLS listener: ${(err && err.message) || err}`));
     pergb.start().catch((err) => console.error(`[node-agent] pergb start: ${(err && err.message) || err}`));
+    // VPN — an enabled node gets its entry addresses, guard and Xray back.
+    vpn.start().catch((err) => console.error(`[node-agent] vpn start: ${(err && err.message) || err}`));
   });
 }
 
@@ -4769,4 +4775,5 @@ module.exports = {
   // Pay-per-GB v2 — exported for unit tests.
   pergb,
   pergbServer,
+  vpn,
 };

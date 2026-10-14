@@ -76,9 +76,9 @@ function netplanIdFor(iface, texts) {
   return iface;
 }
 
-function dropinText(id, ips) {
+function dropinText(id, ips, title = "pay-per-GB v2 — the per-GB IPv4 addresses (node_agent/pergb_ipv4.js, POST /pergb/enable)") {
   const lines = [
-    "# NETRUN pay-per-GB v2 — the per-GB IPv4 addresses (node_agent/pergb_ipv4.js, POST /pergb/enable).",
+    `# NETRUN ${title}.`,
     "# Configured live with `ip addr add`; this file brings them back after a reboot. Do not edit.",
     "network:",
     "  version: 2",
@@ -109,6 +109,8 @@ function writeAtomic(file, text, mode) {
 
 // Make the node carry exactly `ips` as per-GB addresses (added by us).
 // deps: { run, settings, log }. -> { ok, iface, added, removed, dropin, error? }
+// settings.dropinName / dropinTitle: another owner of addresses (the VPN,
+// vpn_runtime.js) keeps its own drop-in and state file.
 async function ensureAddresses(ips, deps) {
   const run = deps.run;
   const settings = deps.settings || readSettings();
@@ -139,12 +141,13 @@ async function ensureAddresses(ips, deps) {
     if (r.code === 0) out.removed.push(ip);
   }
   // persisted for the next boot (never applied here)
-  const dropin = path.join(settings.netplanDir, DROPIN_NAME);
+  const dropinName = settings.dropinName || DROPIN_NAME;
+  const dropin = path.join(settings.netplanDir, dropinName);
   let texts = [];
   try {
     texts = fs
       .readdirSync(settings.netplanDir)
-      .filter((f) => f.endsWith(".yaml") && f !== DROPIN_NAME)
+      .filter((f) => f.endsWith(".yaml") && f !== dropinName)
       .sort()
       .map((f) => fs.readFileSync(path.join(settings.netplanDir, f), "utf-8"));
   } catch {}
@@ -152,7 +155,7 @@ async function ensureAddresses(ips, deps) {
   const listed = (ip) => texts.some((t) => new RegExp(`(^|[^0-9.])${ip.replace(/\./g, "\\.")}/\\d+`).test(t));
   const persist = want.filter((ip) => !listed(ip));
   if (persist.length) {
-    const text = dropinText(netplanIdFor(route.dev, texts), persist);
+    const text = dropinText(netplanIdFor(route.dev, texts), persist, settings.dropinTitle);
     let cur = null;
     try {
       cur = fs.readFileSync(dropin, "utf-8");
@@ -170,7 +173,7 @@ async function ensureAddresses(ips, deps) {
   // ours = what we added now plus what we had added before and still want
   const ours = [...new Set([...state.added.filter((ip) => want.includes(ip)), ...out.added])];
   writeAtomic(settings.statePath, `${JSON.stringify({ added: ours, iface: route.dev, updatedAt: new Date().toISOString() }, null, 2)}\n`, 0o600);
-  if (out.added.length || out.removed.length) log.log(`[pergb-ipv4] ${route.dev}: added ${out.added.join(",") || "-"}, removed ${out.removed.join(",") || "-"}`);
+  if (out.added.length || out.removed.length) log.log(`[${settings.dropinName ? "vpn" : "pergb"}-ipv4] ${route.dev}: added ${out.added.join(",") || "-"}, removed ${out.removed.join(",") || "-"}`);
   return out;
 }
 
