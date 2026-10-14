@@ -87,6 +87,7 @@ test("renderConfig: an inbound and a marked outbound per entry, the guards in ro
     { type: "field", inboundTag: ["vpn-in-1"], outboundTag: "vpn-out-1" },
   ]);
   assert.strictEqual(cfg.api.listen, "127.0.0.1:8087");
+  assert.deepStrictEqual(cfg.api.services, ["HandlerService", "StatsService", "LoggerService"], "restartlogger needs LoggerService");
   assert.ok(cfg.policy.levels[0].statsUserUplink && cfg.policy.levels[0].statsUserDownlink);
   assert.strictEqual(cfg.log.access, "/run/netrun-vpn/access.log");
 });
@@ -188,7 +189,7 @@ function fakeNode() {
         for (const e of args.slice(4)) state.users.delete(`${tag}/${e}`);
         return ok("Removed");
       }
-      if (sub === "restartlogger") return ok();
+      if (sub === "restartlogger") return state.restartloggerFails ? { code: 1, stdout: "", stderr: "unknown service xray.app.log.command.LoggerService" } : ok();
     }
     if (cmd === "ss") return ok(args.includes("-K") ? "0 0 104.207.139.14:443 198.51.100.7:43364\n" : "");
     return { code: 1, stdout: "", stderr: `unexpected ${cmd} ${args.join(" ")}` };
@@ -262,6 +263,10 @@ test("runtime: users go in and out through the API, the removed ones lose their 
   assert.deepStrictEqual([...n.state.users.keys()].sort(), ["vpn-in-0/v1", "vpn-in-0/v2", "vpn-in-1/v1", "vpn-in-1/v2"]);
   // v2's connection shows up in the access log, then v2 goes
   fs.writeFileSync(path.join(n.run, "access.log"), "2026/10/15 01:12:12.229340 from 198.51.100.7:43364 accepted tcp:dl.google.com:443 [vpn-in-0 -> vpn-out-0] email: v2\n");
+  n.state.restartloggerFails = true;
+  assert.strictEqual(await n.rt.readAccessLog(), 0, "restartlogger failed: nothing read");
+  assert.ok(fs.existsSync(path.join(n.run, "access.log")), "and the file keeps its name (Xray still writes it)");
+  n.state.restartloggerFails = false;
   assert.strictEqual(await n.rt.readAccessLog(), 1);
   assert.ok(!fs.existsSync(path.join(n.run, "access.log.1")), "the rotated log is dropped at once");
   r = await n.rt.putUsers({ users: [{ id: U1, email: "v1" }] });

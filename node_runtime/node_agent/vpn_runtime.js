@@ -180,7 +180,8 @@ function renderConfig({ params, keys, users, settings, ownIps }) {
   const deny = [...DENY_V4, ...DENY_V6, ...(ownIps || []).map(normalizeCidr)];
   return {
     log: { loglevel: "warning", access: path.join(settings.runDir, "access.log"), dnsLog: false },
-    api: { tag: "api", listen: settings.api, services: ["HandlerService", "StatsService"] },
+    // LoggerService: `api restartlogger` reopens the access log after the agent rotated it
+    api: { tag: "api", listen: settings.api, services: ["HandlerService", "StatsService", "LoggerService"] },
     stats: {},
     policy: {
       levels: { 0: { handshake: 4, connIdle: 300, uplinkOnly: 1, downlinkOnly: 1, statsUserUplink: true, statsUserDownlink: true } },
@@ -741,7 +742,15 @@ function createVpn(deps = {}) {
       lastLogError = e.message;
       return 0;
     }
-    await api(["restartlogger"], 5000);
+    const rl = await api(["restartlogger"], 5000);
+    if (rl.code !== 0) {
+      // Xray still writes the renamed file: give it its name back, read next time
+      try {
+        fs.renameSync(P.accessOld, P.access);
+      } catch {}
+      lastLogError = `restartlogger: ${String(rl.stderr || rl.stdout).trim().slice(0, 160)}`;
+      return 0;
+    }
     let text = "";
     try {
       text = fs.readFileSync(P.accessOld, "utf-8");
