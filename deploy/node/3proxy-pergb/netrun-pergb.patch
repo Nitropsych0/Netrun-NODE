@@ -47,20 +47,22 @@ the stock deploy/node/bin/3proxy.
    it and accepts datagrams only from the real client; its egress socket takes
    the family of the egress RADIUS assigned, not of the client's 0.0.0.0:0
    placeholder (an IPv4 socket on a dual-stack listener, which the piece's
-   IPv6 could not bind). A datagram to a name
-   without an address of the node's family (an IPv4-only host on an IPv6-only
-   node), of an unknown address type or of a family the egress socket can not
-   send to, to a special address (loopback, private, link-local, multicast,
-   v4-mapped) or to a scanner / reflection port (0 19 137-139 1900 11211), or
-   over 20000 per second per association, is dropped and the association
-   lives on (upstream ended it on a bad one, sent the rest blindly). Interim log
-   records at the logdump thresholds (either direction), as a TCP relay
-   writes them, so a long association is billed while it lasts. A refused
-   ASSOCIATE (RADIUS, ACL) gets its SOCKS reply (upstream wrote it to a relay
-   control socket that did not exist yet, so the client saw only a close). The login is asked again every 300 s,
-   so an expired or switched-off proxy loses its association (the node agent
-   kills TCP sockets only). Which logins may open one is RADIUS's call
-   (per-piece proxies only, for now).
+   IPv6 could not bind), and a datagram's address is parsed with its own
+   family (upstream copied it at the placeholder family's offset). A datagram
+   to a name without an address of the node's family (an IPv4-only host on an
+   IPv6-only node), of an unknown address type or of a family the egress
+   socket can not send to, to a special address (loopback, private, link-
+   local, multicast, v4-mapped) or to a scanner / reflection port (0 19
+   137-139 1900 11211), over 20000 per second per association, shorter than a
+   SOCKS5 UDP header or with a non-zero FRAG (RFC 1928: drop), is dropped and
+   the association lives on (upstream ended it on a bad one, sent the rest
+   blindly). Interim log records at the logdump thresholds (either direction),
+   as a TCP relay writes them, so a long association is billed while it lasts.
+   A refused ASSOCIATE (RADIUS, ACL) gets its SOCKS reply (upstream wrote it
+   to a relay control socket that did not exist yet, so the client saw only a
+   close). The login is asked again every 300 s, so an expired or switched-off
+   proxy loses its association (the node agent kills TCP sockets only). Which
+   logins may open one is RADIUS's call (per-piece proxies only, for now).
 8. proxy.c / socks.c (no 3proxy fingerprint for whoever connects to the
    ports): the HTTP proxy's answers are our own short plain-text pages
    (HTTP/1.1, Content-Length, realm "Netrun", the cause in X-Proxy-Error)
@@ -603,7 +605,7 @@ diff -ru a/src/socks.c b/src/socks.c
  
  				for(;;){
  					fds[0].fd = param->remsock;
-@@ -348,13 +483,24 @@
+@@ -348,28 +483,47 @@
  						param->res = 0;
  						break;
  					}
@@ -620,16 +622,45 @@ diff -ru a/src/socks.c b/src/socks.c
 +					}
  					if (fds[1].revents) {
  						sasize = sizeof(sin);
- 						if((len = so._recvfrom(param->clisock, (char *)buf, 65535, 0, (struct sockaddr *)&sin, &sasize)) <= 10) {
+-						if((len = so._recvfrom(param->clisock, (char *)buf, 65535, 0, (struct sockaddr *)&sin, &sasize)) <= 10) {
++						if((len = so._recvfrom(param->clisock, (char *)buf, 65535, 0, (struct sockaddr *)&sin, &sasize)) <= 0) {
  							param->res = 464;
  							break;
  						}
 -						if(SAADDRLEN(&sin) != SAADDRLEN(&param->sincr) || memcmp(SAADDR(&sin), SAADDR(&param->sincr), SAADDRLEN(&sin))){
++						/* netrun-pergb: a datagram too short for a SOCKS5 UDP
++						   header is dropped, the association lives on */
++						if(len <= 10) continue;
 +						if(SAADDRLEN(&sin) != SAADDRLEN(&udpcli) || memcmp(SAADDR(&sin), SAADDR(&udpcli), SAADDRLEN(&sin))){
  							param->res = 465;
  							break;
  						}
-@@ -377,20 +523,35 @@
+-						if(buf[0] || buf[1] || buf[2]) {
+-							param->res = 466;
+-							break;
+-						}
++						/* netrun-pergb: RFC 1928 — an implementation without
++						   fragmentation MUST drop a datagram whose FRAG is not 0
++						   (upstream ended the association) */
++						if(buf[0] || buf[1] || buf[2]) continue;
+ 						size = 4;
+ 						switch(buf[3]) {
+ 							case 4:
+ 								size = 16;
+ 							case 1:
+ 								i = 4+size;
+-								memcpy(SAADDR(&param->sinsr), buf+4, size);
++								/* netrun-pergb: the family first — SAADDR's offset
++								   depends on it, and sinsr still has the
++								   placeholder's family (an IPv4 0.0.0.0 on a
++								   dual-stack listener shifted an IPv6 address by
++								   4 bytes) */
+ 								*SAFAMILY(&param->sinsr) = (size == 4)?AF_INET:AF_INET6;
++								memcpy(SAADDR(&param->sinsr), buf+4, size);
+ 								break;
+ 							case 3:
+ 								size = buf[4];
+@@ -377,20 +531,35 @@
  									buf[i] = buf[i+1];
  								}
  								buf[i++] = 0;
@@ -667,7 +698,7 @@ diff -ru a/src/socks.c b/src/socks.c
  #if SOCKSTRACE > 1
  fprintf(stderr, "UDP packet relayed from client to %s:%hu size %d, header %d\n",
  			inet_ntoa(param->sins.sin_addr),
-@@ -421,6 +582,12 @@
+@@ -421,6 +590,12 @@
  						memcpy(buf+4+SAADDRLEN(&param->sinsr), SAPORT(&param->sinsr), 2);
  						sasize = sizeof(sin);
  						socksendto(param->clisock, (struct sockaddr *)&sin, buf, len + 6 + SAADDRLEN(&param->sinsr), conf.timeouts[SINGLEBYTE_L]*1000);

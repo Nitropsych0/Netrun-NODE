@@ -75,6 +75,25 @@ def serve_target(addrs):
         threading.Thread(target=loop, args=(s,), daemon=True).start()
 
 
+def serve_nxdomain(addrs=("127.0.0.1", "::1")):
+    """The namespace's resolver (3proxy's nserver 127.0.0.1 / ::1): NXDOMAIN for
+    every name at once, as the node's unbound answers a name that does not
+    exist — without it a name waits out the DNS timeout on each nserver."""
+
+    def loop(s):
+        while True:
+            q, peer = s.recvfrom(512)
+            if len(q) < 12:
+                continue
+            # same id and question, QR=1 RD RA, RCODE=3 (NXDOMAIN), no records
+            s.sendto(q[:2] + b"\x81\x83" + q[4:6] + b"\x00\x00\x00\x00\x00\x00" + q[12:], peer)
+
+    for a in addrs:
+        u = socket.socket(socket.AF_INET6 if ":" in a else socket.AF_INET, socket.SOCK_DGRAM)
+        u.bind((a, 53))
+        threading.Thread(target=loop, args=(u,), daemon=True).start()
+
+
 def serve_target_udp(addrs):
     """A UDP echo of the source address it sees (the SOCKS5 UDP relay checks)."""
 
@@ -174,7 +193,9 @@ def socks5_udp(port, user, password, dst, dst_port=TARGET_PORT, junk=(), timeout
         u = socket.socket(socket.AF_INET6 if relay.version == 6 else socket.AF_INET, socket.SOCK_DGRAM)
         u.settimeout(timeout)
         for hdr in junk:
-            u.sendto(b"\x00\x00\x00" + hdr + b"junk", (str(relay), bport))
+            # a junk entry starting with RSV RSV is sent as it is (a FRAG test)
+            raw = hdr if hdr[:2] == b"\x00\x00" else b"\x00\x00\x00" + hdr + b"junk"
+            u.sendto(raw, (str(relay), bport))
         ip = ipaddress.ip_address(dst)
         # RSV RSV FRAG(0) ATYP — a non-zero FRAG ends the association (3proxy)
         u.sendto(b"\x00\x00\x00\x04" + ip.packed + struct.pack("!H", dst_port) + b"ping", (str(relay), bport))
@@ -583,12 +604,18 @@ def udp_checks(env: Env, want):
         check("udp: the relay is the listener's address (no PROXY header here)", str(relay) == SOCKS_HOST, relay)
     except (ProxyError, OSError) as e:
         check("udp: a piece's association leaves from its fixed address", False, e)
-    junk = [udp_hdr("nosuch.invalid", TARGET_PORT), udp_hdr("::1", TARGET_PORT), udp_hdr(t6, 1900), b"\x09\x00"]
+    junk = [
+        udp_hdr("nosuch.invalid", TARGET_PORT),  # NXDOMAIN
+        udp_hdr("::1", TARGET_PORT),  # loopback
+        udp_hdr(t6, 1900),  # a denied port
+        b"\x09\x00",  # an unknown address type, shorter than a header
+        b"\x00\x00\x01" + udp_hdr(t6, TARGET_PORT) + b"frag",  # FRAG 1 (RFC 1928: drop)
+    ]
     try:
         src, _ = socks5_udp(b, "netrun-e2epiec", PW, t6, junk=junk)
-        check("udp: unresolvable / loopback / denied-port / bad-type datagrams are dropped, not fatal", src == want, src)
+        check("udp: NXDOMAIN / loopback / denied-port / short / fragmented datagrams are dropped, not fatal", src == want, src)
     except (ProxyError, OSError) as e:
-        check("udp: unresolvable / loopback / denied-port / bad-type datagrams are dropped, not fatal", False, e)
+        check("udp: NXDOMAIN / loopback / denied-port / short / fragmented datagrams are dropped, not fatal", False, e)
     try:
         socks5_udp(b, "netrun-e2erota", PW, t6)
         check("udp: per-GB logins get no association", False, "accepted")
@@ -767,6 +794,7 @@ def main():
     if not a.no_target:
         serve_target([a.target6, a.target4])
         serve_target_udp([a.target6])
+        serve_nxdomain()
     env = Env(a)
     env.wait_ctl(20)
     env.facts()
