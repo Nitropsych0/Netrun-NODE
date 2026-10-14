@@ -688,8 +688,9 @@ def udp_checks(env: Env, want):
         check("udp: a blocked list gets no association", False, e)
     rej = env.call({"op": "status"})["counters"]
     check("udp: RADIUS counts the accepts, refuses none for UDP itself", rej.get("udpAccepts", 0) >= 7 and rej.get("udpRefused", 0) == 0, rej)
-    greet = raw_exchange(SOCKS_HOST, b, b"\x05\x01\x00", size=2)
-    check("no fingerprint: a greeting without user/pass gets 0xFF (RFC 1928)", greet == b"\x05\xff", greet)
+    greet = raw_exchange(SOCKS_HOST, b, b"\x05\x01\x00", timeout=3.0, size=64)
+    # 0xFF and the close — no stray SOCKS reply after it (upstream sent 05 02 00 01 …)
+    check("no fingerprint: a greeting without user/pass gets 0xFF and the close, nothing else", greet == b"\x05\xff", greet)
     # an address, not a name: the namespace has no DNS and 3proxy resolves first
     url = "http://[%s]:%d/" % (t6, TARGET_PORT)
     resp = raw_exchange(HTTP_HOST, b + HTTP_OFFSET, ("GET %s HTTP/1.1\r\nHost: [%s]\r\n\r\n" % (url, t6)).encode())

@@ -112,8 +112,8 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 const FAMILIES = new Set(["dualstack", "ipv6_only"]);
 // 3proxy 0.9.3 conf.c (h_ace) operation names. The per-GB ACL allows SOCKS
 // CONNECT, SOCKS5 UDP ASSOCIATE (owner 2026-10-14: UDP on the same ports;
-// netrun-radius decides which logins get one — per-piece proxies for now —
-// and 3proxy-pergb change 7 relays it) and the HTTP-proxy operations (plain
+// netrun-radius decides which logins get one — every per-piece and per-GB
+// login, never the probe — and 3proxy-pergb change 7 relays it) and the HTTP-proxy operations (plain
 // HTTP methods + CONNECT); never BIND / ICMPASSOC, FTP, ADMIN or DNSRESOLVE.
 const ACL_OPERATIONS = [
   "CONNECT",
