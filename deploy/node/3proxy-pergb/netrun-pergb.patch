@@ -1,4 +1,4 @@
-NETRUN per-GB 3proxy: 3proxy 0.9.3 (upstream tag 0.9.3) + four changes.
+NETRUN per-GB 3proxy: 3proxy 0.9.3 (upstream tag 0.9.3) + five changes.
 Applied with `patch -p1` in the extracted 3proxy-0.9.3/ tree by
 scripts/build_3proxy_pergb.sh; the result is deploy/node/bin/3proxy-pergb
 (sha256 pinned in deploy/node/bin/3proxy-pergb.sha256). Per-piece batches keep
@@ -29,6 +29,12 @@ the stock deploy/node/bin/3proxy.
    egress fingerprint rewriter (deploy/node/osfp); SO_MARK needs CAP_NET_ADMIN
    and fails harmlessly without it (only the TTL applies). The window / scale /
    option / timestamp rewrite is done by that rewriter, not in 3proxy.
+5. socks.c (the SOCKS reply code): upstream maps a result >= 100 to
+   res % 10, so res 100 — no destination, the name did not resolve (every
+   IPv4-only site once the node is -6, IPv6 only since 2026-10-14) — became
+   reply 0 = success: the client read "request granted" and got an empty
+   tunnel. 100 now answers 4 (host unreachable), any other res % 10 == 0
+   answers 1 (general failure). SOCKS4 follows (91 rejected).
 
 diff -ru a/src/common.c b/src/common.c
 --- a/src/common.c
@@ -123,3 +129,19 @@ diff -ru a/src/conf.c b/src/conf.c
  	if(strstr((char *) *(argv + 1), "ip")) conf.authcachetype |= 1;
  	if(strstr((char *) *(argv + 1), "user")) conf.authcachetype |= 2;
  	if(strstr((char *) *(argv + 1), "pass")) conf.authcachetype |= 4;
+diff -ru a/src/socks.c b/src/socks.c
+--- a/src/socks.c
++++ b/src/socks.c
+@@ -253,7 +253,11 @@
+ 	else if (param->res < 20) repcode = 5;
+ 	else if (param->res < 30) repcode = 1;
+ 	else if (param->res < 100) repcode = 4;
+-	else repcode = param->res%10;
++	/* netrun-pergb: res 100 (no destination: the name did not resolve, e.g. an
++	   IPv4-only site under -6) and any other res%10 == 0 code mapped to
++	   reply 0 = SUCCESS; the client saw "request granted" and an empty
++	   tunnel. 100 -> 4 (host unreachable), others -> 1 (general failure). */
++	else repcode = (param->res%10) ? param->res%10 : ((param->res == 100) ? 4 : 1);
+ 
+ 	if(ver == 5){
+ 		buf[0] = 5;
