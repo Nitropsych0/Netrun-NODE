@@ -160,10 +160,20 @@ class Basics(unittest.TestCase):
         self.eng.dispatch({"op": "ipv4_admission", "open": True})
         self.assertIsNone(self.reason_of("netrun-rotaaaa", dst=DST4))
 
-    def test_ipv6_only_rejects_ipv4(self):
+    def test_ipv6_only_answers_ipv4_with_the_ipv6_egress(self):
+        """Owner 2026-10-14, IPv6 only: an IPv4 destination is not refused (3proxy
+        would say 407, a «wrong password») but given the IPv6 egress, which 3proxy
+        can't bind to the IPv4 socket -> HTTP 502 / SOCKS reply 5, nothing leaves."""
         self.eng.dispatch({"op": "facts", "facts": rtest.facts(family="ipv6_only", egressIpv4=None)})
-        self.assertEqual(self.reason_of("netrun-rotaaaa", dst=DST4), "bad_params")
+        r = ask(self.eng, "netrun-rotaaaa", dst=DST4)
+        self.assertTrue(r.accepted)
+        self.assertEqual(r.addr.version, 6)
+        self.assertNotIn(8, [t for t, _ in r.attrs], "no Framed-IP-Address (IPv4)")
         self.assertIsNone(self.reason_of("netrun-rotaaaa", dst=DST6))
+        self.assertEqual(self.eng.dispatch({"op": "status"})["counters"]["v4OnIpv6Only"], 1)
+        # the IPv4 guard has nothing to say about it any more
+        self.eng.dispatch({"op": "ipv4_admission", "open": False})
+        self.assertEqual(ask(self.eng, "netrun-rotaaaa", dst=DST4).addr.version, 6)
 
     def test_no_destination_is_ipv6_and_counted(self):
         r = ask(self.eng, "netrun-rotaaaa", dst=None)

@@ -152,6 +152,15 @@ def http_connect(port, user, password, dst, dst_port=TARGET_PORT, timeout=10.0):
         s.close()
 
 
+def refusal(fn, *a, **kw):
+    """The proxy's refusal text (the HTTP status line / «socks reply N»), None if it worked."""
+    try:
+        fn(*a, **kw)
+        return None
+    except (ProxyError, OSError) as e:
+        return str(e)
+
+
 def fails(fn, *a, **kw):
     try:
         fn(*a, **kw)
@@ -442,7 +451,14 @@ def run_checks(env: Env):
 
     # ipv6_only
     env.facts(family="ipv6_only", egressIpv4=None)
-    check("ipv6_only: an IPv4 destination is rejected", fails(socks5, b, "netrun-e2erota", PW, t4))
+    # owner 2026-10-14, IPv6 only: an IPv4 destination fails as a GATEWAY error
+    # (502 / SOCKS «refused»), never as 407 (that reads as a wrong password)
+    r = refusal(http_connect, b, "netrun-e2erota", PW, t4)
+    check("ipv6_only: IPv4 over HTTP CONNECT -> 502, not 407", r is not None and " 502 " in r + " ", r)
+    r = refusal(socks5, b, "netrun-e2erota", PW, t4)
+    check("ipv6_only: IPv4 over SOCKS5 -> reply 5 (refused)", r == "socks reply 5", r)
+    r = refusal(http_connect, b, "netrun-e2epiec", PW, t4)
+    check("ipv6_only: a piece's IPv4 destination -> 502", r is not None and " 502 " in r + " ", r)
     check("ipv6_only: IPv6 still works", env.list_of(socks5(b, "netrun-e2erota", PW, t6)) == 101)
     env.facts()
 

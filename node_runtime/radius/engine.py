@@ -574,6 +574,7 @@ class Engine:
             "noSecret": 0,
             "badAuthenticator": 0,
             "noDst": 0,
+            "v4OnIpv6Only": 0,
             "probeAccepts": 0,
             "sendErrors": 0,
         }
@@ -781,11 +782,14 @@ class Engine:
             return self._reject("capacity", lst, now)
         v4s = None
         if fam == 4:
-            if f.family == "ipv6_only" or not f.egress_v4s:
+            if f.family == "ipv6_only":
+                fam = self._v4_on_ipv6_only()
+            elif not f.egress_v4s:
                 return self._reject("bad_params", lst, now)
-            v4s = self._open_v4s(f)
-            if not v4s:
-                return self._reject("capacity", lst, now)
+            else:
+                v4s = self._open_v4s(f)
+                if not v4s:
+                    return self._reject("capacity", lst, now)
         need = 2 * f.l_prime
         if near is not None and near - self.near_reserved.get(aid, 0) < need:
             return self._reject("quota", lst, now)
@@ -836,10 +840,12 @@ class Engine:
         if not a.is_piece_net(net):
             # its /64 was released (or never reserved): never serve it from a shared /64
             return self._reject("list_off", lst, now)
+        if fam == 4 and self.facts.family == "ipv6_only":
+            fam = self._v4_on_ipv6_only()
         if fam == 4:
             f = self.facts
             v4 = f.piece_v4
-            if f.family == "ipv6_only" or v4 is None:
+            if v4 is None:
                 return self._reject("bad_params", lst, now)
             if v4 in self.ipv4_closed or (not self.ipv4_open and v4 in f.egress_v4s):
                 return self._reject("capacity", lst, now)
@@ -871,6 +877,16 @@ class Engine:
         except AllocError as e:
             return self._reject(e.reason, None, now)
         return None, addr.to_bytes(16, "big"), None
+
+    def _v4_on_ipv6_only(self) -> int:
+        """An IPv4 destination on an ``ipv6_only`` node (owner 2026-10-14: IPv6 only,
+        no IPv4 egress at all). Not refused — 3proxy turns an Access-Reject into
+        HTTP 407 «Proxy Authentication Required», which reads as a wrong password —
+        but answered like an IPv6 one: 3proxy can't bind the IPv6 egress to the
+        IPv4 socket (doconnect -> 12), so the client gets HTTP 502 / SOCKS reply 5
+        and not a byte leaves over IPv4. Returns the family to go on with (6)."""
+        self.counters["v4OnIpv6Only"] += 1
+        return 6
 
     def _open_v4s(self, f: Facts) -> list:
         """The egress IPv4s the port guard leaves open (A7); empty when IPv4 is closed."""

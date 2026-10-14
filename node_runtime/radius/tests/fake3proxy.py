@@ -4,7 +4,9 @@ it writes the Framed address back as if the target had seen it.
 
 Like 3proxy 0.9.3: one Access-Request per connection from a fresh UDP socket,
 NAS-Port = the listen port, the destination in Login-IP(v6)-Host, a 3 s timeout
-(SINGLEBYTE_L), SOCKS reply 2 / HTTP 407 on refusal.
+(SINGLEBYTE_L), SOCKS reply 2 / HTTP 407 on refusal; an accepted egress of the
+other family than the destination can't be bound (doconnect -> 12): SOCKS reply 5
+/ HTTP 502.
 
     python3 -I fake3proxy.py --secret-file F --base 31000 --count 4 --socks-host 127.0.0.1 \
         --http-host 127.0.0.1 --http-offset 100 [--radius 127.0.0.1:1812]
@@ -59,6 +61,10 @@ def radius(args, secret, nas_port, user, password, dst, dst_port, service):
     return None
 
 
+def _family_mismatch(framed: str, dst: bytes) -> bool:
+    return ipaddress.ip_address(framed).version != (6 if len(dst) == 16 else 4)
+
+
 def recv_exact(c, n):
     b = b""
     while len(b) < n:
@@ -86,6 +92,9 @@ def socks_conn(args, secret, port, c):
         if framed is None:
             c.sendall(b"\x05\x02\x00\x01" + bytes(6))
             return
+        if _family_mismatch(framed, dst):
+            c.sendall(b"\x05\x05\x00\x01" + bytes(6))
+            return
         c.sendall(b"\x05\x00\x00\x01" + bytes(6))
         c.sendall((framed + "\n").encode())
     except OSError:
@@ -112,6 +121,9 @@ def http_conn(args, secret, port, c):
         framed = radius(args, secret, port, user.encode(), pw.encode(), dst, int(dport), b"PROXY")
         if framed is None:
             c.sendall(b"HTTP/1.0 407 Proxy Authentication Required\r\n\r\n")
+            return
+        if _family_mismatch(framed, dst):
+            c.sendall(b"HTTP/1.0 502 Bad Gateway\r\n\r\n")
             return
         c.sendall(b"HTTP/1.0 200 Connection established\r\n\r\n" + (framed + "\n").encode())
     except OSError:

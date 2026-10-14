@@ -157,8 +157,10 @@ class PieceAccess(PieceBase):
         r = ask(self.eng, "netrun-pieceaa", dst=DST4)
         self.assertEqual(str(r.addr), rtest.EGRESS4, "option A: egressIpv4 is the primary IPv4")
         self.call("facts", facts=rtest.facts(family="ipv6_only", primaryIpv4=PRIMARY4))
-        self.assertEqual(self.reason_of("netrun-pieceaa", dst=DST4), "bad_params")
-        self.assertIsNone(self.reason_of("netrun-pieceaa", dst=DST6))
+        # IPv6 only (owner 2026-10-14): the piece's own IPv6 address, never the
+        # primary IPv4 — 3proxy can't bind it to the IPv4 socket (HTTP 502)
+        v6 = ask(self.eng, "netrun-pieceaa", dst=DST6)
+        self.assertEqual(ask(self.eng, "netrun-pieceaa", dst=DST4).addr, v6.addr)
 
     def test_never_quota_blocked(self):
         r = self.call("local_block", accountId=100, blocked=True)

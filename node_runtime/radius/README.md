@@ -49,7 +49,9 @@ and 25k accounts (measured on an M-series Mac; RSS ~235 MiB, live ~160 MiB).
 `NAS-Port` in `[base, base+count)` → username (I1) → probe? → list exists,
 password (`sha256(salt‖password)`), list `active` → account `active`, not
 expired, not locally blocked → deadman → admission (hard / soft per account) →
-IPv4 family (`ipv6_only` rejects) and IPv4 admission → near-limit reservation
+IPv4 family (`ipv6_only`: answered with the IPv6 egress, so 3proxy can't
+bind it to the IPv4 socket → HTTP 502 / SOCKS reply 5, counter `v4OnIpv6Only`;
+an Access-Reject would read as a wrong password, HTTP 407) and IPv4 admission → near-limit reservation
 (`2·L'`, `L' = logdumpBytes + 64 KiB`) → mode and slot (I1) → address.
 
 A piece list (A13-I, below) leaves this path after the account checks: only
@@ -163,7 +165,7 @@ port of its own (the line is `host:port:login:pass` on any shared port).
   `piece:` ref (`list_off` — a released /64 is never served), then IPv6: the
   fixed address; IPv4: the node's PRIMARY IPv4 (facts `primaryIpv4`; without it
   `egressIpv4`, which is the primary in option A), refused (`capacity`) while the
-  guard closes that address; `ipv6_only` → `bad_params`. No near / deadman
+  guard closes that address; `ipv6_only` → the IPv6 address (502, as above). No near / deadman
   check, no quota: `local_block` on a piece account answers
   `{ok, ignored: "piece"}`. Traffic is logged under the login like any other
   (the agent reports it with `kind: "piece"`, never charged).
