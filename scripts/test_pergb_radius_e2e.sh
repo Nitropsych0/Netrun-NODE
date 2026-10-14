@@ -20,7 +20,9 @@
 # list (A13-I: its fixed address in its own /64, IPv4 from the primary IPv4, no
 # -session/-rotate), ipv6_only reject, the probe login, a hung RADIUS = SINGLEBYTE_L then reject, restarts
 # under load with no failed connection; SOCKS5 UDP for a piece (its fixed address,
-# bad datagrams dropped without ending the association) and not for per-GB; no
+# bad datagrams dropped without ending the association) and for per-GB (per_request:
+# a fresh address per association, timer / static: the line's TCP address; ss -K
+# on its socket ends it); no
 # 3proxy fingerprint (0xFF without user/pass, 0.0.0.0:0 in refusals, our own 407);
 # then real Access-Requests are captured
 # to $OUT/3proxy_captured.json (fixture for tests/test_proto.py).

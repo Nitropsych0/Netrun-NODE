@@ -37,7 +37,14 @@ function ssLine(s) {
   return `0      0      ${bracket(s.local)}:${s.lport}     ${bracket(s.peer)}:${s.pport}\n\t cubic wscale:7,7 rto:204 bytes_sent:${s.sent || 0} bytes_acked:${s.sent || 0} bytes_received:${s.received || 0} segs_out:3\n`;
 }
 
-// world: { sockets: [{ local, lport, peer, pport, sent, received, cgroup }], cgroupSupport }
+// a UDP socket as `ss -Huan` prints it (UNCONN without a peer)
+function ssLineUdp(s) {
+  const peer = s.peer ? `${bracket(s.peer)}:${s.pport}` : s.local.includes(":") ? "[::]:*" : "0.0.0.0:*";
+  return `${s.peer ? "ESTAB " : "UNCONN"} 0      0      ${bracket(s.local)}:${s.lport} ${peer}\n`;
+}
+
+// world: { sockets: [{ local, lport, peer, pport, sent, received, cgroup, proto? }], cgroupSupport }
+// (proto "udp": listed and killed only by the -Huan calls)
 function fakeRun(world, extra = {}) {
   const calls = [];
   const run = async (cmd, args) => {
@@ -51,8 +58,19 @@ function fakeRun(world, extra = {}) {
       const cgi = args.indexOf("cgroup");
       if (cgi >= 0 && world.cgroupSupport === false) return { code: 255, stdout: "", stderr: 'Error: an inet prefix is expected rather than "cgroup".' };
       const cg = cgi >= 0 ? args[cgi + 1] : null;
-      let pool = world.sockets.filter((s) => (cg === null || cg === "/" ? true : s.cgroup === cg));
+      const udp = args.includes("-Huan");
+      const line = udp ? ssLineUdp : ssLine;
+      let pool = world.sockets.filter((s) => (s.proto === "udp") === udp && (cg === null || cg === "/" ? true : s.cgroup === cg));
       if (cg === "/") pool = [];
+      if (kill && udp) {
+        // local addresses from "( src A:p or src B:q ... )"
+        const locals = [];
+        for (let i = 0; i < args.length; i += 1) if (args[i] === "src") locals.push(args[i + 1]);
+        const hit = pool.filter((s) => locals.includes(`${bracket(s.local)}:${s.lport}`));
+        world.sockets = world.sockets.filter((s) => !hit.includes(s));
+        world.killed = (world.killed || []).concat(hit);
+        return { code: 0, stdout: hit.map(line).join(""), stderr: "" };
+      }
       if (kill) {
         // exact tuples from "( src A:p and dst B:q ) or ..."
         const tuples = [];
@@ -66,9 +84,9 @@ function fakeRun(world, extra = {}) {
       }
       if (cgi < 0 && args.includes("src")) {
         // fallback listing: the pool prefix and the loopback listeners
-        pool = world.sockets.filter((s) => s.local.startsWith("2001:db8:aa:") || s.local === "127.0.0.3" || s.local === "127.0.0.4");
+        pool = pool.filter((s) => s.local.startsWith("2001:db8:aa:") || s.local === "127.0.0.3" || s.local === "127.0.0.4");
       }
-      return { code: 0, stdout: pool.map(ssLine).join(""), stderr: "" };
+      return { code: 0, stdout: pool.map(line).join(""), stderr: "" };
     }
     if (cmd === "systemctl" || cmd === "timedatectl") return { code: 0, stdout: cmd === "timedatectl" ? "yes\n" : "", stderr: "" };
     return { code: 0, stdout: "", stderr: "" };
@@ -233,6 +251,7 @@ module.exports = {
   tagger,
   untaggedAddress,
   ssLine,
+  ssLineUdp,
   fakeRun,
   fakeCtl,
   havePython,

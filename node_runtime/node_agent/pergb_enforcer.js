@@ -14,7 +14,8 @@
 //    account's rate over the last 15 s): unlogged = Σ over the account's live
 //    sockets of min(sent, L') + min(received, L') (L' = logdump + 64 KiB, the
 //    most a live connection can hold unlogged per direction; IPv6 sessions by
-//    the tag of the outbound socket, IPv4 sessions by the loopback tuple) plus
+//    the tag of the outbound socket, IPv4 sessions by the loopback tuple; a
+//    UDP association's socket, without counters, 2·L') plus
 //    2·L' × the IPv4 accepts RADIUS counted since near mode started that the
 //    meter has not seen a record of yet (near_stats). The heartbeat carries
 //    near[account] = limit − cum − unlogged; until the next one RADIUS
@@ -41,8 +42,10 @@ function lPrime(logdumpBytes) {
   return (Number(logdumpBytes) || 262144) + SPLICE_CHUNK;
 }
 
-// Upper bound of one socket's unlogged bytes.
+// Upper bound of one socket's unlogged bytes. A UDP association's socket has
+// no byte counters: L' per direction (3proxy logs it at the logdump marks).
 function socketBound(s, lp) {
+  if (s.proto === "udp") return 2 * lp;
   return Math.min(Number(s.sent) || 0, lp) + Math.min(Number(s.received) || 0, lp);
 }
 

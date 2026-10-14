@@ -522,6 +522,106 @@ class EgressIpv4s(unittest.TestCase):
         self.assertEqual(self.eng.facts.egress_v4s_str, (rtest.EGRESS4,))
 
 
+class UdpAssociate(unittest.TestCase):
+    """Owner 2026-10-14: SOCKS5 UDP on per-GB lists. An association takes its
+    egress like a TCP connection of the same line (3proxy asks with
+    Login-Service 1003 and a placeholder destination)."""
+
+    MAPPED0 = ipaddress.IPv6Address("::ffff:0.0.0.0").packed
+
+    def setUp(self):
+        self.clock = rtest.FakeClock()
+        self.eng = rtest.make_engine(self, clock=self.clock)
+        self.t0 = self.clock()
+        setup_state(
+            self.eng,
+            lists=[
+                plist(10, "perreqa", 1, mode="per_request"),
+                plist(11, "timerab", 1, mode="timer", ttlSec=300, timerAnchor=self.t0),
+                plist(12, "linkabc", 1, mode="link"),
+                plist(13, "statica", 1, mode="static"),
+                plist(14, "pausing", 1, mode="per_request", stickyPauseSec=5),
+                plist(15, "stickyy", 1, mode="sticky", ttlSec=1800),
+                plist(20, "otheraa", 2, mode="rotate"),
+            ],
+        )
+
+    def udp(self, user, port=BASE, dst=None):
+        return ask(self.eng, user, port=port, dst=dst, dst_port=0, op=rtest.OP_UDPASSOC)
+
+    def test_per_request_new_address_per_association(self):
+        nets = set()
+        for dst in (None, self.MAPPED0) * 10:
+            r = self.udp("netrun-perreqa", port=BASE + 1, dst=dst)
+            self.assertTrue(r.accepted)
+            self.assertEqual(r.addr.version, 6)
+            self.assertEqual(self.eng.alloc.tagger.list_of(int(r.addr) & ((1 << 64) - 1)), 10)  # the agent's attribution
+            nets.add(r.net)
+        self.assertEqual(len(nets), 20)
+        self.assertEqual(self.eng.dispatch({"op": "status"})["counters"]["udpAccepts"], 20)
+
+    def test_line_modes_give_the_tcp_address(self):
+        for user, port in (
+            ("netrun-timerab", BASE + 1),
+            ("netrun-linkabc", BASE + 2),
+            ("netrun-statica", BASE + 3),
+            ("netrun-stickyy", BASE + 4),
+            ("netrun-perreqa-session-job1-ttl-30m", BASE + 5),
+        ):
+            tcp = ask(self.eng, user, port=port)
+            self.assertTrue(tcp.accepted, user)
+            for dst in (None, self.MAPPED0):
+                self.assertEqual(self.udp(user, port=port, dst=dst).addr, tcp.addr, user)
+            self.clock.advance(10)
+            self.assertEqual(self.udp(user, port=port).addr, tcp.addr, user)
+            self.assertEqual(ask(self.eng, user, port=port).addr, tcp.addr, user)
+
+    def test_pause_keeps_the_address_for_udp_too(self):
+        tcp = ask(self.eng, "netrun-pausing", port=BASE + 7)
+        self.clock.advance(2)
+        self.assertEqual(self.udp("netrun-pausing", port=BASE + 7).addr, tcp.addr)
+
+    def test_quota_and_blocks_refuse_an_association(self):
+        self.eng.dispatch({"op": "heartbeat", "at": self.clock(), "near": {"1": 0}})
+        r = self.udp("netrun-perreqa")
+        self.assertFalse(r.accepted)
+        self.assertEqual(self.eng.reject_counts["quota"], 1)
+        self.assertTrue(self.udp("netrun-otheraa").accepted)  # another account is served
+        self.eng.dispatch({"op": "heartbeat", "at": self.clock(), "near": {}})
+        self.assertTrue(self.udp("netrun-perreqa").accepted)
+        self.eng.dispatch({"op": "local_block", "accountId": 1, "blocked": True})
+        self.assertFalse(self.udp("netrun-perreqa").accepted)
+        self.assertEqual(self.eng.reject_counts["quota"], 2)
+
+    def test_near_reserves_two_l_prime_per_association(self):
+        self.eng.dispatch({"op": "heartbeat", "at": self.clock(), "near": {"1": 2 * 2 * L_PRIME + 10}})
+        self.assertTrue(self.udp("netrun-perreqa").accepted)
+        self.assertTrue(self.udp("netrun-perreqa").accepted)
+        self.assertFalse(self.udp("netrun-perreqa").accepted)
+        ns = self.eng.dispatch({"op": "near_stats"})["accounts"]
+        self.assertEqual(ns["1"]["reserved"], 2 * 2 * L_PRIME)
+
+    def test_a_client_ipv4_hint_still_leaves_over_ipv6(self):
+        # RFC 1928: the client may name its own address in the ASSOCIATE
+        for user, port in (("netrun-perreqa", BASE), ("netrun-statica", BASE + 3)):
+            r = self.udp(user, port=port, dst=DST4)
+            self.assertTrue(r.accepted, user)
+            self.assertEqual(r.addr.version, 6, user)
+        self.assertEqual(self.udp("netrun-statica", port=BASE + 3, dst=DST6).addr, ask(self.eng, "netrun-statica", port=BASE + 3).addr)
+        st = self.eng.dispatch({"op": "status"})
+        self.assertEqual(st["counters"]["v4OnIpv6Only"], 0)
+
+    def test_an_association_names_no_site(self):
+        def no_site(_req):
+            raise AssertionError("smart rotation must not key an association by its placeholder")
+
+        self.eng._site = no_site
+        self.eng.alloc.avoid = {"v4:0.0.0.0/24": {0: self.clock() + 60}}  # makes a.avoid truthy
+        for dst in (None, self.MAPPED0):
+            self.assertTrue(self.udp("netrun-perreqa", dst=dst).accepted)
+            self.assertTrue(self.udp("netrun-pausing", port=BASE + 9, dst=dst).accepted)
+
+
 class SmartRotation(unittest.TestCase):
     """A12: ctl avoid and the re-draw on per_request picks."""
 

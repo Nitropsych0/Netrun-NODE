@@ -749,16 +749,22 @@ class Engine:
             login = uname.parse(req.username, f.geo)
         except uname.LoginError as e:
             return self._reject(e.reason, self.by_login.get(e.base) if e.base else None, now)
-        # SOCKS5 UDP ASSOCIATE (owner 2026-10-14): per-piece proxies only for
-        # now — a per-GB association would outlive a quota kill (the node agent
-        # kills TCP sockets). BIND (an inbound listener) never.
+        # SOCKS5 UDP ASSOCIATE (owner 2026-10-14: every proxy, per-piece and
+        # per-GB). An association takes its egress like a TCP connection of the
+        # line: the line's address in static / sticky / timer / link, a fresh one
+        # per association in per_request (3proxy binds it once, so one
+        # association = one address). The node agent kills its UDP socket on a
+        # quota / block like a TCP one. BIND (an inbound listener) never.
         udp = req.login_service == proto.LOGIN_SERVICE_UDPASSOC
         if req.login_service == proto.LOGIN_SERVICE_BIND:
             return self._reject("bad_params", None, now)
         fam = req.dst_family
-        if fam == 0:
-            if not udp:  # an ASSOCIATE names no destination by design
-                self.counters["noDst"] += 1
+        if udp:
+            # an ASSOCIATE's address is a placeholder or the client's own hint
+            # (RFC 1928), never a destination: an association leaves over IPv6
+            fam = 6
+        elif fam == 0:
+            self.counters["noDst"] += 1
             fam = 6
         if login.probe:
             if udp:
@@ -785,9 +791,6 @@ class Engine:
             if udp and out[0] is None:
                 self.counters["udpAccepts"] += 1
             return out
-        if udp:
-            self.counters["udpRefused"] += 1
-            return self._reject("udp_off", lst, now)
         if acct.local_blocked:
             return self._reject("quota", lst, now)
         aid = acct.id
@@ -819,7 +822,8 @@ class Engine:
                 if fam == 4:
                     v4 = v4s[self.rng.randrange(len(v4s))]
                 else:
-                    v6 = a.rotate_addr(lst.id, now, self._site(req) if a.avoid else None).to_bytes(16, "big")
+                    # an association names no site (A12 avoids are per site)
+                    v6 = a.rotate_addr(lst.id, now, self._site(req) if (a.avoid and not udp) else None).to_bytes(16, "big")
             else:
                 if mode == uname.STATIC:
                     ln = a.static_line(lst.id, slot, aid, now)
@@ -830,7 +834,7 @@ class Engine:
                 elif mode == uname.LINK:
                     ln = a.link_line(lst.id, slot, aid, lst.epochs(slot), now)
                 else:  # per_request with the A11 pause
-                    site = self._site(req) if (a.avoid and fam != 4) else None
+                    site = self._site(req) if (a.avoid and fam != 4 and not udp) else None
                     ln = a.pause_line(lst.id, slot, aid, lst.pause, now, site)
                 if fam == 4:
                     v4 = self._line_v4(f, v4s, ln.v4)
@@ -843,6 +847,8 @@ class Engine:
             self.near_reserved[aid] = self.near_reserved.get(aid, 0) + need
             if fam == 4:
                 self.near_ipv4[aid] = self.near_ipv4.get(aid, 0) + 1
+        if udp:
+            self.counters["udpAccepts"] += 1
         return None, v6, v4
 
     def _authorize_piece(self, req, login, lst, acct, fam, now):

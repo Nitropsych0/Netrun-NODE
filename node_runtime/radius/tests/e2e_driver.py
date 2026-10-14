@@ -21,6 +21,7 @@ import os
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -169,13 +170,10 @@ class SocksRefused(ProxyError):
         self.code, self.bnd = code, bnd
 
 
-def socks5_udp(port, user, password, dst, dst_port=TARGET_PORT, junk=(), timeout=5.0):
-    """SOCKS5 UDP ASSOCIATE through 127.0.0.4:port (placeholder 0.0.0.0:0); the
-    `junk` datagrams (atype + address + port headers) go first and must be dropped
-    without ending the association; then one to dst. Returns (the source the
-    target saw, the relay address)."""
+def _associate(port, user, password, timeout):
+    """SOCKS5 UDP ASSOCIATE through 127.0.0.4:port (placeholder 0.0.0.0:0) ->
+    (control socket, relay address, relay port); SocksRefused on a refusal."""
     s = socket.create_connection((SOCKS_HOST, port), timeout=timeout)
-    u = None
     try:
         s.sendall(b"\x05\x01\x02")
         if _recv_exact(s, 2) != b"\x05\x02":
@@ -190,22 +188,64 @@ def socks5_udp(port, user, password, dst, dst_port=TARGET_PORT, junk=(), timeout
         relay = ipaddress.ip_address(addr)
         if head[1] != 0:
             raise SocksRefused(head[1], (relay, bport))
+        return s, relay, bport
+    except BaseException:
+        s.close()
+        raise
+
+
+def _udp_ask(u, relay, bport, dst, dst_port=TARGET_PORT):
+    """One datagram to dst through the relay; the source address the target saw."""
+    ip = ipaddress.ip_address(dst)
+    # RSV RSV FRAG(0) ATYP — a non-zero FRAG is dropped (RFC 1928)
+    u.sendto(b"\x00\x00\x00\x04" + ip.packed + struct.pack("!H", dst_port) + b"ping", (str(relay), bport))
+    data, _ = u.recvfrom(2048)
+    off = 4 + (16 if data[3] == 4 else 4) + 2
+    return ipaddress.ip_address(data[off:].decode().strip())
+
+
+def socks5_udp(port, user, password, dst, dst_port=TARGET_PORT, junk=(), timeout=5.0):
+    """SOCKS5 UDP ASSOCIATE through 127.0.0.4:port (placeholder 0.0.0.0:0); the
+    `junk` datagrams (atype + address + port headers) go first and must be dropped
+    without ending the association; then one to dst. Returns (the source the
+    target saw, the relay address)."""
+    s, relay, bport = _associate(port, user, password, timeout)
+    u = None
+    try:
         u = socket.socket(socket.AF_INET6 if relay.version == 6 else socket.AF_INET, socket.SOCK_DGRAM)
         u.settimeout(timeout)
         for hdr in junk:
             # a junk entry starting with RSV RSV is sent as it is (a FRAG test)
             raw = hdr if hdr[:2] == b"\x00\x00" else b"\x00\x00\x00" + hdr + b"junk"
             u.sendto(raw, (str(relay), bport))
-        ip = ipaddress.ip_address(dst)
-        # RSV RSV FRAG(0) ATYP — a non-zero FRAG ends the association (3proxy)
-        u.sendto(b"\x00\x00\x00\x04" + ip.packed + struct.pack("!H", dst_port) + b"ping", (str(relay), bport))
-        data, _ = u.recvfrom(2048)
-        off = 4 + (16 if data[3] == 4 else 4) + 2
-        return ipaddress.ip_address(data[off:].decode().strip()), relay
+        return _udp_ask(u, relay, bport, dst, dst_port), relay
     finally:
         s.close()
         if u is not None:
             u.close()
+
+
+def udp_kill(port, user, password, dst, timeout=5.0):
+    """The node agent's quota / block kill of an association: `ss -K` on its
+    egress UDP socket (unconnected, bound to the address RADIUS handed out). Its
+    relay must end and its TCP control close. -> (ok, detail)"""
+    s, relay, bport = _associate(port, user, password, timeout)
+    u = socket.socket(socket.AF_INET6 if relay.version == 6 else socket.AF_INET, socket.SOCK_DGRAM)
+    u.settimeout(timeout)
+    try:
+        src = _udp_ask(u, relay, bport, dst)
+        r = subprocess.run(["ss", "-K", "-Huan", "src", "[%s]" % src], capture_output=True, text=True, timeout=10)
+        killed = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        try:
+            closed = s.recv(1) == b""
+        except ConnectionResetError:
+            closed = True
+        except socket.timeout:
+            closed = False
+        return closed and len(killed) == 1, {"src": str(src), "killed": killed, "controlClosed": closed, "stderr": r.stderr.strip()}
+    finally:
+        s.close()
+        u.close()
 
 
 def udp_hdr(dst, port):
@@ -593,9 +633,11 @@ def run_checks(env: Env):
 
 
 def udp_checks(env: Env, want):
-    """Owner 2026-10-14: SOCKS5 UDP on the same ports for per-piece proxies
-    (3proxy-pergb change 7, netrun-radius: per-piece only); no 3proxy fingerprint
-    for whoever connects (change 8, socks -u2)."""
+    """Owner 2026-10-14: SOCKS5 UDP on the same ports for every proxy (3proxy-pergb
+    change 7, netrun-radius): a piece from its fixed address, a per-GB line like
+    its TCP connections (per_request: a fresh address per association); the node
+    agent's kill (ss -K on the association's UDP socket) ends it; no 3proxy
+    fingerprint for whoever connects (change 8, socks -u2)."""
     a = env.a
     b, t6 = a.base, a.target6
     try:
@@ -616,16 +658,36 @@ def udp_checks(env: Env, want):
         check("udp: NXDOMAIN / loopback / denied-port / short / fragmented datagrams are dropped, not fatal", src == want, src)
     except (ProxyError, OSError) as e:
         check("udp: NXDOMAIN / loopback / denied-port / short / fragmented datagrams are dropped, not fatal", False, e)
+    # per-GB lines
     try:
-        socks5_udp(b, "netrun-e2erota", PW, t6)
-        check("udp: per-GB logins get no association", False, "accepted")
+        r1, _ = socks5_udp(b, "netrun-e2erota", PW, t6)
+        r2, _ = socks5_udp(b, "netrun-e2erota", PW, t6)
+        check("udp: a per-GB association leaves from a pool address of its list", env.list_of(r1) == 101 and env.list_of(r2) == 101, (r1, r2))
+        check("udp: per_request — a fresh address per association", r1 != r2, (r1, r2))
+    except (ProxyError, OSError) as e:
+        check("udp: a per-GB association leaves from a pool address of its list", False, e)
+    for user, port in (("netrun-e2estik", b + 1), ("netrun-e2estat", b + 2)):
+        try:
+            tcp = socks5(port, user, PW, t6)
+            udp, _ = socks5_udp(port, user, PW, t6)
+            check("udp: %s — the association leaves from the line's TCP address" % user, udp == tcp, (udp, tcp))
+        except (ProxyError, OSError) as e:
+            check("udp: %s — the association leaves from the line's TCP address" % user, False, e)
+    try:
+        ok, detail = udp_kill(b + 3, "netrun-e2erota", PW, t6)
+        check("udp: ss -K on the association's socket ends it (the agent's quota / block kill)", ok, detail)
+    except (ProxyError, OSError, subprocess.SubprocessError) as e:
+        check("udp: ss -K on the association's socket ends it (the agent's quota / block kill)", False, e)
+    try:
+        socks5_udp(b, "netrun-e2eblok", PW, t6)
+        check("udp: a blocked list gets no association", False, "accepted")
     except SocksRefused as e:
-        check("udp: per-GB logins get no association", True)
+        check("udp: a blocked list gets no association", True)
         check("no fingerprint: a refused SOCKS request carries 0.0.0.0:0", str(e.bnd[0]) == "0.0.0.0" and e.bnd[1] == 0, e.bnd)
     except (ProxyError, OSError) as e:
-        check("udp: per-GB logins get no association", False, e)
+        check("udp: a blocked list gets no association", False, e)
     rej = env.call({"op": "status"})["counters"]
-    check("udp: RADIUS counts the piece accepts and the per-GB refusal", rej.get("udpAccepts", 0) >= 2 and rej.get("udpRefused", 0) >= 1, rej)
+    check("udp: RADIUS counts the accepts, refuses none for UDP itself", rej.get("udpAccepts", 0) >= 7 and rej.get("udpRefused", 0) == 0, rej)
     greet = raw_exchange(SOCKS_HOST, b, b"\x05\x01\x00", size=2)
     check("no fingerprint: a greeting without user/pass gets 0xFF (RFC 1928)", greet == b"\x05\xff", greet)
     # an address, not a name: the namespace has no DNS and 3proxy resolves first

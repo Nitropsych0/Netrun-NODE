@@ -227,6 +227,28 @@ test("near-limit: the per-socket bound is never below the true unlogged bytes (s
   }
 });
 
+test("near-limit: a UDP association (no byte counters) is bounded at 2·L'", async () => {
+  assert.strictEqual(enforcerLib.socketBound({ proto: "udp", sent: null, received: null }, LP), 2 * LP);
+  assert.strictEqual(enforcerLib.socketBound({ sent: 10, received: 20 }, LP), 30);
+  const meter = fakeMeter();
+  const killer = fakeKiller({
+    v6: [
+      { accountId: 10, proto: "udp" },
+      { accountId: 10, sent: 100, received: 50 },
+    ],
+    v4: [],
+    loopUnknown: 0,
+  });
+  const { e, ctl } = setup({ meter, killer, accounts: [{ id: 10, state: "active", limit: { epoch: meter.epoch, bytes: 1000 * MiB, allowance: 0, full: true } }] });
+  meter.add("netrun-aaaa1", 900 * MiB, 0);
+  const r = await e.tick();
+  assert.deepStrictEqual(r.near, [10]);
+  const v = e.accountView(10);
+  assert.strictEqual(v.unlogged, 2 * LP + 150);
+  const hb = ctl.calls.filter((c) => c.op === "heartbeat").pop();
+  assert.strictEqual(hb.body.near["10"], 1000 * MiB - 900 * MiB - (2 * LP + 150));
+});
+
 test("near-limit reservations: IPv4 accepts RADIUS counted without a record yet add 2·L' each", async () => {
   const meter = fakeMeter();
   const now = clock();

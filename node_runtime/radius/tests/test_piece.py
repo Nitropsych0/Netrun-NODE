@@ -137,15 +137,21 @@ class PieceAccess(PieceBase):
         self.eng.dispatch({"op": "facts", "facts": rtest.facts(family="ipv6_only", egressIpv4=None)})
         r = ask(self.eng, "netrun-pieceaa", dst=None, dst_port=0, op=rtest.OP_UDPASSOC)
         self.assertEqual(r.addr, want)
+        # a client's own IPv4 hint in the ASSOCIATE is no IPv4 destination
+        self.eng.dispatch({"op": "facts", "facts": rtest.facts()})
+        r = ask(self.eng, "netrun-pieceaa", dst=DST4, dst_port=40000, op=rtest.OP_UDPASSOC)
+        self.assertEqual(r.addr, want)
         status = self.eng.dispatch({"op": "status"})
-        self.assertEqual(status["counters"]["udpAccepts"], 3)
+        self.assertEqual(status["counters"]["udpAccepts"], 4)
         self.assertEqual(status["noDst"], 0, "an ASSOCIATE names no destination by design")
 
-    def test_udp_is_per_piece_only_and_bind_never(self):
+    def test_udp_for_every_login_and_bind_never(self):
+        """Owner 2026-10-14: UDP on per-GB lists too (test_engine.UdpAssociate)."""
         r = ask(self.eng, "netrun-rotaaaa", dst=None, dst_port=0, op=rtest.OP_UDPASSOC)
-        self.assertFalse(r.accepted)
-        self.assertEqual(self.eng.reject_counts.get("udp_off"), 1)
-        self.assertEqual(self.eng.dispatch({"op": "status"})["counters"]["udpRefused"], 1)
+        self.assertTrue(r.accepted)
+        self.assertNotEqual(r.net, self.net, "a per-GB association never draws a piece's /64")
+        self.assertIsNone(self.eng.reject_counts.get("udp_off"))
+        self.assertEqual(self.eng.dispatch({"op": "status"})["counters"]["udpRefused"], 0)
         for user in ("netrun-pieceaa", "netrun-rotaaaa"):
             self.assertFalse(ask(self.eng, user, dst=None, dst_port=0, op=rtest.OP_BIND).accepted, user)
         # CONNECT and HTTP CONNECT are untouched

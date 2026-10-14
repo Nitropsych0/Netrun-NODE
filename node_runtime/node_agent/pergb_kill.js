@@ -21,8 +21,14 @@
 //     A session without any record yet holds < 2·L' and is killed on the
 //     tick its first record appears (the enforcer repeats kills every tick
 //     while an account is blocked).
-// Kills: `ss -K` with the exact 4-tuples, 256 per call, inside the unit's
-// cgroup. 3proxy then tears down the other side. A node whose ss has no
+// SOCKS5 UDP (owner 2026-10-14, per-GB too): an association's egress is a UDP
+// socket bound to the address RADIUS handed out (tagged IPv6, attributed like
+// a TCP one), unconnected — `ss -Hua` lists it as UNCONN with no peer. It is
+// killed by its local address and port (`ss -K` aborts it: 3proxy's relay
+// read fails, the association ends and its TCP control closes). UDP sockets
+// carry no byte counters: the enforcer bounds one at 2·L'.
+// Kills: `ss -K` with the exact 4-tuples (UDP: local address + port), 256 per
+// call, inside the unit's cgroup. 3proxy then tears down the other side. A node whose ss has no
 // `cgroup` filter (iproute2 < 5.9) falls back to the address filters only,
 // which is still exact: no per-piece socket uses a pool address outside
 // `excluded` with a valid tag, nor 127.0.0.3/4.
@@ -83,6 +89,28 @@ function parseSs(text) {
   return out;
 }
 
+// `ss -Huan ...` text -> [{ local, lport, peer, pport, proto: "udp" }]. The
+// state column is present (UNCONN / ESTAB); an unconnected socket's peer is
+// `*:*` / `[::]:*` (peer null). A wildcard-bound socket (`*:5353`) is skipped.
+function parseSsUdp(text) {
+  const out = [];
+  for (const raw of String(text || "").split("\n")) {
+    if (!raw.trim() || /^\s/.test(raw)) continue;
+    const toks = raw.trim().split(/\s+/);
+    let local = null;
+    let peer = null;
+    let i = 0;
+    for (; i < toks.length; i++) {
+      local = parseEndpoint(toks[i]);
+      if (local) break;
+    }
+    if (!local) continue;
+    if (i + 1 < toks.length) peer = parseEndpoint(toks[i + 1]);
+    out.push({ local: local.ip, lport: local.port, peer: peer ? peer.ip : null, pport: peer ? peer.port : null, proto: "udp", sent: null, received: null });
+  }
+  return out;
+}
+
 function tupleKey(localIp, port, clientIp, clientPort) {
   return `${localIp}:${port}<${clientIp}:${clientPort}`;
 }
@@ -102,6 +130,17 @@ function tupleFilter(socks) {
   return toks;
 }
 
+// ss filter tokens for UDP sockets by their local address: ( src L or ... )
+function udpFilter(socks) {
+  const toks = ["("];
+  socks.forEach((s, i) => {
+    if (i > 0) toks.push("or");
+    toks.push("src", `${bracket(s.local)}:${s.lport}`);
+  });
+  toks.push(")");
+  return toks;
+}
+
 // Classify sockets (one unit's or the fallback listing).
 //   ctx: { tagger (pergb_tag createTagger | null), excluded (Set of subnet
 //   ids), pieceOf(subnetId) -> { listId, accountId } | null (A13-I: the /64s
@@ -114,6 +153,12 @@ function classify(socks, ctx) {
   let loopUnknown = 0;
   let other = 0;
   for (const s of socks) {
+    if (s.proto === "udp" && !s.local.includes(":")) {
+      // IPv4 UDP: the relay's client side (the public address), RADIUS, DNS —
+      // an association's egress is always the IPv6 (netrun-radius)
+      other += 1;
+      continue;
+    }
     if (LOOPBACK_LISTEN.has(s.local)) {
       const key = tupleKey(s.local, s.lport, s.peer, s.pport);
       const login = ctx.tupleLogin ? ctx.tupleLogin(key) : null;
@@ -202,6 +247,13 @@ function createKiller(deps) {
           continue;
         }
         for (const s of parseSs(r.stdout)) out.push({ ...s, unit: u.unit, cgroup: u.cgroup });
+        const ru = await run("ss", ["-Huan", "cgroup", u.cgroup], { timeoutMs: 20000 });
+        if (ru.code !== 0) {
+          stats.errors += 1;
+          stats.lastError = `ss -u cgroup ${u.cgroup}: ${String(ru.stderr || "").trim().slice(0, 200)}`;
+          continue;
+        }
+        for (const s of parseSsUdp(ru.stdout)) out.push({ ...s, unit: u.unit, cgroup: u.cgroup });
       }
     } else {
       const filter = deps.fallbackFilter ? deps.fallbackFilter() : null;
@@ -211,6 +263,12 @@ function createKiller(deps) {
         else {
           stats.errors += 1;
           stats.lastError = `ss: ${String(r.stderr || "").trim().slice(0, 200)}`;
+        }
+        const ru = await run("ss", ["-Huan", ...filter], { timeoutMs: 20000 });
+        if (ru.code === 0) for (const s of parseSsUdp(ru.stdout)) out.push({ ...s, unit: null, cgroup: null });
+        else {
+          stats.errors += 1;
+          stats.lastError = `ss -u: ${String(ru.stderr || "").trim().slice(0, 200)}`;
         }
       }
     }
@@ -227,19 +285,20 @@ function createKiller(deps) {
 
   async function killSockets(list) {
     let killed = 0;
-    // group by cgroup (null in fallback mode)
+    // group by cgroup (null in fallback mode) and protocol
     const groups = new Map();
     for (const s of list) {
-      const k = s.cgroup || "";
-      if (!groups.has(k)) groups.set(k, []);
-      groups.get(k).push(s);
+      const udp = s.proto === "udp";
+      const k = `${udp ? "u" : "t"}|${s.cgroup || ""}`;
+      if (!groups.has(k)) groups.set(k, { udp, cg: s.cgroup || "", socks: [] });
+      groups.get(k).socks.push(s);
     }
-    for (const [cg, socks] of groups) {
+    for (const { udp, cg, socks } of groups.values()) {
       for (let i = 0; i < socks.length; i += KILL_CHUNK) {
         const chunk = socks.slice(i, i + KILL_CHUNK);
-        const args = ["-K", "-Htn", "state", "established"];
+        const args = udp ? ["-K", "-Huan"] : ["-K", "-Htn", "state", "established"];
         if (cg) args.push("cgroup", cg, "and");
-        args.push(...tupleFilter(chunk));
+        args.push(...(udp ? udpFilter(chunk) : tupleFilter(chunk)));
         stats.calls += 1;
         const r = await run("ss", args, { timeoutMs: 20000 });
         if (r.code !== 0) {
@@ -249,7 +308,7 @@ function createKiller(deps) {
           continue;
         }
         // ss -K prints the sockets it closed
-        const closed = parseSs(r.stdout).length;
+        const closed = (udp ? parseSsUdp(r.stdout) : parseSs(r.stdout)).length;
         killed += closed || 0;
       }
     }
@@ -287,8 +346,10 @@ module.exports = {
   KILL_CHUNK,
   parseEndpoint,
   parseSs,
+  parseSsUdp,
   tupleKey,
   tupleFilter,
+  udpFilter,
   classify,
   selectTargets,
   createKiller,

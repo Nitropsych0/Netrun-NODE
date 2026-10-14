@@ -155,6 +155,80 @@ test("classify: the sockets view the enforcer and guards share", () => {
   assert.strictEqual(v.loopUnknown, 1);
 });
 
+test("parseSsUdp: UNCONN / ESTAB lines, no peer for an unconnected socket, wildcard-bound skipped", () => {
+  const text = [
+    "UNCONN 0      0      [2001:db8:aa:12:4301:2de4:e935:4ca7]:41000 [::]:*",
+    "ESTAB  0      0      [2001:db8:aa:13::5]:41001 [2001:4860:4860::8888]:53",
+    "UNCONN 0      0      64.177.12.242:51000 0.0.0.0:*",
+    "UNCONN 0      0      *:5353 *:*",
+    "",
+  ].join("\n");
+  const s = killLib.parseSsUdp(text);
+  assert.strictEqual(s.length, 3);
+  assert.deepStrictEqual(s[0], { local: "2001:db8:aa:12:4301:2de4:e935:4ca7", lport: 41000, peer: null, pport: null, proto: "udp", sent: null, received: null });
+  assert.deepStrictEqual([s[1].peer, s[1].pport], ["2001:4860:4860::8888", 53]);
+  assert.strictEqual(s[2].local, "64.177.12.242");
+  assert.deepStrictEqual(killLib.udpFilter(s.slice(0, 2)), ["(", "src", "[2001:db8:aa:12:4301:2de4:e935:4ca7]:41000", "or", "src", "[2001:db8:aa:13::5]:41001", ")"]);
+});
+
+// SOCKS5 UDP on per-GB (owner 2026-10-14): an association's egress socket is
+// UDP, unconnected, bound to the tagged address RADIUS handed out.
+function udpWorld() {
+  const w = world();
+  w.sockets.push(
+    { proto: "udp", local: w.addrs.A1, lport: 45001, peer: null, pport: null, cgroup: T.CG(T.UNIT_A) }, // account 10
+    { proto: "udp", local: w.addrs.B3, lport: 45003, peer: null, pport: null, cgroup: T.CG(T.UNIT_B) }, // account 20
+    { proto: "udp", local: w.addrs.EXCL, lport: 45004, peer: null, pport: null, cgroup: T.CG(T.UNIT_A) }, // excluded /64
+    { proto: "udp", local: "64.177.12.242", lport: 45005, peer: null, pport: null, cgroup: T.CG(T.UNIT_A) }, // the relay's client side
+    { proto: "udp", local: "127.0.0.1", lport: 45006, peer: "127.0.0.1", pport: 1812, cgroup: T.CG(T.UNIT_A) } // RADIUS
+  );
+  return w;
+}
+
+test("classify: a per-GB association's UDP socket is attributed by its tag; IPv4 UDP is never a session", () => {
+  const w = udpWorld();
+  const ctx = {
+    tagger: T.tagger(),
+    excluded: new Set([0x99]),
+    tupleLogin: (key) => TUPLES.get(key) || null,
+    listAccount: (id) => (LISTS.get(id) || {}).accountId ?? null,
+    loginAccount: (login) => (login === "netrun-aaaa1" ? 10 : login === "netrun-bbbb3" ? 20 : null),
+  };
+  const v = killLib.classify(w.sockets, ctx);
+  const udp = v.v6.filter((s) => s.proto === "udp");
+  assert.deepStrictEqual(udp.map((s) => [s.listId, s.accountId]).sort(), [[1, 10], [3, 20]]);
+  assert.strictEqual(v.loopUnknown, 1, "UDP sockets never count as unknown loopback sessions");
+  assert.strictEqual(v.v4.length, 2);
+});
+
+for (const mode of ["cgroup", "fallback"]) {
+  test(`kill(account) [${mode}]: the account's UDP associations die with its TCP sessions`, async () => {
+    const w = udpWorld();
+    w.cgroupSupport = mode === "cgroup";
+    const { k, run } = killer(w);
+    const r = await k.kill({ accountId: 10 });
+    const killed = w.killed.map((s) => `${s.proto || "tcp"} ${s.local}:${s.lport}`).sort();
+    assert.deepStrictEqual(killed, [`tcp ${w.addrs.A1}:40001`, `tcp ${w.addrs.A2}:40002`, "tcp 127.0.0.4:31000", `udp ${w.addrs.A1}:45001`].sort());
+    assert.strictEqual(r.killed6, 3);
+    const udpKills = run.calls.filter((c) => c.includes("-K") && c.includes("-Huan"));
+    assert.strictEqual(udpKills.length, 1);
+    assert.ok(!udpKills[0].includes("dst"), "an unconnected socket is killed by its local address");
+    assert.strictEqual(udpKills[0].includes("cgroup"), mode === "cgroup");
+    assert.ok(w.sockets.some((s) => s.proto === "udp" && s.local === w.addrs.B3), "another account's association lives");
+    assert.ok(w.sockets.some((s) => s.proto === "udp" && s.local === "64.177.12.242"));
+    // listing: TCP and UDP per unit (cgroup) or one each (fallback)
+    const lists = run.calls.filter((c) => c[0] === "ss" && !c.includes("-K") && !c.includes("/"));
+    assert.strictEqual(lists.filter((c) => c.includes("-Huan")).length, mode === "cgroup" ? 2 : 1);
+  });
+}
+
+test("kill(list): only the list's associations", async () => {
+  const w = udpWorld();
+  const { k } = killer(w);
+  await k.kill({ listId: 3, logins: new Set(["netrun-bbbb3"]) });
+  assert.deepStrictEqual(w.killed.filter((s) => s.proto === "udp").map((s) => s.local), [w.addrs.B3]);
+});
+
 // A13-I: per-piece proxies on RADIUS — list 7 (account 70) owns /64 0x77.
 function pieceWorld() {
   const t = T.tagger();
