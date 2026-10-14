@@ -122,7 +122,9 @@ function validateEnable(body) {
   for (const n of serverNames) if (!HOST_RE.test(n)) return bad(`serverNames: not a hostname: ${n}`);
   const flow = b.flow === undefined || b.flow === null ? DEFAULT_FLOW : String(b.flow);
   if (!FLOWS.has(flow)) return bad(`flow: one of ${[...FLOWS].map((f) => JSON.stringify(f)).join(", ")}`);
-  return { ok: true, params: { entries, port, dest: `${dest.host}:${dest.port}`, serverNames, flow } };
+  // the node's primary IPv4 serves the proxies: an entry only when asked for
+  const allowPrimary = b.allowPrimary === true;
+  return { ok: true, params: { entries, port, dest: `${dest.host}:${dest.port}`, serverNames, flow, allowPrimary } };
 }
 
 // The users body -> { ok, users } | { ok: false, error, detail }; one email per user
@@ -487,6 +489,12 @@ function createVpn(deps = {}) {
     return keys;
   }
 
+  async function primaryIpv4() {
+    const r = await run("ip", ["-4", "route", "get", "1.1.1.1"], { timeoutMs: 10000 });
+    const m = /\bsrc (\d+\.\d+\.\d+\.\d+)/.exec(String((r && r.stdout) || ""));
+    return r && r.code === 0 && m ? m[1] : null;
+  }
+
   async function ownAddresses() {
     const a = await run("ip", ["-o", "addr", "show"], { timeoutMs: 10000 });
     const r = await run("ip", ["-6", "route", "show", "type", "blackhole"], { timeoutMs: 10000 });
@@ -555,7 +563,11 @@ function createVpn(deps = {}) {
     const bin = binaryCheck();
     if (bin) return { status: 409, body: { success: false, error: bin } };
     const params = v.params;
-    const ip = await ipv4Lib.ensureAddresses(params.entries, {
+    const primary = await primaryIpv4();
+    if (primary && params.entries.includes(primary) && !params.allowPrimary) {
+      return { status: 409, body: { success: false, error: "primary_ipv4", detail: `${primary} is the node's primary IPv4 (the proxies'); pass allowPrimary to use it` } };
+    }
+    const ip = await ipv4Lib.ensureAddresses(params.entries.filter((a) => a !== primary), {
       run,
       log,
       settings: { netplanDir: settings.netplanDir, statePath: P.ipv4s, dropinName: "61-netrun-vpn.yaml", dropinTitle: "VPN entry IPv4s (node_agent/vpn_runtime.js, POST /vpn/enable)" },
@@ -785,11 +797,16 @@ function createVpn(deps = {}) {
     const st = enableState();
     if (!st.enabled || !installed()) return { enabled: false };
     try {
-      await ipv4Lib.ensureAddresses(st.params.entries, { run, log, settings: { netplanDir: settings.netplanDir, statePath: P.ipv4s, dropinName: "61-netrun-vpn.yaml" } });
+      const primary = await primaryIpv4();
+      await ipv4Lib.ensureAddresses(
+        st.params.entries.filter((a) => a !== primary),
+        { run, log, settings: { netplanDir: settings.netplanDir, statePath: P.ipv4s, dropinName: "61-netrun-vpn.yaml" } }
+      );
       const own = await applyNft(st.params.entries);
       const keys = await ensureKeys();
-      writeConfig(st.params, keys, usersFile(), own);
-      if (!(await active())) await restart();
+      // a new agent may render another config (a deploy): Xray must run it
+      const changed = writeConfig(st.params, keys, usersFile(), own);
+      if (changed || !(await active())) await restart();
       else applied = usersFile();
     } catch (e) {
       log.error(`[vpn] start: ${(e && e.message) || e}`);

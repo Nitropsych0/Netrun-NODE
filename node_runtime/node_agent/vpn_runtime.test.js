@@ -20,7 +20,7 @@ const U2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 test("validateEnable: entries, port, dest, serverNames, flow", () => {
   const ok = vpn.validateEnable({ entries: ["104.207.139.14", "64.177.112.56", "104.207.139.14"], dest: "dl.google.com" });
   assert.ok(ok.ok);
-  assert.deepStrictEqual(ok.params, { entries: ["104.207.139.14", "64.177.112.56"], port: 443, dest: "dl.google.com:443", serverNames: ["dl.google.com"], flow: "xtls-rprx-vision" });
+  assert.deepStrictEqual(ok.params, { entries: ["104.207.139.14", "64.177.112.56"], port: 443, dest: "dl.google.com:443", serverNames: ["dl.google.com"], flow: "xtls-rprx-vision", allowPrimary: false });
   assert.strictEqual(vpn.validateEnable({ entries: [], dest: "a.com" }).ok, false);
   assert.strictEqual(vpn.validateEnable({ entries: ["2001:db8::1"], dest: "a.com" }).ok, false, "IPv4 only");
   assert.strictEqual(vpn.validateEnable({ entries: ["1.2.3.4"], dest: "not a host" }).ok, false);
@@ -230,6 +230,26 @@ test("runtime: enable adds the entry IPs, writes the config + guard, starts Xray
   assert.strictEqual(again.body.publicKey, "PUBKEY", "the keys are kept");
   assert.strictEqual(n.state.calls.filter((c) => c === "systemctl restart netrun-vpn-xray.service").length, 1, "the same params restart nothing");
   assert.strictEqual((await n.rt.enable({ entries: [], dest: "x.com" })).status, 400);
+  // the primary IPv4 (the proxies') only when asked for, and never added again
+  const prim = await n.rt.enable({ entries: ["64.177.12.242"], dest: "dl.google.com" });
+  assert.deepStrictEqual([prim.status, prim.body.error], [409, "primary_ipv4"]);
+  const withPrim = await n.rt.enable({ entries: ["64.177.12.242"], dest: "dl.google.com", allowPrimary: true });
+  assert.strictEqual(withPrim.status, 200, JSON.stringify(withPrim.body));
+  assert.ok(!n.state.calls.some((c) => c === "ip addr add 64.177.12.242/32 dev enp1s0"));
+  n.rt.stopLoops();
+});
+
+test("runtime: an agent start with a changed config restarts Xray (a deploy)", async () => {
+  const n = fakeNode();
+  await n.rt.enable({ entries: ["104.207.139.14"], dest: "dl.google.com" });
+  n.rt.stopLoops();
+  const cfgPath = path.join(n.etc, "xray.json");
+  fs.writeFileSync(cfgPath, "{}\n"); // what an older agent had rendered
+  const before = n.state.calls.filter((c) => c === "systemctl restart netrun-vpn-xray.service").length;
+  await n.rt.start();
+  assert.strictEqual(n.state.calls.filter((c) => c === "systemctl restart netrun-vpn-xray.service").length, before + 1);
+  await n.rt.start();
+  assert.strictEqual(n.state.calls.filter((c) => c === "systemctl restart netrun-vpn-xray.service").length, before + 1, "same config: no restart");
   n.rt.stopLoops();
 });
 
