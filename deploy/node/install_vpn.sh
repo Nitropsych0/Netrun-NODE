@@ -70,6 +70,9 @@ mkd() { # path mode owner
   chmod "$2" "$1"
   if [ "$NO_CHOWN" != 1 ]; then chown "$3" "$1"; fi
 }
+# the parent too: under a deploy's `umask 077` mkdir -p leaves it 0700 and
+# netrun-vpn could not reach its binary (Chicago 2026-10-15)
+mkd "$ROOT/opt/netrun/vpn" 0755 root:root
 mkd "$BIN_DIR" 0755 root:root
 mkd "$SHARE_DIR" 0755 root:root
 mkd "$ETC_DIR" 0750 "root:$VPN_USER"
