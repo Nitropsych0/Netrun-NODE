@@ -182,11 +182,45 @@ let _counterParseCount = 0;
 // Overridable exec seam for unit tests (asserts the dump timeout).
 let _dumpExec = execCapture;
 
+// Audit P-N3 — the dump grows with every port (~1.1 s per 12k counters, ~5 s at the
+// ~55k of a full node, >20 s at ~200k). The bulk dump stays (a per-counter read is
+// slower, see above); what changes: (1) the timeout scales with the counter count of the
+// last dump — 6x the expected dump time, never below NFT_DUMP_TIMEOUT_MS (the 20 s floor)
+// and never above NODE_AGENT_NFT_DUMP_TIMEOUT_MAX_MS (60 s); (2) a dump slower than
+// NODE_AGENT_NFT_DUMP_WARN_MS (5 s) is logged, and so is a failed one, each at most once
+// per DUMP_LOG_GAP_MS; (3) getCounterDumpStats() exposes the last duration / count.
+// Coupling: the orchestrator's TRAFFIC_POLL_REQUEST_TIMEOUT_SEC must exceed the largest
+// scaled timeout (60 s) + parse time, or a slow dump still fails the cycle as a read timeout.
+const NFT_DUMP_TIMEOUT_MAX_MS = Math.max(NFT_DUMP_TIMEOUT_MS, Number(process.env.NODE_AGENT_NFT_DUMP_TIMEOUT_MAX_MS || 60000) || 60000);
+const NFT_DUMP_WARN_MS = Number(process.env.NODE_AGENT_NFT_DUMP_WARN_MS || 5000) || 5000;
+const DUMP_LOG_GAP_MS = 5 * 60 * 1000;
+const DUMP_MS_PER_12K = 1100;
+const DUMP_TIMEOUT_FACTOR = 6;
+let _lastCounterCount = 0;
+let _lastSlowLogAt = 0;
+let _lastFailLogAt = 0;
+let _dumpStats = { lastMs: null, lastCount: 0, lastAt: null, slowCount: 0, failCount: 0, lastTimeoutMs: NFT_DUMP_TIMEOUT_MS };
+
+function _dumpTimeoutMs() {
+  const scaled = Math.ceil((_lastCounterCount / 12000) * DUMP_MS_PER_12K * DUMP_TIMEOUT_FACTOR);
+  return Math.min(NFT_DUMP_TIMEOUT_MAX_MS, Math.max(NFT_DUMP_TIMEOUT_MS, scaled));
+}
+
+function getCounterDumpStats() {
+  return { ..._dumpStats };
+}
+
 async function _fetchAllCounterItems() {
-  const result = await _dumpExec("nft", ["-j", "list", "counters", "table", "inet", NFT_TABLE], {
-    timeoutMs: NFT_DUMP_TIMEOUT_MS,
-  });
+  const timeoutMs = _dumpTimeoutMs();
+  const t0 = Date.now();
+  const result = await _dumpExec("nft", ["-j", "list", "counters", "table", "inet", NFT_TABLE], { timeoutMs });
+  const ms = Date.now() - t0;
   if (result.code !== 0) {
+    _dumpStats = { ..._dumpStats, lastMs: ms, lastAt: new Date().toISOString(), failCount: _dumpStats.failCount + 1, lastTimeoutMs: timeoutMs };
+    if (Date.now() - _lastFailLogAt >= DUMP_LOG_GAP_MS) {
+      _lastFailLogAt = Date.now();
+      console.error(`[accounting] nft counter dump failed after ${ms} ms (timeout ${timeoutMs} ms, ${_lastCounterCount} counters at the last dump): ${String(result.stderr || `exit ${result.code}`).slice(0, 200)}`);
+    }
     throw new NftablesError("nft_list_counters_failed", result.stderr || `exit ${result.code}`);
   }
   let parsed;
@@ -195,7 +229,15 @@ async function _fetchAllCounterItems() {
   } catch (err) {
     throw new NftablesError("nft_json_parse_failed", String(err && err.message || err));
   }
-  return Array.isArray(parsed && parsed.nftables) ? parsed.nftables : [];
+  const items = Array.isArray(parsed && parsed.nftables) ? parsed.nftables : [];
+  _lastCounterCount = items.length;
+  const slow = ms > NFT_DUMP_WARN_MS;
+  _dumpStats = { lastMs: ms, lastCount: items.length, lastAt: new Date().toISOString(), slowCount: _dumpStats.slowCount + (slow ? 1 : 0), failCount: _dumpStats.failCount, lastTimeoutMs: timeoutMs };
+  if (slow && Date.now() - _lastSlowLogAt >= DUMP_LOG_GAP_MS) {
+    _lastSlowLogAt = Date.now();
+    console.warn(`[accounting] slow nft counter dump: ${ms} ms for ${items.length} items (timeout now ${_dumpTimeoutMs()} ms) — per-GB accounting stops at the timeout`);
+  }
+  return items;
 }
 
 // Overridable fetcher seam for unit tests (default = real nft dump).
@@ -262,6 +304,13 @@ function _setDumpExec(fn) {
 }
 function _counterParses() {
   return _counterParseCount;
+}
+// Test seam (P-N3).
+function _resetDumpState() {
+  _lastCounterCount = 0;
+  _lastSlowLogAt = 0;
+  _lastFailLogAt = 0;
+  _dumpStats = { lastMs: null, lastCount: 0, lastAt: null, slowCount: 0, failCount: 0, lastTimeoutMs: NFT_DUMP_TIMEOUT_MS };
 }
 
 async function getCountersForPorts(ports) {
@@ -814,6 +863,10 @@ module.exports = {
   parseCounterItems,
   _fetchAllCounterItems,
   _setDumpExec,
+  _dumpTimeoutMs,
+  _resetDumpState,
+  getCounterDumpStats,
+  NFT_DUMP_TIMEOUT_MAX_MS,
   _counterParses,
   NFT_DUMP_TIMEOUT_MS,
   _writeBlockedList,

@@ -1548,3 +1548,15 @@ lock, and a `/health` that finds a `/generate` running, drop or bypass it, so he
 shows a pre-generation table. `/health` has an additive `scanCache: {ttlMs, hits, misses,
 coalesced, lastRefreshAt, entries}`. After a deploy, compare `/health` latency and agent CPU
 on a loaded node (`scanCache.hits` should dominate `misses`).
+
+### nft counter dump cost (P-N3)
+
+`GET /accounting` still reads ONE bulk `nft -j list counters` per poll cycle (a targeted
+per-counter read measured slower), cached across the 500-port chunks. What changed: the dump
+timeout scales with the counter count of the previous dump — `max(20 s, ceil(count / 12 000 x
+1.1 s x 6))`, at most `NODE_AGENT_NFT_DUMP_TIMEOUT_MAX_MS` (60 s) — so a growing node degrades
+gradually instead of hitting a fixed 20 s wall; a dump slower than `NODE_AGENT_NFT_DUMP_WARN_MS`
+(5 s) logs `[accounting] slow nft counter dump: <ms> for <n> items`, and a failed one
+`nft counter dump failed after <ms> (timeout …)` (each at most every 5 min; grep the agent
+journal). The orchestrator's `TRAFFIC_POLL_REQUEST_TIMEOUT_SEC` must exceed 60 s + parse time
+for the scaling to matter (config note for the orchestrator repo).
