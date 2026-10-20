@@ -1384,6 +1384,8 @@ function createPergb(deps = {}) {
     }
   }
 
+  const loadOf = (st, key) => (st && st.load && st.load[key] !== undefined ? st.load[key] : null);
+
   async function status() {
     reloadIfChanged();
     const e = enableDoc;
@@ -1433,6 +1435,13 @@ function createPergb(deps = {}) {
         ready: st ? st.ready : null,
         p50Ms: st && st.latency ? st.latency.p50Ms : null,
         p99Ms: st && st.latency ? st.latency.p99Ms : null,
+        // P-N2 saturation signals (engine op_status "load"); null = unknown (ctl down / an older radius)
+        requests: loadOf(st, "requests"),
+        sendErrors: loadOf(st, "sendErrors"),
+        drainFull: loadOf(st, "drainFull"),
+        udpDrops: loadOf(st, "udpDrops"),
+        udpRxQueue: loadOf(st, "udpRxQueue"),
+        loopMaxMs: loadOf(st, "loopMaxMs"),
         dbRecovered: st ? st.dbRecovered : null,
         admission: st ? st.admission : null,
         ipv4AdmissionOpen: st ? st.ipv4AdmissionOpen : null,

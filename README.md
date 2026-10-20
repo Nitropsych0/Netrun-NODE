@@ -1514,3 +1514,12 @@ integers — `tasksMax`, `maxConns`, `sliceMemMax` (`null` while per-GB is off) 
 systemctl show netrun-pergb.slice -p TasksMax -p MemoryMax
 cat /etc/systemd/system/netrun-pergb.slice.d/50-netrun-enable.conf
 ```
+
+### RADIUS saturation signals in `/pergb` status (P-N2)
+
+`GET /pergb/status` (and the enable response) `radius` block carries, besides `p50Ms` /
+`p99Ms`, the single-threaded RADIUS loop's load: `requests`, `sendErrors`, `drainFull`,
+`udpDrops`, `udpRxQueue`, `loopMaxMs` (`null` = unknown: ctl down, an older RADIUS, or no
+`/proc/net/udp`). `udpDrops` growing between polls means datagrams were lost — per-GB
+auth is failing right now; the watchdog does NOT fire on overload. Details and the
+deferred scale-up options (auth cache, `SO_REUSEPORT`): `node_runtime/radius/README.md`.

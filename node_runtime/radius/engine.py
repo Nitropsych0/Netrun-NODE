@@ -579,7 +579,15 @@ class Engine:
             "udpAccepts": 0,
             "udpRefused": 0,
             "sendErrors": 0,
+            "drainFull": 0,
         }
+        # saturation signals of the single UDP loop (netrun_radius.Server): the slowest
+        # drain pass of the last two LOOP_WINDOW_SEC windows, and the kernel's view of the
+        # socket (drops / rx_queue from /proc/net/udp; None until sampled or unreadable)
+        self.loop_max_cur = 0.0
+        self.loop_max_prev = 0.0
+        self.udp_drops = None
+        self.udp_rx_queue = None
         self.lat = array("d", bytes(8 * LAT_SAMPLES))
         self.lat_i = 0
         self.lat_n = 0
@@ -1045,6 +1053,32 @@ class Engine:
         now = self.clock() if now is None else now
         return self.store.prune_events(now - EVENT_RETENTION_SEC)
 
+    def note_loop(self, seconds, full):
+        """One drain pass of the UDP loop took `seconds`; `full` = it hit DRAIN_MAX (a backlog)."""
+        if seconds > self.loop_max_cur:
+            self.loop_max_cur = seconds
+        if full:
+            self.counters["drainFull"] += 1
+
+    def roll_loop_max(self):
+        """Called every LOOP_WINDOW_SEC: a spike is reported for one to two windows, then decays."""
+        self.loop_max_prev = self.loop_max_cur
+        self.loop_max_cur = 0.0
+
+    def load_signals(self):
+        """The saturation signals the agent exports as /pergb status radius.* (op_status "load")."""
+        c = self.counters
+        return {
+            "requests": c["requests"],
+            "sendErrors": c["sendErrors"],
+            "malformed": c["malformed"],
+            "badAuthenticator": c["badAuthenticator"],
+            "drainFull": c["drainFull"],
+            "loopMaxMs": round(max(self.loop_max_cur, self.loop_max_prev) * 1000, 3),
+            "udpDrops": self.udp_drops,
+            "udpRxQueue": self.udp_rx_queue,
+        }
+
     def latency(self):
         """(p50, p99) in ms over the last LAT_SAMPLES requests (the copy is taken at once)."""
         n = self.lat_n
@@ -1082,6 +1116,7 @@ class Engine:
                 "alloc": self.alloc.stats(now),
                 "smartRotation": self.alloc.avoid_stats(now),
                 "latency": {"p50Ms": p50, "p99Ms": p99},
+                "load": self.load_signals(),
                 "admission": {"open": self.adm_open, "soft": sorted(self.adm_soft)},
                 "ipv4AdmissionOpen": self.ipv4_open,
                 "ipv4Closed": sorted(str(ipaddress.IPv4Address(x)) for x in self.ipv4_closed),

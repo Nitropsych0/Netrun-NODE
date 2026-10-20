@@ -6,7 +6,9 @@
 #
 # Restarts never stop: StartLimitIntervalSec=0 + Restart=always + RestartSec=1,
 # so start-limit-hit (and with it a closed socket) cannot happen. WatchdogSec:
-# the sweeper pings only while the UDP loop is alive.
+# the sweeper pings only while the UDP loop is alive. Overload is NOT a restart: it
+# shows as kernel drops on the socket (ctl status "load": udpDrops, drainFull,
+# loopMaxMs; exported by the agent as /pergb radius.*, see README "Saturation signals").
 # MemoryMax: measured 2026-10-09 with 50k lists + 100k bindings + 25k accounts:
 # ~160 MiB live, ~235 MiB RSS; 512M = about 2x. The in-process caps
 # (PERGB_BINDINGS_MAX, PERGB_STICKY_MAX_PER_ACCOUNT) keep the state bounded.
