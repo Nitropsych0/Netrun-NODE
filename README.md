@@ -1535,3 +1535,16 @@ admission stays open) and `warnings: ["log_fs_warn", ...]`; the existing admissi
 The meter's own status has `logFs: {total, free, usedPct, freePct}`. The first crossing
 logs `pergb_log_fs_high` (and an agent event) with `meterLagSec`, so a stalled meter and
 plain volume can be told apart. Alert on `logFsWarn`.
+
+### One ps / ss scan for /health, hygiene and the supervisor (P-N4)
+
+`proc_snapshot.js` keeps ONE `ps -eo pid=,etimes=,args=` and one `ss -ltnH sport = …`
+result per port set for `NODE_AGENT_SNAPSHOT_TTL_MS` (default 10 000; `0` = every call
+scans, argv as before). `/health` (5-10 calls a minute) reads it; concurrent calls share
+one running scan; failed scans are never cached. hygiene's reaper and the supervisor decide
+kills / respawns, so they read `fresh` (never a cached view) and their read refreshes the
+cache. Every locked process-table change (`process_lock.js`), every released generation
+lock, and a `/health` that finds a `/generate` running, drop or bypass it, so health never
+shows a pre-generation table. `/health` has an additive `scanCache: {ttlMs, hits, misses,
+coalesced, lastRefreshAt, entries}`. After a deploy, compare `/health` latency and agent CPU
+on a loaded node (`scanCache.hits` should dominate `misses`).

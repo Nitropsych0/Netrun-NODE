@@ -399,6 +399,10 @@ function createSupervisor({
   exists = fs.existsSync,
   isGenerationBusy = async () => false,
   processLock = (fn) => fn(),
+  // P-N4 — the shared ps / ss snapshot (proc_snapshot.js), optional. A respawn decision
+  // must never rest on a cached "not listening" (a second respawn would follow), so
+  // every read here is {fresh: true}; it refreshes the cache /health reads.
+  snapshot = null,
   // Orphan-anchor GC inputs; either missing (null) = the GC deletes nothing.
   ownedAddresses = null, // async () => Set of addresses (text) | null (unknown)
   readDisabledAnchors = null, // async () => Set of anchor addresses (text) of *.cfg.disabled
@@ -491,9 +495,17 @@ function createSupervisor({
   }
 
   async function listProcesses() {
-    const res = await run("ps", ["-eo", "pid=,etimes=,args="], { timeoutMs: 8000 });
-    if (res.code !== 0) return { ok: false, error: String(res.stderr || "").trim().slice(0, 200) || `exit ${res.code}` };
-    const procs = hygieneLib.parsePsProcesses(res.stdout);
+    let stdout;
+    if (snapshot) {
+      const snap = await snapshot.ps({ fresh: true });
+      if (!snap.ok) return { ok: false, error: snap.error };
+      stdout = snap.stdout;
+    } else {
+      const res = await run("ps", ["-eo", "pid=,etimes=,args="], { timeoutMs: 8000 });
+      if (res.code !== 0) return { ok: false, error: String(res.stderr || "").trim().slice(0, 200) || `exit ${res.code}` };
+      stdout = res.stdout;
+    }
+    const procs = hygieneLib.parsePsProcesses(stdout);
     const keys = new Set();
     const dirs = new Map();
     for (const p of procs) {
@@ -523,6 +535,13 @@ function createSupervisor({
     const list = [...new Set(ports)].filter((p) => Number.isInteger(p) && p > 0);
     const out = new Set();
     const keys = new Set();
+    if (snapshot) {
+      const snap = await snapshot.ss(list, { fresh: true });
+      if (!snap.ok) return { ok: false, error: snap.error };
+      for (const p of hygieneLib.parseListeningPorts(snap.stdout)) out.add(p);
+      for (const k of cfgStatus.parseListenKeys(snap.stdout)) keys.add(k);
+      return { ok: true, ports: out, keys };
+    }
     for (let i = 0; i < list.length; i += LISTEN_PROBE_CHUNK) {
       const filter = list.slice(i, i + LISTEN_PROBE_CHUNK).map((p) => `sport = :${p}`).join(" or ");
       const res = await run("ss", ["-ltnH", filter], { timeoutMs: 8000 });

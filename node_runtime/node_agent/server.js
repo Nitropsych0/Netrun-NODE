@@ -17,6 +17,8 @@ const cfgStatus = require("./cfg_status.js");
 const jobRetention = require("./job_retention.js");
 const hygieneLib = require("./hygiene.js");
 const { withProcessLock } = require("./process_lock.js");
+const processLockLib = require("./process_lock.js");
+const procSnapshotLib = require("./proc_snapshot.js");
 const supervisorLib = require("./supervisor.js");
 const firewallLib = require("./firewall.js");
 const proxySpawn = require("./proxy_spawn.js");
@@ -1198,8 +1200,8 @@ async function runCommand(command, args, options = {}) {
   });
 }
 
-async function collectRunningInstances() {
-  const ps = await runCommand("ps", ["-eo", "pid,args"], { timeoutSec: 8 });
+async function collectRunningInstances(opts = {}) {
+  const ps = opts.shared ? await sharedPsOutput(opts) : await runCommand("ps", ["-eo", "pid,args"], { timeoutSec: 8 });
   if (!ps.ok) {
     return {
       ok: false,
@@ -1787,6 +1789,31 @@ async function listListeningTcpPorts(range) {
   return { ok: true, error: null, ports: out, keys: cfgStatus.parseListenKeys(ss.stdout) };
 }
 
+// --- lane: node-pergb-runtime ---
+// P-N4 — the /health path's view of the shared ps / ss snapshot (procSnapshot,
+// built next to the hygiene instance). With the TTL at 0 both fall back to the
+// original scans (same argv as before).
+async function sharedPsOutput({ fresh = false } = {}) {
+  if (procSnapshot.stats().ttlMs === 0) return runCommand("ps", ["-eo", "pid,args"], { timeoutSec: 8 });
+  const snap = await procSnapshot.ps({ fresh });
+  if (!snap.ok) return { ok: false, error: snap.error || "ps_failed", stdout: "", stderr: snap.error || "" };
+  // the snapshot's `pid etimes args` -> `pid args`
+  const stdout = snap.stdout
+    .split("\n")
+    .map((l) => l.replace(/^(\s*\d+)\s+\d+\s+/, "$1 "))
+    .join("\n");
+  return { ok: true, error: null, stdout, stderr: "" };
+}
+
+async function listListeningExactPortsShared(ports, { fresh = false } = {}) {
+  const list = [...new Set((ports || []).map((p) => toPositiveInt(p, 0)).filter((p) => p > 0 && p <= 65535))];
+  if (procSnapshot.stats().ttlMs === 0 || !list.length) return listListeningExactPorts(ports);
+  const snap = await procSnapshot.ss(list, { fresh });
+  if (!snap.ok) return { ok: false, error: snap.error || "ss_failed", ports: new Set(), keys: new Set() };
+  return { ok: true, error: null, ports: hygieneLib.parseListeningPorts(snap.stdout), keys: cfgStatus.parseListenKeys(snap.stdout) };
+}
+// --- end lane: node-pergb-runtime ---
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -2220,12 +2247,30 @@ async function checkDns(timeoutMs = 5000) {
 // NODE_AGENT_HYGIENE_INTERVAL_SEC, the duplicate reaper a minute after start
 // and on the same tick, both idle while a /generate holds the lock. The
 // agent's own path (PROXY_ROOT) is the copy kept when a cfg runs twice.
+// --- lane: node-pergb-runtime ---
+// Audit P-N4 — ONE ps / ss snapshot (proc_snapshot.js, NODE_AGENT_SNAPSHOT_TTL_MS,
+// default 10 s, 0 = every call scans as before) shared by /health, hygiene and the
+// supervisor. hygiene / supervisor read {fresh: true} (they decide kills / respawns)
+// and refresh it for /health; every locked process-table change and every released
+// generation lock invalidates it, so /health never reports a batch as it was before
+// a /generate, /deprovision or respawn finished.
+const procSnapshot = procSnapshotLib.createProcSnapshot({
+  run: async (cmd, args, opts = {}) => {
+    const r = await runCommand(cmd, args, { timeoutSec: Math.max(1, Math.ceil(Number(opts.timeoutMs || 8000) / 1000)) });
+    return { code: r.ok ? 0 : Number.isInteger(r.exitCode) && r.exitCode !== 0 ? r.exitCode : 1, stdout: r.stdout, stderr: r.stderr || r.error || "" };
+  },
+  ttlMs: procSnapshotLib.ttlFromEnv(process.env),
+});
+processLockLib.onSettled(() => procSnapshot.invalidate());
+// --- end lane: node-pergb-runtime ---
+
 const hygiene = hygieneLib.createHygiene({
   preferRoot: PROXY_ROOT,
   isGenerationBusy: generationBusy,
   // Audit RES-11 — the reaper's kills and the supervisor's respawns never
   // interleave (process_lock.js).
   processLock: withProcessLock,
+  snapshot: procSnapshot,
 });
 
 // Removes THIS batch's generator @reboot line after a /generate. Matched by
@@ -2627,6 +2672,7 @@ async function releaseGenerationLock(lockPath, ownerToken) {
     return;
   }
   await safeUnlink(lockPath);
+  procSnapshot.invalidate(); // P-N4: the generation moved the process table
 }
 
 function markJobStatus(jobMeta, status, patch = {}) {
@@ -4100,6 +4146,7 @@ const supervisor = supervisorLib.createSupervisor({
   spawnCfg: (cfgPath) => proxySpawn.spawn3proxyCfg(cfgPath, { bin: path.join(PROXY_CFG_ROOT, "bin", "3proxy") }),
   isGenerationBusy: generationBusy,
   processLock: withProcessLock,
+  snapshot: procSnapshot,
   // Audit N2 follow-up — the orphan-anchor GC's keep-lists.
   ownedAddresses: () => egress.ownedAddresses(),
   readDisabledAnchors: readDisabledCfgAnchors,
@@ -4161,7 +4208,8 @@ async function handleHealth(req, res) {
   // expired lock that /generate would happily reclaim (the prod inconsistency).
   const lockState = await classifyGenerationLock(lockPath);
   const busy = Boolean(lockState.parsed) && !lockState.stale;
-  const instancesState = await collectRunningInstances();
+  // P-N4 — the shared 10 s scan, unless a /generate is running (it moves the table).
+  const instancesState = await collectRunningInstances({ shared: true, fresh: busy });
   const instances = instancesState.instances || [];
   const summary = buildInstanceSummary(instances);
   // Fan out ipv6 + dns + listening-port probes in parallel — each carries its
@@ -4194,7 +4242,7 @@ async function handleHealth(req, res) {
   const [ipv6Check, dnsCheck, listenState, ipv6Addresses, httpsHostnamesStatus, ipv6EgressRouted, clock] = await Promise.all([
     checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
     checkDns(5000),
-    listListeningExactPorts([...probePorts]),
+    listListeningExactPortsShared([...probePorts], { fresh: busy }),
     ipv6Coverage.get(),
     httpsHostnames.healthStatus(),
     routedEgress.get(),
@@ -4326,6 +4374,9 @@ async function handleHealth(req, res) {
     // Pay-per-GB v2 — additive, no secrets: { enabled, pool, radiusAlive,
     // live, guards } (the full state is GET /pergb/status on :8086).
     pergb: { ...pergb.healthBlock(), tls: pergbServer.status() },
+    // P-N4 — additive. The shared ps / ss scan cache: { ttlMs (0 = off), hits, misses,
+    // coalesced, lastRefreshAt, entries }.
+    scanCache: procSnapshot.stats(),
   });
 }
 
@@ -4776,4 +4827,6 @@ module.exports = {
   pergb,
   pergbServer,
   vpn,
+  // --- lane: node-pergb-runtime --- (P-N4, exported for unit tests)
+  procSnapshot,
 };

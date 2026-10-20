@@ -252,6 +252,10 @@ function createHygiene({
   tmpDir = os.tmpdir(),
   log = console,
   processLock = (fn) => fn(),
+  // P-N4 — the shared ps / ss snapshot (proc_snapshot.js). Optional: without it the
+  // scans run on `run` as before. The reaper decides kills, so it reads {fresh: true}
+  // (and thereby refreshes the cache /health reads).
+  snapshot = null,
 } = {}) {
   const settings = readSettings(env);
   const stats = {
@@ -370,6 +374,11 @@ function createHygiene({
   }
 
   async function listProcesses() {
+    if (snapshot) {
+      const snap = await snapshot.ps({ fresh: true });
+      if (!snap.ok) return { ok: false, error: snap.error, procs: [] };
+      return { ok: true, error: null, procs: parsePsProcesses(snap.stdout) };
+    }
     const res = await run("ps", ["-eo", "pid=,etimes=,args="], { timeoutMs: 8000 });
     if (res.code !== 0) return { ok: false, error: stderrOf(res), procs: [] };
     return { ok: true, error: null, procs: parsePsProcesses(res.stdout) };
@@ -413,6 +422,12 @@ function createHygiene({
   async function listListening(ports) {
     const list = [...new Set(ports)];
     const out = new Set();
+    if (snapshot) {
+      const snap = await snapshot.ss(list, { fresh: true });
+      if (!snap.ok) return { ok: false, error: snap.error, ports: out };
+      for (const p of parseListeningPorts(snap.stdout)) out.add(p);
+      return { ok: true, error: null, ports: out };
+    }
     for (let i = 0; i < list.length; i += LISTEN_PROBE_CHUNK) {
       const filter = list.slice(i, i + LISTEN_PROBE_CHUNK).map((p) => `sport = :${p}`).join(" or ");
       const res = await run("ss", ["-ltnH", filter], { timeoutMs: 8000 });
