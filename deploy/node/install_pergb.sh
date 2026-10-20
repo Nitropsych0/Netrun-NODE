@@ -58,6 +58,8 @@ NO_CHOWN="${NETRUN_PERGB_NO_CHOWN:-0}"
 PERGB_USER="netrun-pergb"
 RADIUS_USER="netrun-radius"
 PERGB_UID="${NETRUN_PERGB_UID:-65533}"
+# 16G holds ~15 h of per-connection log lines at 2 000 conn/s if the meter stalls; the agent
+# warns from 70 % used (/pergb status logFsWarn) and closes admission at < 10 % free
 LOG_SIZE="${NETRUN_PERGB_LOG_SIZE:-16G}"
 MEM_MAX="${NETRUN_PERGB_MEM_MAX:-1536M}"
 CPU_WEIGHT="${NETRUN_PERGB_CPU_WEIGHT:-50}"

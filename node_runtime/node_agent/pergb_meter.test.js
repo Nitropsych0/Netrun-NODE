@@ -97,6 +97,17 @@ test("parseRecord: exactly 14 fields, digits where digits belong, a UTC time", (
   assert.strictEqual(meterLib.baseLogin("-"), null);
 });
 
+test("P-N6: status() reports the log image usage {total, free, usedPct, freePct}; null when the dir is unreadable", () => {
+  const dir = tmpdir("logfs");
+  fs.mkdirSync(path.join(dir, "log"), { recursive: true });
+  const m = newMeter(dir, clock());
+  const u = m.status().logFs;
+  assert.ok(u && u.total > 0 && u.free >= 0 && u.free <= u.total, JSON.stringify(u));
+  assert.ok(Math.abs(u.usedPct + u.freePct - 100) < 0.001);
+  fs.rmSync(path.join(dir, "log"), { recursive: true });
+  assert.strictEqual(m.status().logFs, null);
+});
+
 test("counting: known base logins only; probe and zero-byte records skipped; unknown aggregated", () => {
   const dir = tmpdir("count");
   const now = clock();

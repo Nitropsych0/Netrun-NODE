@@ -1523,3 +1523,15 @@ cat /etc/systemd/system/netrun-pergb.slice.d/50-netrun-enable.conf
 `/proc/net/udp`). `udpDrops` growing between polls means datagrams were lost — per-GB
 auth is failing right now; the watchdog does NOT fire on overload. Details and the
 deferred scale-up options (auth cache, `SO_REUSEPORT`): `node_runtime/radius/README.md`.
+
+### Log image usage warning (P-N6)
+
+3proxy-pergb writes one log line per connection onto the 16 GB loop image
+(`NETRUN_PERGB_LOG_SIZE`); at ~2 000 conn/s that is ~25 GB/day raw, i.e. ~15 h of backlog
+if the meter stalls (a full image = unmetered traffic, not an outage). `/pergb` status
+now reports `logFsUsedPct` (also in `guards`), `logFsWarn` (`true` from 70 % used;
+admission stays open) and `warnings: ["log_fs_warn", ...]`; the existing admission gate
+(`guards.closedBy: ["log_fs"]` at < 10 % free) and the meter-lag gate are unchanged.
+The meter's own status has `logFs: {total, free, usedPct, freePct}`. The first crossing
+logs `pergb_log_fs_high` (and an agent event) with `meterLagSec`, so a stalled meter and
+plain volume can be told apart. Alert on `logFsWarn`.

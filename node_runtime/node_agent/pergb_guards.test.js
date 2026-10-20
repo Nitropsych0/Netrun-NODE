@@ -44,7 +44,7 @@ test("countLocalPorts: distinct local ports of the address inside the range, any
   assert.strictEqual(guardsLib.countLocalPorts(text, "203.0.113.5", 1024, 8000), 2);
 });
 
-function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessions = new Map(), probe = null, ips = ["203.0.113.5"], portsByIp = null, extraIps = null } = {}) {
+function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessions = new Map(), probe = null, ips = ["203.0.113.5"], portsByIp = null, extraIps = null, onEvent = undefined, statfs = null } = {}) {
   const files = {};
   const set = (m, p) => {
     files[path.join("/cg", SLICE, "memory.current")] = String(Math.round(m * 10 * 1024 * 1024));
@@ -81,7 +81,8 @@ function env({ mem = 50, pids = 10, freePct = 50, lag = 0, portsUsed = 0, sessio
       if (p in files) return files[p];
       throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
     },
-    statfs: () => ({ blocks: 1000, bavail: Math.round(st.freePct * 10), bsize: 4096 }),
+    statfs: statfs || (() => ({ blocks: 1000, bavail: Math.round(st.freePct * 10), bsize: 4096 })),
+    onEvent,
     settings: { cgroupRoot: "/cg", sliceCgroup: SLICE, logDir: "/logs", portRangeFile: "/proc/range" },
     enable: () => ({ sliceMemMax: 1200 * 1024 * 1024 }),
     egressIpv4s: () => ips,
@@ -135,6 +136,43 @@ test("tick: log filesystem < 10 % free or meter lag > 30 s close admission for e
   e.st.lag = 1;
   s = await e.g.tick();
   assert.strictEqual(s.admissionOpen, true);
+});
+
+test("P-N6: log image > 70 % used warns (admission stays open); < 10 % free still closes; one event per transition", async () => {
+  const events = [];
+  const e = env({ freePct: 50, onEvent: (type, d) => events.push([type, d]) });
+  const g = e.g;
+  let s = await g.tick();
+  assert.strictEqual(s.logFsWarn, false);
+  assert.strictEqual(s.logFsUsedPct, 50);
+  assert.deepStrictEqual(s.warnings, []);
+  e.st.freePct = 25; // 75 % used
+  s = await g.tick();
+  assert.strictEqual(s.logFsWarn, true);
+  assert.strictEqual(s.logFsUsedPct, 75);
+  assert.deepStrictEqual(s.warnings, ["log_fs_warn"]);
+  assert.strictEqual(s.admissionOpen, true, "a warning alone never closes admission");
+  assert.deepStrictEqual(s.closedBy, []);
+  await g.tick();
+  assert.strictEqual(events.length, 1, "once per transition, not per tick");
+  assert.strictEqual(events[0][0], "pergb_log_fs_high");
+  assert.strictEqual(events[0][1].usedPct, 75);
+  e.st.freePct = 5; // 95 % used
+  s = await g.tick();
+  assert.strictEqual(s.logFsWarn, true);
+  assert.strictEqual(s.admissionOpen, false);
+  assert.deepStrictEqual(s.closedBy, ["log_fs"]);
+  e.st.freePct = 40;
+  s = await g.tick();
+  assert.deepStrictEqual([s.logFsWarn, s.warnings], [false, []]);
+  e.st.freePct = 25;
+  await g.tick();
+  assert.strictEqual(events.length, 2, "a new transition fires again");
+  // unreadable fs: unknown, not a warning
+  const blind = env({ statfs: () => { throw new Error("EIO"); } });
+  s = await blind.g.tick();
+  assert.deepStrictEqual([s.logFsUsedPct, s.logFsWarn], [null, false]);
+  assert.strictEqual(guardsLib.LOGFS_WARN_USED_PCT, 70);
 });
 
 test("tick: IPv4 local ports on the egress IPv4 drive ipv4_admission with hysteresis", async () => {

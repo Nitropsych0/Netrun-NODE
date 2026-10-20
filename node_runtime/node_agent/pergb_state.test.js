@@ -192,6 +192,7 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
       assert.ok(k in st.json.radius && st.json.radius[k] === null, `radius.${k} is null before enable: ${JSON.stringify(st.json.radius)}`);
     }
     assert.deepStrictEqual([st.json.tasksMax, st.json.maxConns, st.json.sliceMemMax, st.json.warnings], [null, null, null, []]);
+    assert.ok("logFsUsedPct" in st.json && "logFsWarn" in st.json);
     assert.strictEqual((await call("POST", "/pergb/reserve_nets", { body: { count: 1, ref: "r0" } })).json.error, "pergb_off");
     assert.strictEqual((await call("PATCH", "/pergb/state", { body: { baseSeq: 0, seq: 1 } })).json.error, "pergb_off");
   });
@@ -235,6 +236,10 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     assert.deepStrictEqual([r.json.tasksMax, r.json.maxConns, r.json.sliceMemMax], [10500, 8000, 1610612736]);
     assert.deepStrictEqual(r.json.warnings, []);
     assert.deepStrictEqual(r.json.conns.max, 8000);
+    // P-N6: log image usage (statfs fake: 50 % used) and the warning flag, top level and in guards
+    assert.strictEqual(typeof r.json.logFsWarn, "boolean");
+    assert.ok(r.json.logFsUsedPct === null || r.json.logFsUsedPct === 50, String(r.json.logFsUsedPct));
+    assert.strictEqual(r.json.guards.logFsWarn, r.json.logFsWarn);
     assert.deepStrictEqual(r.json.excludedPush, { ok: true, excluded: 2, scanned: 2, complete: true });
     const pool = fs.readFileSync(path.join(dir, "pergb-pool.conf"), "utf-8");
     assert.match(pool, /^PREFIX=2001:db8:aa::\/48$/m);
