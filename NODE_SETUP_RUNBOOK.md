@@ -79,6 +79,7 @@ echo "symlink:    $(readlink /root/proxyserver || echo NOT-A-SYMLINK)"
 echo "pid_max:    $(cat /proc/sys/kernel/pid_max)"
 echo "conntrack:  $(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null) (boot: $(cat /etc/modules-load.d/netrun-conntrack.conf 2>/dev/null | grep -c '^nf_conntrack$'))"
 echo "watchdog:   $(systemctl is-active netrun-watchdog.timer)"
+echo "hq-watch:   $(systemctl is-active netrun-hq-watch.timer)"   # тихий no-op, пока оркестратор не запушил /etc/netrun/hq-watch.env
 echo "restore:    $(systemctl is-enabled netrun-3proxy-restore.service)"
 echo "ufw:        $(command -v ufw >/dev/null && echo PRESENT-BAD || echo absent-ok)"
 REMOTE

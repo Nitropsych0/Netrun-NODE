@@ -165,8 +165,9 @@ jobs:
         run: bash scripts/test_netrun_bgp.sh
       - name: HQ watch (stubbed curl/timeout) + shellcheck
         run: |
-          shellcheck -S warning deploy/node/netrun-hq-watch.sh scripts/test_hq_watch.sh
+          shellcheck -S warning deploy/node/netrun-hq-watch.sh scripts/test_hq_watch.sh scripts/test_hq_watch_install.sh
           bash scripts/test_hq_watch.sh
+          bash scripts/test_hq_watch_install.sh
       - name: quick-install registers over https only (audit S-U2) + shellcheck
         run: |
           shellcheck -S warning scripts/test_quick_install_https.sh

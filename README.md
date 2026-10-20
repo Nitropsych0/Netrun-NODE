@@ -1415,10 +1415,20 @@ answers; `site_down`: the site fails while SSH answers), a reminder every
 node's own internet is down (`HQ_REF_URL`, Cloudflare's trace) — it could not
 reach Telegram anyway, so a node never raises a false alarm about HQ.
 
-Config `/etc/netrun/hq-watch.env` (0600, root): `TG_TOKEN` (the admin bot),
-`TG_CHAT`, `TG_TOPIC`, `NODE_LABEL`; without it the unit is a no-op. The
-token reaches curl through its config on stdin, never argv. Test:
-`bash scripts/test_hq_watch.sh` (curl / timeout stubbed).
+Config `/etc/netrun/hq-watch.env` (0600, root, **written by the orchestrator**
+over the node_backup SSH channel — never by an installer, `user_data` or by hand):
+`HQ_WATCH_TG_TOKEN` (a **dedicated alerts-only bot**, never the shop / admin bot's
+token), `HQ_WATCH_TG_CHAT`, `HQ_WATCH_TG_TOPIC`, `NODE_LABEL`. The old names
+`TG_TOKEN` / `TG_CHAT` / `TG_TOPIC` are still read, with a deprecation warning on
+stderr (the journal). Without the file — or when it is readable by group/others
+(a 0644 file is ignored with a message, nothing is sent) — the unit is a quiet
+no-op; `scripts/node_followup_v2.sh` installs the watcher + timer on every node
+(`/usr/local/sbin/netrun-hq-watch`, 0700), so only the orchestrator decides
+whether a node talks. The token reaches curl through its config on stdin, never
+argv. Rotation: change the token on the orchestrator (its fingerprint changes →
+every node is re-pushed), then revoke the old bot in BotFather. Tests:
+`bash scripts/test_hq_watch.sh` (curl / timeout stubbed),
+`bash scripts/test_hq_watch_install.sh` (static).
 
 ## Smoke Generate
 
