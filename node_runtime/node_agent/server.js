@@ -75,6 +75,13 @@ const DEFAULT_PORTS_LISTEN_WAIT_MS = Math.max(12000, Number(process.env.NODE_AGE
 const DEFAULT_IPV6_EGRESS_URL = String(process.env.NODE_AGENT_IPV6_EGRESS_URL || "https://api64.ipify.org").trim();
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_ROOT = path.join(PROXY_ROOT, "3proxy");
+// Audit S-NODE-2 — /generate executes generators only from under GENERATOR_ROOT
+// (as root!); GENERATOR_SCRIPT is what runs when the request names none. The
+// request's cwd is never honoured.
+const GENERATOR_ROOT = path.normalize(process.env.NODE_AGENT_GENERATOR_ROOT || "/opt/netrun/node_runtime");
+const GENERATOR_SCRIPT = path.normalize(
+  process.env.NODE_AGENT_GENERATOR_SCRIPT || path.join(GENERATOR_ROOT, "soft", "generator", "proxyyy_automated.sh")
+);
 const CLEANUP_CRON_AFTER_RUN = String(process.env.NODE_AGENT_CLEANUP_CRON_AFTER_RUN || "1").trim() !== "0";
 const DEFAULT_FINGERPRINT_PROFILE_VERSION = (
   String(process.env.NODE_AGENT_DEFAULT_FINGERPRINT_PROFILE_VERSION || "v2_android_ipv6_only_dns_custom").trim()
@@ -194,16 +201,6 @@ function parseJsonBody(req) {
     });
     req.on("error", reject);
   });
-}
-
-function resolveInputPath(baseDir, inputPath) {
-  if (!inputPath) {
-    return "";
-  }
-  if (path.isAbsolute(inputPath)) {
-    return path.normalize(inputPath);
-  }
-  return path.resolve(baseDir, inputPath);
 }
 
 function toPositiveInt(value, fallback = 0) {
@@ -3018,15 +3015,8 @@ async function handleGenerate(req, res) {
     return;
   }
   const jobId = normalizeJobId(rawJobId);
+  // Audit S-NODE-2 — generatorScript is optional: empty = NODE_AGENT_GENERATOR_SCRIPT.
   const generatorScript = String(body.generatorScript || "").trim();
-  if (!generatorScript) {
-    sendJson(res, 400, {
-      success: false,
-      status: "failed",
-      error: "generatorScript is required",
-    });
-    return;
-  }
 
   const rawGeneratorArgs = Array.isArray(body.generatorArgs)
     ? body.generatorArgs.map((v) => String(v))
@@ -3055,17 +3045,25 @@ async function handleGenerate(req, res) {
   body.ipv6_policy = requiredIpv6Policy;
 
   const timeoutSec = Math.max(10, Number(body.timeoutSec || DEFAULT_TIMEOUT_SEC) || DEFAULT_TIMEOUT_SEC);
-  const cwd = resolveInputPath(process.cwd(), body.cwd || process.cwd());
-  const scriptPath = resolveInputPath(cwd, generatorScript);
-  if (!(await fileExists(scriptPath))) {
+  // Audit S-NODE-2 — the working directory is the agent's own, never the
+  // request's; the script must resolve (realpath) under NODE_AGENT_GENERATOR_ROOT.
+  const cwd = process.cwd();
+  if (body.cwd && path.resolve(String(body.cwd)) !== cwd) {
+    console.warn("[node-agent] generation job_id=%s ignored request cwd=%s", jobId, String(body.cwd));
+  }
+  const gen = await resolveGeneratorScript(generatorScript);
+  if (!gen.ok) {
     sendJson(res, 400, {
       success: false,
       status: "failed",
-      error: "generator_script_not_found",
-      scriptPath,
+      error: gen.error,
+      detail: gen.detail || null,
+      scriptPath: generatorScript || GENERATOR_SCRIPT,
+      allowedRoot: GENERATOR_ROOT,
     });
     return;
   }
+  const scriptPath = gen.scriptPath;
 
   const params = collectJobParams(body, rawGeneratorArgs);
   const profileDiagnostics = buildProfileDiagnostics(params.profile || {});
@@ -3368,6 +3366,8 @@ async function handleGenerate(req, res) {
         providedOutputDir: body.outputDir ?? null,
         providedProxiesListPath: body.proxiesListPath ?? null,
         providedMapCsvPath: body.mapCsvPath ?? null,
+        providedGeneratorScript: body.generatorScript ?? null,
+        providedCwd: body.cwd ?? null,
         fingerprintProfileVersion: profileDiagnostics.fingerprint_profile_version || null,
         profileSelectionSource: profileDiagnostics.profile_selection_source || null,
         // Wave FLEET-HEALTH (FO-06 / RES-12) — counts and flags only, never the
@@ -4799,6 +4799,9 @@ module.exports = {
   pergbServer,
   vpn,
   // Audit S-ORCH-1 / S-NODE-2 / L-U2 — lane node-agent-hardening.
+  resolveGeneratorScript,
+  GENERATOR_ROOT,
+  GENERATOR_SCRIPT,
   parkFailedAttempt,
   dropStaleBatchLists,
   dropIpv6List,
@@ -4872,4 +4875,32 @@ async function dropStaleBatchLists({ startPort, proxyCount, keepCredentialsFile 
     }
   }
   return out;
+}
+
+// Audit S-NODE-2 — which generator may /generate run? -> { ok: true, scriptPath }
+// (the REAL path, so a symlink inside the root pointing outside is rejected and
+// the spawned file is the vetted one) | { ok: false, error, detail? }.
+//   empty request            -> GENERATOR_SCRIPT
+//   relative path            -> generator_script_not_allowed (no cwd-relative resolution)
+//   missing / not a file     -> generator_script_not_found
+//   outside GENERATOR_ROOT   -> generator_script_not_allowed
+// realpath on BOTH sides: on macOS os.tmpdir() is /var/... -> /private/var/...
+async function resolveGeneratorScript(requested) {
+  const wanted = String(requested ?? "").trim();
+  let candidate = GENERATOR_SCRIPT;
+  if (wanted) {
+    if (!path.isAbsolute(wanted)) return { ok: false, error: "generator_script_not_allowed", detail: "relative_path" };
+    candidate = path.normalize(wanted);
+  }
+  let scriptReal;
+  try {
+    const st = await fsp.stat(candidate);
+    if (!st.isFile()) return { ok: false, error: "generator_script_not_found", detail: "not_a_regular_file" };
+    scriptReal = await fsp.realpath(candidate);
+  } catch (_error) {
+    return { ok: false, error: "generator_script_not_found" };
+  }
+  const rootReal = await fsp.realpath(GENERATOR_ROOT).catch(() => GENERATOR_ROOT);
+  if (!isPathInside(rootReal, scriptReal)) return { ok: false, error: "generator_script_not_allowed", detail: "outside_generator_root" };
+  return { ok: true, scriptPath: scriptReal };
 }

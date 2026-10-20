@@ -1445,7 +1445,7 @@ proxyType=socks5
 ipv6Policy=ipv6_only
 networkProfile=high_compatibility
 fingerprintProfileVersion=v2_android_ipv6_only_dns_custom
-generatorScript=/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh
+generatorScript=/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh   # optional; must resolve under NODE_AGENT_GENERATOR_ROOT
 ```
 
 ## Download proxies.list
@@ -1527,3 +1527,17 @@ an `ipv6_<p>.list` of the wrong length (immediate failure instead of N listeners
 and its start-up script refuses to render a cfg from lists that do not match the batch (exit 1, no
 cfg, no spawn — never a `users :CL:` line). A parked failed attempt also loses its credentials list.
 Applies to batches generated after the deploy; existing cron start-up scripts are unchanged.
+
+### /generate runs only the vetted generator — audit S-NODE-2
+
+`/generate` used to execute any `generatorScript` (absolute paths allowed) from any `cwd` of the
+request body as root. Now: the script must resolve (`realpath`, so a symlink out of the root is
+rejected) under `NODE_AGENT_GENERATOR_ROOT` (default `/opt/netrun/node_runtime`); `generatorScript`
+is optional — empty runs `NODE_AGENT_GENERATOR_SCRIPT` (default
+`<root>/soft/generator/proxyyy_automated.sh`); a relative, out-of-root path is answered
+`400 generator_script_not_allowed` (`detail`: `relative_path` / `outside_generator_root`), a missing or
+non-regular file `400 generator_script_not_found`, before any job directory or lock is created. The
+body's `cwd` is never honoured (the agent's own cwd is used; a differing value is logged); `job.json`
+records `request.providedGeneratorScript` / `request.providedCwd` next to the values that actually
+ran. The orchestrator's canonical path is inside the default root, so nothing changes for it; a node
+with a non-standard `NETRUN_HOME` needs `NODE_AGENT_GENERATOR_ROOT` in its unit drop-in.

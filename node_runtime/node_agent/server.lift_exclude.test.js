@@ -26,6 +26,7 @@ fs.mkdirSync(path.join(PROXY_ROOT, "3proxy"), { recursive: true });
 fs.mkdirSync(BIN, { recursive: true });
 fs.mkdirSync(HAPROXY_DIR, { recursive: true }); // the node has the HTTPS front
 process.env.NODE_AGENT_PROXY_ROOT = PROXY_ROOT;
+process.env.NODE_AGENT_GENERATOR_ROOT = TMP; // audit S-NODE-2: /generate runs generators only from under this root
 process.env.NODE_AGENT_API_KEY = "test-key"; // audit 2026-10-08: the agent fails closed without a key
 process.env.NODE_AGENT_JOBS_ROOT = JOBS_ROOT;
 process.env.NODE_AGENT_CLEANUP_CRON_AFTER_RUN = "0";
