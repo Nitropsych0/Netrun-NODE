@@ -1513,3 +1513,17 @@ binds it to `127.0.0.1` only (the node-local callers — watchdog_probe, `netrun
 generator's `/pergb/reserve_nets` — keep working); do it only when the orchestrator shows no `http://`
 node URLs. Enrollment URLs printed by `bootstrap_new_node.sh` / sent by `quick-install.sh` are
 `https://<IP>:8086`. `netrun-harden status` reports `A3 agent TLS :8086: listening|closed`.
+
+### Stale per-start-port lists — audit L-U2
+
+When no 3proxy serves the requested start port, the agent removes a leftover
+`random_users_<p>.list` (unless it is identical to the request's explicit credentials — the FO-06
+retry) and an `ipv6_<p>.list` whose line count differs from `proxyCount` (its pool /64s are handed
+back) **before** the generator runs, and records `result.staleLists`
+(`{credentials, credentialsLines, ipv6, ipv6Lines}` — counts only) in `job.json`. The generator
+itself reuses `random_users_<p>.list` only when it holds exactly `proxyCount` valid
+`login:password` lines (otherwise it regenerates it atomically, 0600, and says so on stderr), refuses
+an `ipv6_<p>.list` of the wrong length (immediate failure instead of N listeners for an M-port batch),
+and its start-up script refuses to render a cfg from lists that do not match the batch (exit 1, no
+cfg, no spawn — never a `users :CL:` line). A parked failed attempt also loses its credentials list.
+Applies to batches generated after the deploy; existing cron start-up scripts are unchanged.

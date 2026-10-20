@@ -931,7 +931,10 @@ async function parkFailedAttempt(startPort, sinceMs) {
     const kill = await deprovision.killCfgProcess(sp);
     if (kill.stillAlive) return { parked: false, reason: "still_running", killed: kill.killed };
     await fsp.rename(cfgPath, `${cfgPath}.failed`);
-    for (const f of [buildStartupScriptPath(sp), buildIpv6ListPath(sp), path.join(PROXY_ROOT, `running_server_${sp}.info`)]) {
+    // Audit L-U2 — the credentials list goes too (like perStartPortFiles /
+    // deprovision): a parked attempt's logins must not be picked up by the next
+    // batch on this start port.
+    for (const f of [buildStartupScriptPath(sp), buildIpv6ListPath(sp), buildCredentialsListPath(sp), path.join(PROXY_ROOT, `running_server_${sp}.info`)]) {
       await safeUnlink(f);
     }
     return { parked: true, killed: kill.killed, cfg: `${path.basename(cfgPath)}.failed` };
@@ -3537,6 +3540,25 @@ async function handleGenerate(req, res) {
       }
     }
 
+    // Audit L-U2 — no 3proxy serves this start port (the ps scan succeeded and
+    // matched nothing), so a random_users_<p>.list or an ipv6_<p>.list of the
+    // wrong length is a leftover of a released batch: its logins would be
+    // resold / its addresses would not fit the new ports. Drop it before the
+    // generator runs (an explicit identical credentials file is kept: the FO-06
+    // retry contract; an ipv6 list with exactly proxyCount lines is kept too).
+    if (instanceStateBefore.ok && !instanceStateBefore.instances.some((x) => x.startPort === params.startPort || x.cfgPath === cfgPath)) {
+      const staleLists = await dropStaleBatchLists({
+        startPort: params.startPort,
+        proxyCount: params.proxyCount,
+        keepCredentialsFile: Boolean(credentialLines) && (await credentialsFileState(credentialsPath, credentialLines)) === "same",
+      });
+      jobMeta.result.staleLists = staleLists;
+      await writeJobMetadata(metadataPath, jobMeta);
+      if (staleLists.credentials === "dropped" || staleLists.ipv6 === "dropped") {
+        console.warn("[generate] stale per-start-port list(s) dropped", { jobId, start_port: params.startPort, ...staleLists });
+      }
+    }
+
     const effectiveArgs = await buildGeneratorArgs({
       rawArgs: rawGeneratorArgs,
       scriptPath,
@@ -3561,11 +3583,7 @@ async function handleGenerate(req, res) {
     if (freshAddresses) {
       // AMENDMENT A1 — the dropped list's /64s go back to the per-GB pool
       // unless something per-piece still names them.
-      const staleNets = pergbPool.poolPresent() ? pergbPool.collectFileNets([buildIpv6ListPath(params.startPort)]) : new Set();
-      await safeUnlink(buildIpv6ListPath(params.startPort));
-      if (staleNets.size) {
-        await pergbPool.releaseUnusedNets(staleNets, { proxyRoot: PROXY_ROOT, ref: pergbPool.newRef("fresh", params.startPort) });
-      }
+      await dropIpv6List(params.startPort, "fresh");
     }
 
     markJobStatus(jobMeta, "running");
@@ -4781,6 +4799,9 @@ module.exports = {
   pergbServer,
   vpn,
   // Audit S-ORCH-1 / S-NODE-2 / L-U2 — lane node-agent-hardening.
+  parkFailedAttempt,
+  dropStaleBatchLists,
+  dropIpv6List,
   handleAgentRequest,
   allowPlainHttp,
   plainListenHost,
@@ -4800,4 +4821,55 @@ function allowPlainHttp(env = process.env) {
 
 function plainListenHost(env = process.env) {
   return allowPlainHttp(env) ? LISTEN_HOST : "127.0.0.1";
+}
+
+// Audit L-U2 — drop the ipv6_<p>.list of a start port; its pool /64s go back to
+// the per-GB pool unless something per-piece still names them (AMENDMENT A1).
+async function dropIpv6List(startPort, refKind) {
+  const listPath = buildIpv6ListPath(startPort);
+  const staleNets = pergbPool.poolPresent() ? pergbPool.collectFileNets([listPath]) : new Set();
+  await safeUnlink(listPath);
+  if (staleNets.size) {
+    await pergbPool.releaseUnusedNets(staleNets, { proxyRoot: PROXY_ROOT, ref: pergbPool.newRef(refKind, startPort) });
+  }
+}
+
+// Audit L-U2 — the leftovers of a batch no 3proxy serves any more. The
+// credentials list (random_users_<p>.list) is removed unless the caller keeps it
+// (explicit identical credentials, the FO-06 retry contract); the address list
+// only when its line count differs from proxyCount (an equal-count list is a
+// retry that keeps its addresses and its pool /64s). Counts only, never the
+// contents. -> { credentials, credentialsLines, ipv6, ipv6Lines } with
+// "absent" | "kept" | "dropped".
+async function dropStaleBatchLists({ startPort, proxyCount, keepCredentialsFile = false }) {
+  const out = { credentials: "absent", credentialsLines: 0, ipv6: "absent", ipv6Lines: 0 };
+  const readLines = async (filePath) => {
+    try {
+      return credentialLinesOf(await fsp.readFile(filePath, "utf-8")).length;
+    } catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      throw error;
+    }
+  };
+  const credLines = await readLines(buildCredentialsListPath(startPort));
+  if (credLines !== null) {
+    out.credentialsLines = credLines;
+    if (keepCredentialsFile) {
+      out.credentials = "kept";
+    } else {
+      await safeUnlink(buildCredentialsListPath(startPort));
+      out.credentials = "dropped";
+    }
+  }
+  const ipv6Lines = await readLines(buildIpv6ListPath(startPort));
+  if (ipv6Lines !== null) {
+    out.ipv6Lines = ipv6Lines;
+    if (ipv6Lines === Number(proxyCount)) {
+      out.ipv6 = "kept";
+    } else {
+      await dropIpv6List(startPort, "stale");
+      out.ipv6 = "dropped";
+    }
+  }
+  return out;
 }
