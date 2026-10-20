@@ -91,7 +91,7 @@ On your ORCHESTRATOR machine, run:
     -H "Content-Type: application/json" \\
     -d '{
       "name": "$NODE_NAME",
-      "url": "http://$NODE_IP:8085",
+      "url": "https://$NODE_IP:8086",
       "geo": "$GEO_CODE",
       "capacity": 4000,
       "weight": 100,
@@ -105,7 +105,7 @@ Then bind to the geo's SKU (replace SKU_ID with the row id from skus table):
 INSERT INTO sku_node_bindings (sku_id, node_id, is_active)
 SELECT s.id, n.id, TRUE
 FROM skus s
-JOIN nodes n ON n.url = 'http://$NODE_IP:8085'
+JOIN nodes n ON n.url IN ('https://$NODE_IP:8086', 'http://$NODE_IP:8085')
 WHERE s.code = 'ipv6_$(echo "$GEO_CODE" | tr '[:upper:]' '[:lower:]')'
 ON CONFLICT (sku_id, node_id) DO UPDATE SET is_active = TRUE;
 EOF

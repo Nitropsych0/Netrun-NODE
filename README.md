@@ -1482,3 +1482,24 @@ client_os_profile_enforcement=not_controlled_by_proxy
 ipv6_policy=ipv6_only
 effective_ipv6_policy=ipv6_only
 ```
+
+<!-- --- lane: node-agent-hardening --- -->
+## Agent API over TLS (:8086) — audit S-ORCH-1
+
+`handleAgentRequest` (the plain listener's request handler) is also the handler of the TLS listener
+`pergb_tls_server.js`: every path that is not `/pergb*` or `/vpn*` is passed to it untouched, so
+`/health`, `/describe`, `/generate`, `/jobs`, `/deprovision`, `/egress`, `/firewall/desired`,
+`/accounting`, … behave identically over `https://<IP>:8086` and `http://<IP>:8085` — each route keeps
+its own `X-API-KEY` check (a keyless `/health` is still the liveness `{ok:true}`). The listener now
+opens on every node that has its IP certificate (lego `<ip>.crt/.key`, else `node.pem`), not only
+where per-GB is installed (`NETRUN_AGENT_TLS_REQUIRE_PERGB=1` brings the old gate back); the firewall
+gate is unchanged (`agent_firewall_without_8086` keeps it closed on a guard that lacks 8086 — run
+`netrun-harden agent-firewall`). `/health` → `pergb.tls.routes` is `"full"` (`"pergb_only"` for a
+listener built without the agent handler); `/describe` → `supports.agent_tls = 1`,
+`supports.agent_tls_port`.
+
+`NODE_AGENT_ALLOW_PLAIN_HTTP` (default `true`): the plain `:8085` stays on `NODE_AGENT_HOST`. `false`
+binds it to `127.0.0.1` only (the node-local callers — watchdog_probe, `netrun-harden agent-key`, the
+generator's `/pergb/reserve_nets` — keep working); do it only when the orchestrator shows no `http://`
+node URLs. Enrollment URLs printed by `bootstrap_new_node.sh` / sent by `quick-install.sh` are
+`https://<IP>:8086`. `netrun-harden status` reports `A3 agent TLS :8086: listening|closed`.

@@ -16,8 +16,19 @@
 // the two amendment-A1 routes the node itself uses (the generator, per-piece
 // deprovision): POST /pergb/reserve_nets and /pergb/release_nets.
 //
-// The listener opens only on a node where per-GB is installed
-// (deploy/node/install_pergb.sh made /etc/netrun-pergb) and never while the
+// Audit S-ORCH-1 — when createTlsServer gets an `agentHandler` (server.js's
+// handleAgentRequest, the plain listener's own request handler) this listener
+// serves EVERY agent route, not only /pergb/* and /vpn/*: /health, /describe,
+// /generate, /deprovision, /egress, /firewall/desired, ... go to that handler
+// with the request body untouched, so each route keeps its own X-API-KEY check
+// and behaves the same over :8085 and :8086. The orchestrator then talks to the
+// node over https (verified against the fleet root) and :8085 can be switched
+// off (NODE_AGENT_ALLOW_PLAIN_HTTP=false) or bound to loopback.
+//
+// Without an agentHandler the listener opens only on a node where per-GB is
+// installed (deploy/node/install_pergb.sh made /etc/netrun-pergb); with one it
+// opens on every node that has its IP certificate (NETRUN_AGENT_TLS_REQUIRE_PERGB=1
+// restores the per-GB-only gate). In both modes it never opens while the
 // node's agent firewall (netrun-harden agent-firewall, table
 // inet netrun_agent_guard) exists without 8086: deploying this agent fleet-wide
 // must not put a new internet-facing port on nodes guarded before 8086
@@ -34,7 +45,10 @@ const BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_PORT = 8086;
 const CERT_CHECK_MS = 30000;
 
-function readSettings(env = process.env) {
+function readSettings(env = process.env, opts = {}) {
+  // Audit S-ORCH-1 — with the full agent API on this listener the per-GB
+  // install marker is no gate any more (default off); the firewall gate stays.
+  const requireInstalledDefault = opts.agentHandler ? env.NETRUN_AGENT_TLS_REQUIRE_PERGB || "0" : env.NETRUN_PERGB_TLS_REQUIRE_INSTALLED || "1";
   return {
     port: Number(env.NETRUN_PERGB_TLS_PORT || DEFAULT_PORT),
     host: String(env.NETRUN_PERGB_TLS_HOST || "0.0.0.0"),
@@ -47,7 +61,7 @@ function readSettings(env = process.env) {
     installedDir: String(env.NETRUN_PERGB_ETC_DIR || "/etc/netrun-pergb"),
     // VPN (owner 2026-10-15): /vpn/* share this listener; a VPN-only node opens it too
     vpnInstalledDir: String(env.NETRUN_VPN_ETC_DIR || "/etc/netrun-vpn"),
-    requireInstalled: !/^(0|off|false|no)$/i.test(String(env.NETRUN_PERGB_TLS_REQUIRE_INSTALLED || "1")),
+    requireInstalled: !/^(0|off|false|no)$/i.test(String(requireInstalledDefault)),
     requireFirewall: !/^(0|off|false|no)$/i.test(String(env.NETRUN_PERGB_TLS_REQUIRE_FIREWALL || "1")),
   };
 }
@@ -146,7 +160,8 @@ function defaultPrimaryIp(run) {
 
 // deps: { pergb, vpn?, apiKeyMatches(given) -> bool, env, log, run, primaryIp() }
 function createTlsServer(deps) {
-  const settings = { ...readSettings(deps.env || process.env), ...(deps.settings || {}) };
+  const agentHandler = typeof deps.agentHandler === "function" ? deps.agentHandler : null;
+  const settings = { ...readSettings(deps.env || process.env, { agentHandler }), ...(deps.settings || {}) };
   const log = deps.log || console;
   const pergb = deps.pergb;
   const vpn = deps.vpn || null;
@@ -191,6 +206,10 @@ function createTlsServer(deps) {
       return sendJson(res, 400, { success: false, error: "bad_request" });
     }
     const p = url.pathname;
+    // Audit S-ORCH-1 — every non-/pergb, non-/vpn path is the agent's own API:
+    // hand the untouched request (body unread) to its handler, which does the
+    // X-API-KEY check per route and answers /health keyless with {ok:true}.
+    if (agentHandler && p !== "/pergb" && !p.startsWith("/pergb/") && p !== "/vpn" && !p.startsWith("/vpn/")) return agentHandler(req, res);
     if (req.method === "GET" && p === "/health") return sendJson(res, 200, { ok: true });
     if (!keyOk(req.headers["x-api-key"])) return sendJson(res, 401, { success: false, error: "unauthorized" });
     const q = Object.fromEntries(url.searchParams.entries());
@@ -327,6 +346,7 @@ function createTlsServer(deps) {
       reloads,
       error: lastError,
       gate,
+      routes: agentHandler ? "full" : "pergb_only",
     };
   }
 

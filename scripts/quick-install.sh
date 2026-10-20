@@ -128,12 +128,14 @@ ok "node-agent ready"
 # Get the box's public IPv4 for orchestrator URL
 PUBLIC_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | head -1 | grep -oE 'src [0-9.]+' | sed 's/src //')
 [ -z "$PUBLIC_IP" ] && die "could not determine public IPv4 of this box"
-NODE_URL="http://${PUBLIC_IP}:8085"
+# Audit S-ORCH-1: the orchestrator reaches the agent over the TLS listener
+# (:8086, the node's IP certificate; same routes and X-API-KEY as plain :8085).
+NODE_URL="https://${PUBLIC_IP}:8086"
 log "    Node URL: $NODE_URL"
 
 # === 5. Register with orchestrator ===
 # Schema (orchestrator/api_schemas.py:EnrollRequest):
-#   agent_url    (required) — node-agent HTTP URL
+#   agent_url    (required) — node-agent URL (https://<ip>:8086)
 #   name         (optional) — human-readable name
 #   geo_code     (optional) — 2-letter country code
 #   api_key      the node-agent key install_node_v2.sh generated (audit

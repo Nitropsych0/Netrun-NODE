@@ -75,3 +75,19 @@ test("buildDescribe keeps max_batch_size 1500 / max_parallel_jobs 1 and exposes 
   assert.strictEqual(d.capacity_model.perProxyKb, 100);
   assert.strictEqual(d.capacity_model.portCeiling, 27436);
 });
+
+// Audit S-ORCH-1 — the TLS listener serves the whole agent API: /describe says
+// so whether or not per-GB (pergbRadius) is installed.
+test("buildDescribe advertises supports.agent_tls / agent_tls_port regardless of per-GB", async () => {
+  for (const pergbRadius of [false, true]) {
+    const d = await describe.buildDescribe({ pergbRadius, pergbTlsPort: 8086 });
+    assert.strictEqual(d.supports.agent_tls, 1, `pergbRadius=${pergbRadius}`);
+    assert.strictEqual(d.supports.agent_tls_port, 8086);
+  }
+  const d = await describe.buildDescribe({});
+  assert.strictEqual(d.supports.agent_tls, 1);
+  assert.strictEqual(d.supports.agent_tls_port, 8086);
+  assert.strictEqual(d.supports.pergb_tls_port, null, "per-GB's own marker is unchanged");
+  const custom = await describe.buildDescribe({ pergbTlsPort: 9443 });
+  assert.strictEqual(custom.supports.agent_tls_port, 9443);
+});

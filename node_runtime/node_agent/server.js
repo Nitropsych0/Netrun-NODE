@@ -162,7 +162,9 @@ function ensureAuthorized(req) {
 
 const pergb = pergbStateLib.createPergb();
 const vpn = vpnLib.createVpn();
-const pergbServer = pergbTlsLib.createTlsServer({ pergb, vpn, apiKeyMatches: (given) => apiKeyMatches(given) });
+// Audit S-ORCH-1 — the TLS listener serves the same routes as :8085
+// (agentHandler = the plain listener's own request handler, hoisted below).
+const pergbServer = pergbTlsLib.createTlsServer({ pergb, vpn, apiKeyMatches: (given) => apiKeyMatches(given), agentHandler: handleAgentRequest });
 // Per-piece allocators (egress.js, deprovision, rebind) reserve and release
 // pool /64s through the agent's per-GB service: one ctl client, and the
 // excluded set the kills and attribution skip learns each /64 at once.
@@ -4362,7 +4364,7 @@ async function handleDescribe(req, res) {
   sendJson(res, 200, payload);
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleAgentRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   const pathname = url.pathname;
 
@@ -4635,7 +4637,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   sendJson(res, 404, { success: false, status: "failed", error: "not_found" });
-});
+}
+
+const server = http.createServer(handleAgentRequest);
 
 // Wave HTTP.A — only bind the port when run as the entrypoint, so unit
 // tests can ``require`` this module and exercise the pure helpers below
@@ -4644,7 +4648,7 @@ const server = http.createServer(async (req, res) => {
 // Wave FLEET-HEALTH (RES-10) — bind PORT on LISTEN_HOST (NODE_AGENT_HOST,
 // default 0.0.0.0). Exported so a test can assert the arguments with a fake.
 function listenAgent(srv = server, onListening = () => {}) {
-  return srv.listen(PORT, LISTEN_HOST, onListening);
+  return srv.listen(PORT, plainListenHost(), onListening);
 }
 
 if (require.main === module) {
@@ -4657,7 +4661,7 @@ if (require.main === module) {
   loadSampler.start();
   listenAgent(server, () => {
     console.log(
-      `[node-agent] listening on ${LISTEN_HOST}:${PORT}, jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}, jobs_keep=${JOBS_KEEP}, rebind_policy=${REBIND_POLICY}`
+      `[node-agent] listening on ${plainListenHost()}:${PORT} (plain_http=${allowPlainHttp()}), jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}, jobs_keep=${JOBS_KEEP}, rebind_policy=${REBIND_POLICY}`
     );
     // Wave FLEET-HEALTH — trim the job-directory backlog once, a minute after
     // start (the live node carried 1500 of them).
@@ -4776,4 +4780,24 @@ module.exports = {
   pergb,
   pergbServer,
   vpn,
+  // Audit S-ORCH-1 / S-NODE-2 / L-U2 — lane node-agent-hardening.
+  handleAgentRequest,
+  allowPlainHttp,
+  plainListenHost,
 };
+
+// --- lane: node-agent-hardening ---
+// Audit S-ORCH-1 — NODE_AGENT_ALLOW_PLAIN_HTTP (default true in this release):
+// :8085 stays a plain-HTTP listener on NODE_AGENT_HOST for orchestrators that
+// still call http://<ip>:8085. false = the cleartext port is loopback-only (the
+// node-local callers: watchdog_probe, `netrun-harden agent-key`, the
+// generator's /pergb/reserve_nets) and the orchestrator reaches the agent only
+// over the TLS listener :8086. Read at call time (function, not a const) so
+// it is safe above the entrypoint block.
+function allowPlainHttp(env = process.env) {
+  return !/^(0|off|false|no)$/i.test(String(env.NODE_AGENT_ALLOW_PLAIN_HTTP ?? "true").trim());
+}
+
+function plainListenHost(env = process.env) {
+  return allowPlainHttp(env) ? LISTEN_HOST : "127.0.0.1";
+}
