@@ -1482,3 +1482,35 @@ client_os_profile_enforcement=not_controlled_by_proxy
 ipv6_policy=ipv6_only
 effective_ipv6_policy=ipv6_only
 ```
+
+<!-- lane: node-pergb-runtime -->
+## Per-GB runtime limits and signals
+
+### Slice limits: one sizing rule, reported back (P-U1)
+
+`netrun-pergb.slice` is sized from RAM in one rule, implemented in `pergb_runtime.js`
+(`maxConnsForRam`, `tasksMax`) and mirrored by `install_pergb.sh` `render_slices`
+(`scripts/test_install_pergb.sh` pins both to the same numbers):
+
+```text
+maxConns  <= MemoryMax / 100 KB - 2 x ports - 500      (RAM ceiling; clamped, with a warning)
+TasksMax   = 2 x ports + maxConns + 500                 (<= MemoryMax / 100 KB)
+```
+
+With the defaults (1536M, 1000 ports) the ceiling is 13228 connections and a default
+`maxConns` of 8000 gives `TasksMax=10500` — that figure in `deploy/node/netrun-pergb.slice`
+is only the default; the live value is the enable drop-in's. 22500 tasks (maxConns 20000)
+need `MemoryMax` of ~2.2G. `POST /pergb/enable` clamps a bigger `maxConns` instead of
+refusing it (an old orchestrator keeps working) and says so; a `sliceMemMax` too small for
+its ports (ceiling < 100) is `bad_params`.
+
+`GET /pergb/status` and the `POST /pergb/enable` response carry the EFFECTIVE limits as
+integers — `tasksMax`, `maxConns`, `sliceMemMax` (`null` while per-GB is off) — and
+`warnings: []` (`"max_conns_clamped"` while the requested `maxConns`, kept in
+`enable.json` `params`, is above the effective one). The enable response also has
+`applied.maxConnsRequested` / `applied.warnings`. Verify the live slice on every per-GB node:
+
+```bash
+systemctl show netrun-pergb.slice -p TasksMax -p MemoryMax
+cat /etc/systemd/system/netrun-pergb.slice.d/50-netrun-enable.conf
+```

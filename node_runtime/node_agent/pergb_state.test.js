@@ -221,6 +221,10 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     assert.strictEqual(r.json.subnets, "0000-fffe");
     assert.strictEqual(r.json.egressIpv4, EGRESS, "option A: the primary IPv4");
     assert.strictEqual(r.json.radius.ready, true);
+    // P-U1: the effective slice limits, integers (the orchestrator reads them)
+    assert.deepStrictEqual([r.json.tasksMax, r.json.maxConns, r.json.sliceMemMax], [10500, 8000, 1610612736]);
+    assert.deepStrictEqual(r.json.warnings, []);
+    assert.deepStrictEqual(r.json.conns.max, 8000);
     assert.deepStrictEqual(r.json.excludedPush, { ok: true, excluded: 2, scanned: 2, complete: true });
     const pool = fs.readFileSync(path.join(dir, "pergb-pool.conf"), "utf-8");
     assert.match(pool, /^PREFIX=2001:db8:aa::\/48$/m);

@@ -1107,7 +1107,7 @@ function createPergb(deps = {}) {
     startLoops();
     event("pergb_enabled", { base: enableDoc.base, changed: applied.changed.length, restarted: applied.restarted });
     const st = await status();
-    return { status: 200, body: { ...st, applied: { changed: applied.changed, restarted: applied.restarted, started: applied.started, reloaded: applied.reloaded, secretCreated: applied.secretCreated }, excludedPush: ex, ipv4: ipv4Result } };
+    return { status: 200, body: { ...st, applied: { warnings: applied.warnings, maxConnsRequested: applied.maxConnsRequested, changed: applied.changed, restarted: applied.restarted, started: applied.started, reloaded: applied.reloaded, secretCreated: applied.secretCreated }, excludedPush: ex, ipv4: ipv4Result } };
   }
 
   async function reapplyGuard() {
@@ -1403,10 +1403,16 @@ function createPergb(deps = {}) {
     }
     const g = guards.status();
     const m = meter.status();
+    const lim = rt.limitsOfEnable(e);
     return {
       success: true,
       enabled: Boolean(e && e.enabled === true),
       version: VERSION,
+      // the effective slice limits (after the RAM ceiling), integers or null
+      tasksMax: lim.tasksMax,
+      maxConns: lim.maxConns,
+      sliceMemMax: lim.sliceMemMax,
+      warnings: [...lim.warnings],
       base: e ? e.base : null,
       count: e ? e.count : null,
       last: e ? e.last : null,

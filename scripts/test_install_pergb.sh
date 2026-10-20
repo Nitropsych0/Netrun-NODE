@@ -253,6 +253,21 @@ grep -qx 'MemoryMax=3072M' "$U/netrun-pergb.slice" || fail "slice re-rendered"
 [ "$(cat "$CALLS")" = "systemctl daemon-reload" ] || fail "third run commands: $(cat "$CALLS")"
 ok "a changed setting rewrites only the slice (+ daemon-reload)"
 
+# P-U1: maxConns above the RAM ceiling (MemoryMax / 100 KB - 2 x 1000 - 500) is clamped
+# with a warning, TasksMax = 2 x 1000 + effective maxConns + 500 = MemoryMax / 100 KB
+new_root ram
+out="$(NETRUN_PERGB_MEM_MAX=1536M NETRUN_PERGB_MAX_CONNS=20000 install_run 2>&1)" || fail "ram clamp run: $out"
+echo "$out" | grep -q 'exceeds what NETRUN_PERGB_MEM_MAX=1536M carries (RAM ceiling 13228) — clamped' || fail "ram clamp warning: $out"
+grep -qx 'TasksMax=15728' "$R/etc/systemd/system/netrun-pergb.slice" || fail "ram clamp TasksMax: $(grep = "$R/etc/systemd/system/netrun-pergb.slice")"
+new_root ram2
+out="$(NETRUN_PERGB_MEM_MAX=3G NETRUN_PERGB_MAX_CONNS=20000 install_run 2>&1)" || fail "roomy run: $out"
+echo "$out" | grep -q 'clamped' && fail "3G carries 20000 connections: $out"
+grep -qx 'TasksMax=22500' "$R/etc/systemd/system/netrun-pergb.slice" || fail "roomy TasksMax"
+# the shell and the agent apply the same formula
+want="$(node -e 'const rt=require(process.argv[1]);const p=rt.normalizeParams({base:31000,egressIpv4:"203.0.113.10",maxConns:20000,sliceMemMax:"1536M"}).params;console.log(rt.tasksMax(p))' "$ROOT_DIR/node_runtime/node_agent/pergb_runtime.js")" || fail "node: $want"
+[ "$want" = 15728 ] || fail "pergb_runtime.js tasksMax for 1536M / 20000 = $want, the installer says 15728"
+ok "RAM ceiling: maxConns clamped with a warning, TasksMax from RAM, same numbers as pergb_runtime.js"
+
 # ── 3. refusals: nothing changes ──────────────────────────────────
 refused() { # <label> <expected message>
   local out

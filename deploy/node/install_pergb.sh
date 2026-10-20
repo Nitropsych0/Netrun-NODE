@@ -42,7 +42,8 @@
 #   units (installed, daemon-reload, NOT enabled or started): netrun-pergb.target,
 #     netrun.slice + netrun-pergb.slice (NETRUN_PERGB_CPU_WEIGHT 50,
 #     NETRUN_PERGB_MEM_MAX 1536M -> MemoryHigh 85 %, NETRUN_PERGB_MAX_CONNS
-#     8000 -> TasksMax), netrun-pergb-3proxy@.service, netrun-pergb-haproxy.service,
+#     8000 -> TasksMax; maxConns is capped by RAM: MemoryMax / 100 KB - 2 x 1000
+#     listeners - 500, with a warning), netrun-pergb-3proxy@.service, netrun-pergb-haproxy.service,
 #     netrun-pergb-certs.path/.service, the log mount, and netrun-radius.socket /
 #     .service when the checkout has them.
 #
@@ -166,6 +167,7 @@ preflight() {
   [[ "$CPU_WEIGHT" =~ ^[0-9]+$ ]] && [ "$CPU_WEIGHT" -ge 1 ] && [ "$CPU_WEIGHT" -le 10000 ] || die "NETRUN_PERGB_CPU_WEIGHT must be 1..10000"
   [[ "$MAX_CONNS" =~ ^[0-9]+$ ]] && [ "$MAX_CONNS" -ge 100 ] || die "NETRUN_PERGB_MAX_CONNS must be >= 100"
   [ "$(size_bytes "$MEM_MAX")" -ge $((256 * 1024 * 1024)) ] || die "NETRUN_PERGB_MEM_MAX must be at least 256M"
+  [ $(($(size_bytes "$MEM_MAX") / 102400 - 2 * PORT_COUNT - 500)) -ge 100 ] || die "NETRUN_PERGB_MEM_MAX is too small for $PORT_COUNT ports"
   # uid / gid 65533: free, or netrun-pergb's
   u="$(id_of_user "$PERGB_USER")"
   [ -z "$u" ] || [ "$u" = "$PERGB_UID" ] || die "uid_taken: user $PERGB_USER exists with uid $u, expected $PERGB_UID"
@@ -314,10 +316,19 @@ ensure_logging() {
 }
 
 render_slices() {
-  local max high tasks
+  local max high tasks conns ceiling
   max="$(size_bytes "$MEM_MAX")"
   high=$((max * 85 / 100 / 1024 / 1024))
-  tasks=$((2 * PORT_COUNT + MAX_CONNS + 500))
+  # The same sizing rule as node_agent/pergb_runtime.js (maxConnsForRam, tasksMax;
+  # scripts/test_install_pergb.sh pins them together): a connection costs ~100 KB
+  # of MemoryMax, so maxConns is capped by RAM and TasksMax follows from it.
+  conns="$MAX_CONNS"
+  ceiling=$((max / 102400 - 2 * PORT_COUNT - 500))
+  if [ "$conns" -gt "$ceiling" ]; then
+    log "WARNING: NETRUN_PERGB_MAX_CONNS=$conns exceeds what NETRUN_PERGB_MEM_MAX=$MEM_MAX carries (RAM ceiling $ceiling) — clamped"
+    conns="$ceiling"
+  fi
+  tasks=$((2 * PORT_COUNT + conns + 500))
   ensure_file "$UNIT_DIR/netrun-pergb.slice" 0644 root root < <(
     sed -e "s/^CPUWeight=.*/CPUWeight=$CPU_WEIGHT/" -e "s/^MemoryHigh=.*/MemoryHigh=${high}M/" \
         -e "s/^MemoryMax=.*/MemoryMax=$((max / 1024 / 1024))M/" -e "s/^TasksMax=.*/TasksMax=$tasks/" \

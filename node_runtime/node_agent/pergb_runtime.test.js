@@ -213,6 +213,40 @@ test("procRanges / normalizeParams / slice drop-ins", () => {
   for (let i = 0; i < 20; i += 1) assert.match(rt.newSecret(), /^[A-Za-z0-9]{40}$/);
 });
 
+test("P-U1: TasksMax is sized from RAM in one place — maxConns above MemoryMax / 100 KB is clamped and says so", () => {
+  const MEM = 1536 * 1024 * 1024;
+  // the ceiling: MemoryMax / 100 KB, less the listener threads and the margin
+  assert.strictEqual(rt.maxConnsForRam(MEM, 1000), 15728 - 2000 - 500);
+  const norm = (extra) => rt.normalizeParams({ base: 31000, egressIpv4: IPV4, ...extra });
+  // the load-test notes' 22500 (maxConns 20000 on 1536M) is not carried by this RAM
+  const big = norm({ maxConns: 20000, sliceMemMax: "1536M" });
+  assert.ok(big.ok);
+  assert.strictEqual(big.params.maxConns, 13228);
+  assert.deepStrictEqual(big.warnings, ["max_conns_clamped"]);
+  assert.strictEqual(big.maxConnsRequested, 20000);
+  assert.strictEqual(rt.tasksMax(big.params), 15728, "TasksMax never exceeds MemoryMax / 100 KB");
+  assert.match(rt.renderSliceDropin(big.params), /^TasksMax=15728$/m);
+  // within the ceiling nothing changes (the default 8000 -> 10500 stays)
+  const ok = norm({ maxConns: 8000 });
+  assert.deepStrictEqual(ok.warnings, []);
+  assert.strictEqual(rt.tasksMax(ok.params), 10500);
+  // 22500 tasks need ~2.2 GB: with 3G the same 20000 is accepted as is
+  const roomy = norm({ maxConns: 20000, sliceMemMax: "3G" });
+  assert.strictEqual(roomy.params.maxConns, 20000);
+  assert.strictEqual(rt.tasksMax(roomy.params), 22500);
+  assert.deepStrictEqual(roomy.warnings, []);
+  // a slice too small for its ports is refused, not clamped to nonsense
+  const tiny = rt.normalizeParams({ base: 31000, count: 3000, egressIpv4: IPV4, sliceMemMax: "256M" });
+  assert.strictEqual(tiny.error, "bad_params");
+  assert.deepStrictEqual(rt.effectiveLimits(big.params), { tasksMax: 15728, maxConns: 13228, sliceMemMax: MEM });
+  // from enable.json: null for a node without per-GB; the clamp stays visible
+  assert.deepStrictEqual(rt.limitsOfEnable(null), { tasksMax: null, maxConns: null, sliceMemMax: null, warnings: [] });
+  assert.deepStrictEqual(
+    rt.limitsOfEnable({ enabled: true, count: 1000, maxConns: 13228, sliceMemMax: MEM, params: { maxConns: 20000 } }),
+    { tasksMax: 15728, maxConns: 13228, sliceMemMax: MEM, warnings: ["max_conns_clamped"] },
+  );
+});
+
 // ── apply against a fake node ────────────────────────────────────────────
 
 const BIN = Buffer.from("fake 3proxy-pergb binary\n");
@@ -403,6 +437,24 @@ test("apply: fresh node — files, modes, secret, enable.json, target enabled an
     ["netrun-pergb-3proxy@31500.service", 31500, 31999, true],
   ]);
   assert.ok(s.enabled && s.haproxy.active && s.target.active && s.target.enabled);
+});
+
+test("P-U1: apply clamps maxConns to the RAM ceiling and reports the effective limits (drop-in, runtime set-property, result)", async () => {
+  const n = makeNode("ramclamp");
+  const res = await rt.apply({ ...ENABLE, maxConns: 20000 }, n.deps);
+  assert.ok(res.ok, JSON.stringify(res));
+  assert.deepStrictEqual([res.tasksMax, res.maxConns, res.sliceMemMax], [15728, 13228, 1536 * 1024 * 1024]);
+  assert.deepStrictEqual(res.warnings, ["max_conns_clamped"]);
+  assert.strictEqual(res.maxConnsRequested, 20000);
+  assert.match(fs.readFileSync(path.join(n.settings.systemdDir, "netrun-pergb.slice.d/50-netrun-enable.conf"), "utf8"), /^TasksMax=15728$/m);
+  assert.ok(n.calls.some((c) => /set-property --runtime netrun-pergb\.slice .*TasksMax=15728/.test(c)), n.calls.join("\n"));
+  const e = rt.readEnable(n.settings);
+  assert.strictEqual(e.maxConns, 13228, "enable.json holds the effective value; the request stays in params");
+  assert.strictEqual(e.params.maxConns, 20000);
+  assert.deepStrictEqual(rt.limitsOfEnable(e).warnings, ["max_conns_clamped"]);
+  // the next apply with the same body is still a no-op (idempotent clamp)
+  const again = await rt.apply({ ...ENABLE, maxConns: 20000 }, n.deps);
+  assert.deepStrictEqual(again.changed, []);
 });
 
 test("apply: the same params again write nothing and restart / reload / start nothing", async () => {

@@ -219,7 +219,7 @@ function fakeRuntime(rtSettings) {
         fs.writeFileSync(rtSettings.enablePath, text);
         changed.push(rtSettings.enablePath);
       }
-      return { ok: true, changed, restarted: prev && prev.family !== p.family ? layout.map((r) => r.unit) : [], started: [], stopped: [], reloaded: [], procs: layout, secretCreated: false };
+      return { ok: true, warnings: n.warnings, maxConnsRequested: n.maxConnsRequested, changed, restarted: prev && prev.family !== p.family ? layout.map((r) => r.unit) : [], started: [], stopped: [], reloaded: [], procs: layout, secretCreated: false };
     },
     // the agent-start haproxy refresh: nothing to do on a fake node
     async refreshHaproxy() {
