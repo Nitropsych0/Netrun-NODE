@@ -5,7 +5,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Tmwyw/node_runtime_new/main/scripts/quick-install.sh \
 #     | bash -s -- \
-#         --orch-url http://51.38.205.194:8090 \
+#         --orch-url https://orch.example.com \
 #         --orch-api-key YOUR_API_KEY_HERE \
 #         --node-name "NETRUN Frankfurt" \
 #         --geo DE
@@ -33,13 +33,14 @@ CAPACITY=4000
 WEIGHT=100
 MAX_PARALLEL_JOBS=1
 MAX_BATCH_SIZE=1500
+ALLOW_INSECURE_HTTP=false
 
 usage() {
   cat <<'USAGE'
 Usage: quick-install.sh --orch-url URL --orch-api-key KEY --node-name "NAME" --geo XX [opts]
 
 Required:
-  --orch-url URL          Orchestrator HTTP base URL (e.g. http://51.38.205.194:8090)
+  --orch-url URL          Orchestrator base URL, https:// only (e.g. https://orch.example.com)
   --orch-api-key KEY      Orchestrator API key (from /opt/netrun-orchestrator/.env on orch host)
   --node-name "NAME"      Human-readable name (e.g. "NETRUN Frankfurt")
   --geo XX                ISO 2-letter country code (DE/SG/BR/AU/CA/FR/etc.)
@@ -51,10 +52,12 @@ Optional:
   --max-batch-size N      Max ports per job (default 1500)
   --branch NAME           Repo branch to clone (default main)
   --repo URL              Override repo URL (default Tmwyw/node_runtime_new)
+  --allow-insecure-http   Accept an http:// --orch-url (admin key + agent key travel in cleartext;
+                          only on a private network)
 
 Example:
   bash quick-install.sh \
-    --orch-url http://51.38.205.194:8090 \
+    --orch-url https://orch.example.com \
     --orch-api-key xxx \
     --node-name "NETRUN Frankfurt" --geo DE
 USAGE
@@ -72,6 +75,7 @@ while [[ $# -gt 0 ]]; do
     --max-batch-size) MAX_BATCH_SIZE="$2"; shift 2;;
     --branch) REPO_BRANCH="$2"; shift 2;;
     --repo) REPO_URL="$2"; shift 2;;
+    --allow-insecure-http) ALLOW_INSECURE_HTTP=true; shift;;
     -h|--help) usage; exit 0;;
     *) echo "[quick-install] unknown arg: $1" >&2; usage; exit 1;;
   esac
@@ -81,6 +85,12 @@ done
 [ -z "$ORCH_API_KEY" ] && { echo "[quick-install] missing --orch-api-key" >&2; usage; exit 1; }
 [ -z "$NODE_NAME" ] && { echo "[quick-install] missing --node-name" >&2; usage; exit 1; }
 [ -z "$GEO" ] && { echo "[quick-install] missing --geo" >&2; usage; exit 1; }
+# Audit S-U2: the enroll call carries the ADMIN orchestrator API key and the
+# node's agent key — never over cleartext unless the operator says so.
+case "$ORCH_URL" in
+  https://*) ;;
+  *) [ "$ALLOW_INSECURE_HTTP" = true ] || { echo "[quick-install] --orch-url must be https:// (admin key + agent key travel in the request); pass --allow-insecure-http only on a private network" >&2; exit 1; } ;;
+esac
 [ "$(id -u)" -eq 0 ] || { echo "[quick-install] must run as root" >&2; exit 1; }
 
 # Strip trailing slash from orch URL

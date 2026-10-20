@@ -11,12 +11,14 @@ no manual install**. This replaces the old manual runbooks
 > `/v1/nodes/register` contract are identical for any variant — only "who
 > creates the VM" differs.
 
-## Files
+## Where the user_data comes from
 
-| File | Role |
-|------|------|
-| `deploy/node/cloud-init.sh` | The provisioning script. **Single source of truth.** Pasted directly as user_data (Vultr runs `#!`-scripts), or embedded into the YAML wrapper. |
-| `deploy/node/cloud-init.yaml` | Optional `#cloud-config` wrapper that base64-embeds the `.sh` (for UIs that want a cloud-config document). No script duplication. |
+The cloud-init payload is rendered **only by the orchestrator**
+(`orchestrator/deploy/node/cloud-init.sh.tmpl`, delivered by the bot wizard 🅰/🅱
+as `cloud_init_user_data` / `oneliner_command`). The legacy copies in this repo
+(`deploy/node/cloud-init.sh` / `cloud-init.yaml`, which registered over plain
+HTTP unconditionally) were removed in the 2026-10 audit (S-U2): there is no
+other way to build a user_data, and no `sed` recipe to substitute placeholders by hand.
 
 The script does **not** reimplement install logic. It only invokes the baked v2
 scripts already in this repo:
@@ -28,33 +30,19 @@ scripts already in this repo:
 - `scripts/node_followup_v2.sh` — `netrun-watchdog` (v3, two-tier:
   restart→reboot) + the bounded-parallel restore unit.
 
-## How user_data is generated
+## Registration is HTTPS only
 
-The cloud-init script ships with **greppable placeholders** that the generator
-(in variant B: the bot) substitutes **before** handing the payload to Vultr:
-
-| Placeholder | Meaning |
-|-------------|---------|
-| `__ORCH_URL__` | Orchestrator base URL, e.g. `https://orch.netrun.live` (trailing slash optional — stripped). |
-| `__SECRET__` | **One-time, per-job** secret. The server stores only `sha256(secret)`. |
-| `__JOB_ID__` | Optional; for log correlation only. Safe to leave unsubstituted. |
-
-Direct (`.sh`) form — substitute and paste:
-
-```bash
-sed -e "s|__ORCH_URL__|https://orch.netrun.live|" \
-    -e "s|__SECRET__|$JOB_SECRET|" \
-    -e "s|__JOB_ID__|$JOB_ID|" \
-    deploy/node/cloud-init.sh > user_data.sh
-# paste user_data.sh into Vultr "Startup Script / user_data"
-```
-
-YAML (`#cloud-config`) form — substitute, then base64-embed:
-
-```bash
-sed -e ... deploy/node/cloud-init.sh | base64 -w0 > /tmp/ci.b64
-sed "s|__CLOUD_INIT_B64__|$(cat /tmp/ci.b64)|" deploy/node/cloud-init.yaml > user_data.yaml
-```
+The node registers **only** at the orchestrator's `ORCHESTRATOR_REGISTER_URL`,
+which must be `https://` — in production `https://netrun.world/node-register`,
+forwarded by the site to the orchestrator's `:8090` (with `X-NETRUN-Client-IP`).
+There is no fallback to `<ORCHESTRATOR_BASE_URL>/v1/nodes/register`: an
+orchestrator without the variable (or with an `http://` one) refuses to render a
+user_data, and the rendered script itself refuses to send the one-time secret
+and the fresh agent key to anything that is not `https://` (the script still
+exits 0; the orchestrator's watchdog times the job out). The legacy enroll
+one-liner `scripts/quick-install.sh` likewise requires an `https://` `--orch-url`
+(`--allow-insecure-http` opts out, private networks only) because it sends the
+admin orchestrator key.
 
 ## What happens on first boot
 
@@ -65,8 +53,8 @@ sed "s|__CLOUD_INIT_B64__|$(cat /tmp/ci.b64)|" deploy/node/cloud-init.yaml > use
 5. `install_result.ok = (both exit 0)`; `log_tail = tail -n 30` of the log.
 6. `SELF_IP` from `ifconfig.me`, falling back to Vultr metadata
    `http://169.254.169.254/v1/interfaces/0/ipv4/address`.
-7. `POST __ORCH_URL__/v1/nodes/register` (retry 3× with exponential backoff on
-   network failure / 5xx).
+7. `POST $ORCHESTRATOR_REGISTER_URL` (https only; retry 3× with exponential
+   backoff on network failure / 5xx).
 
 All output (including `set -x` trace) is tee'd to **`/var/log/netrun-provision.log`**.
 
@@ -84,7 +72,7 @@ All output (including `set -x` trace) is tee'd to **`/var/log/netrun-provision.l
 
 The **single** integration point between a node and the orchestrator.
 
-- **`POST {ORCH_URL}/v1/nodes/register`**, `Content-Type: application/json`.
+- **`POST {ORCHESTRATOR_REGISTER_URL}`** (https; the orchestrator's `/v1/nodes/register`), `Content-Type: application/json`.
 - **No `X-NETRUN-API-KEY`** — the node is not yet registered and holds no API key.
 - **Auth:** the server computes `sha256(body.secret)` and compares it to
   `node_provisions.shared_secret_hash` for the pending job. Match → register /
@@ -101,6 +89,7 @@ Request body:
 | `install_result.log_tail` | string | Last ~30 lines of `/var/log/netrun-provision.log`. |
 | `hostname` | string | `$(hostname)`. |
 | `agent_version` | string | `git rev-parse --short HEAD` of the cloned repo. |
+| `agent_api_key` | string | The agent key generated on the node (the orchestrator stores it for `X-API-KEY`). |
 
 ```json
 {
@@ -108,7 +97,8 @@ Request body:
   "secret": "b3f1c9e2a7d04f88b1e6c5a2f9d8e7c6",
   "install_result": { "ok": true, "exit_code": 0, "log_tail": "...Install v2 complete..." },
   "hostname": "netrun-tokyo-01",
-  "agent_version": "55bd5e1"
+  "agent_version": "55bd5e1",
+  "agent_api_key": "<64 hex chars>"
 }
 ```
 

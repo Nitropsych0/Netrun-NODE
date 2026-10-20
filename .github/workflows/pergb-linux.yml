@@ -167,6 +167,10 @@ jobs:
         run: |
           shellcheck -S warning deploy/node/netrun-hq-watch.sh scripts/test_hq_watch.sh
           bash scripts/test_hq_watch.sh
+      - name: quick-install registers over https only (audit S-U2) + shellcheck
+        run: |
+          shellcheck -S warning scripts/test_quick_install_https.sh
+          bash scripts/test_quick_install_https.sh
 
   # Lane L9 — node shields: the A1 address pool (generator, egress.js,
   # deprovision), option A / B shields (accounting, firewall, deprovision,
