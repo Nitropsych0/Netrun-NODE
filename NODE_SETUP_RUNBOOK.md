@@ -79,6 +79,7 @@ echo "symlink:    $(readlink /root/proxyserver || echo NOT-A-SYMLINK)"
 echo "pid_max:    $(cat /proc/sys/kernel/pid_max)"
 echo "conntrack:  $(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null) (boot: $(cat /etc/modules-load.d/netrun-conntrack.conf 2>/dev/null | grep -c '^nf_conntrack$'))"
 echo "watchdog:   $(systemctl is-active netrun-watchdog.timer)"
+echo "hq-watch:   $(systemctl is-active netrun-hq-watch.timer)"   # тихий no-op, пока оркестратор не запушил /etc/netrun/hq-watch.env
 echo "restore:    $(systemctl is-enabled netrun-3proxy-restore.service)"
 echo "ufw:        $(command -v ufw >/dev/null && echo PRESENT-BAD || echo absent-ok)"
 REMOTE
@@ -115,7 +116,7 @@ sed -n 's/^Environment=NODE_AGENT_API_KEY=//p' /etc/systemd/system/netrun-node-a
 ```sql
 -- 1. Добавить ноду (api_key = тот же что задан на ноде в 3.1)
 INSERT INTO nodes (id, name, geo, url, api_key, status, runtime_status)
-VALUES ('xx-city-01', 'NETRUN City', 'XX', 'http://<NODE_IP>:8085', '<NODE_API_KEY>', 'ready', 'active');
+VALUES ('xx-city-01', 'NETRUN City', 'XX', 'https://<NODE_IP>:8086', '<NODE_API_KEY>', 'ready', 'active');
 
 -- 2. Привязать SKU к ноде (binding)
 INSERT INTO sku_node_bindings (sku_id, node_id, weight, max_batch_size, is_active)
@@ -225,3 +226,8 @@ PROXY_ALLOW_DEGRADED_NODES=true       # degraded ноды продолжают �
 ---
 
 *Последнее обновление: 2026-05-21. Все 6 нод на v2, 20h+ uptime без падений.*
+
+<!-- --- lane: node-agent-hardening --- -->
+## Агент по TLS (:8086, аудит S-ORCH-1)
+
+Весь API агента (`/health`, `/describe`, `/generate`, `/deprovision`, `/egress`, `/firewall/desired`, `/accounting`, …) отдаётся и на TLS-листенере `https://<IP>:8086` (сертификат на IP узла — lego/`node.pem`, как для per-GB; тот же `X-API-KEY`). Адрес узла в оркестраторе — `https://<IP>:8086`; loopback-примеры `curl http://127.0.0.1:8085/...` остаются валидными. Порядок выката: (1) обновить агент и `netrun-harden secure` (добавляет 8086 в guard, источник — только IP оркестратора); (2) `curl -sk https://127.0.0.1:8086/health` → `{"ok":true}` и в `/health` с ключом `pergb.tls.routes = "full"`, `netrun-harden status` → `A3 agent TLS :8086: listening`; (3) оркестратор переключает `nodes.url` на https; (4) когда `select count(*) from nodes where url like 'http://%'` = 0 — на узлах `NODE_AGENT_ALLOW_PLAIN_HTTP=false` (или `NODE_AGENT_HOST=127.0.0.1`): :8085 слушает только loopback (watchdog, `netrun-harden agent-key`, /pergb/reserve_nets генератора).

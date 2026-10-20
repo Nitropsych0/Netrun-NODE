@@ -19,6 +19,7 @@ const BIN = path.join(TMP, "bin");
 fs.mkdirSync(path.join(PROXY_ROOT, "3proxy"), { recursive: true });
 fs.mkdirSync(BIN, { recursive: true });
 process.env.NODE_AGENT_PROXY_ROOT = PROXY_ROOT;
+process.env.NODE_AGENT_GENERATOR_ROOT = TMP; // audit S-NODE-2: /generate runs generators only from under this root
 process.env.NODE_AGENT_API_KEY = "test-key"; // audit 2026-10-08: the agent fails closed without a key
 process.env.NODE_AGENT_JOBS_ROOT = JOBS_ROOT;
 process.env.NODE_AGENT_CLEANUP_CRON_AFTER_RUN = "0";
@@ -203,4 +204,79 @@ test("reusedItemsMatchCredentials compares socks items in port order", () => {
   ];
   assert.strictEqual(srv.reusedItemsMatchCredentials(items, 18100, ["a:b", "c:d"]), true);
   assert.strictEqual(srv.reusedItemsMatchCredentials(items, 18100, ["a:b", "c:x"]), false);
+});
+
+// ---- Audit L-U2 — stale per-start-port lists ------------------------------
+
+const jobMetaOf = (jobId) => JSON.parse(fs.readFileSync(path.join(JOBS_ROOT, jobId, "job.json"), "utf-8"));
+
+test("POST /generate without credentials drops the stale lists of a batch no 3proxy serves", async () => {
+  fs.writeFileSync(USERS(29100), "old1:old1\n"); // proxyCount is 2
+  fs.writeFileSync(IPV6(29100), "2001:db8::1\n2001:db8::2\n2001:db8::3\n");
+  const r = await post(PORT, genBody("stale-drop", 29100));
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.json.error, "generator_exit_3");
+  const dir = path.join(JOBS_ROOT, "stale-drop");
+  assert.ok(!fs.existsSync(path.join(dir, "seen_users.list")), "the generator saw no stale credentials");
+  assert.ok(!fs.existsSync(path.join(dir, "seen_ipv6")), "the generator saw no wrong-length address list");
+  assert.deepStrictEqual(jobMetaOf("stale-drop").result.staleLists, { credentials: "dropped", credentialsLines: 1, ipv6: "dropped", ipv6Lines: 3 });
+  await settled();
+  assert.ok(!fs.existsSync(USERS(29100)) && !fs.existsSync(IPV6(29100)));
+  assert.deepStrictEqual(fs.readdirSync(PROXY_ROOT).filter((n) => n.includes(".tmp")), [], "no .tmp files under PROXY_ROOT");
+});
+
+test("a same-count credentials file is also dropped when no instance serves the start port (no explicit credentials)", async () => {
+  fs.writeFileSync(USERS(31100), "Aa1:Bb1\nAa2:Bb2\n");
+  const r = await post(PORT, genBody("stale-same-count", 31100));
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.json.error, "generator_exit_3");
+  const dir = path.join(JOBS_ROOT, "stale-same-count");
+  assert.ok(!fs.existsSync(path.join(dir, "seen_users.list")), "a leftover list of a released batch is never handed on");
+  assert.strictEqual(jobMetaOf("stale-same-count").result.staleLists.credentials, "dropped");
+  assert.strictEqual(jobMetaOf("stale-same-count").result.staleLists.credentialsLines, 2);
+  // ...but the explicit-credentials retry with the SAME content keeps the file (the creds-same test above)
+  fs.writeFileSync(USERS(31200), "Aa1:Bb1\nAa2:Bb2\n");
+  const r2 = await post(PORT, genBody("stale-same-explicit", 31200, { credentials: ["Aa1:Bb1", "Aa2:Bb2"] }));
+  assert.strictEqual(r2.json.error, "generator_exit_3");
+  assert.strictEqual(fs.readFileSync(path.join(JOBS_ROOT, "stale-same-explicit", "seen_users.list"), "utf-8"), "Aa1:Bb1\nAa2:Bb2\n");
+  assert.strictEqual(jobMetaOf("stale-same-explicit").result.staleLists.credentials, "kept");
+});
+
+test("an ipv6 list with exactly proxyCount lines is kept (a retry keeps its addresses)", async () => {
+  fs.writeFileSync(IPV6(33100), "2001:db8::1\n2001:db8::2\n");
+  const r = await post(PORT, genBody("stale-ipv6-kept", 33100));
+  assert.strictEqual(r.json.error, "generator_exit_3");
+  assert.ok(fs.existsSync(path.join(JOBS_ROOT, "stale-ipv6-kept", "seen_ipv6")), "the generator saw the list");
+  assert.strictEqual(jobMetaOf("stale-ipv6-kept").result.staleLists.ipv6, "kept");
+  assert.strictEqual(jobMetaOf("stale-ipv6-kept").result.staleLists.ipv6Lines, 2);
+});
+
+test("parkFailedAttempt removes the credentials list of a parked attempt", async () => {
+  fs.writeFileSync(path.join(BIN, "pgrep"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  const cfg = path.join(PROXY_ROOT, "3proxy", "3proxy_35100.cfg");
+  fs.writeFileSync(cfg, "daemon\n");
+  fs.writeFileSync(USERS(35100), "Aa1:Bb1\nAa2:Bb2\n");
+  fs.writeFileSync(IPV6(35100), "2001:db8::1\n2001:db8::2\n");
+  const prev = process.env.NODE_AGENT_PARK_FAILED_ATTEMPTS;
+  process.env.NODE_AGENT_PARK_FAILED_ATTEMPTS = "1";
+  try {
+    const out = await srv.parkFailedAttempt(35100, Date.now() - 1000);
+    assert.strictEqual(out.parked, true, JSON.stringify(out));
+  } finally {
+    if (prev === undefined) delete process.env.NODE_AGENT_PARK_FAILED_ATTEMPTS;
+    else process.env.NODE_AGENT_PARK_FAILED_ATTEMPTS = prev;
+  }
+  assert.ok(fs.existsSync(`${cfg}.failed`), "the cfg is parked");
+  assert.ok(!fs.existsSync(USERS(35100)), "the credentials list is gone");
+  assert.ok(!fs.existsSync(IPV6(35100)), "the address list is gone");
+});
+
+test("dropStaleBatchLists: absent / kept / dropped with the line counts", async () => {
+  assert.deepStrictEqual(await srv.dropStaleBatchLists({ startPort: 37100, proxyCount: 2 }), { credentials: "absent", credentialsLines: 0, ipv6: "absent", ipv6Lines: 0 });
+  fs.writeFileSync(USERS(37100), "a:b\nc:d\n");
+  fs.writeFileSync(IPV6(37100), "2001:db8::1\n2001:db8::2\n");
+  assert.deepStrictEqual(await srv.dropStaleBatchLists({ startPort: 37100, proxyCount: 2, keepCredentialsFile: true }), { credentials: "kept", credentialsLines: 2, ipv6: "kept", ipv6Lines: 2 });
+  assert.ok(fs.existsSync(USERS(37100)), "keepCredentialsFile never unlinks the credentials file");
+  assert.deepStrictEqual(await srv.dropStaleBatchLists({ startPort: 37100, proxyCount: 3 }), { credentials: "dropped", credentialsLines: 2, ipv6: "dropped", ipv6Lines: 2 });
+  assert.ok(!fs.existsSync(USERS(37100)) && !fs.existsSync(IPV6(37100)));
 });

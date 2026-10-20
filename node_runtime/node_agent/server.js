@@ -75,6 +75,13 @@ const DEFAULT_PORTS_LISTEN_WAIT_MS = Math.max(12000, Number(process.env.NODE_AGE
 const DEFAULT_IPV6_EGRESS_URL = String(process.env.NODE_AGENT_IPV6_EGRESS_URL || "https://api64.ipify.org").trim();
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_ROOT = path.join(PROXY_ROOT, "3proxy");
+// Audit S-NODE-2 — /generate executes generators only from under GENERATOR_ROOT
+// (as root!); GENERATOR_SCRIPT is what runs when the request names none. The
+// request's cwd is never honoured.
+const GENERATOR_ROOT = path.normalize(process.env.NODE_AGENT_GENERATOR_ROOT || "/opt/netrun/node_runtime");
+const GENERATOR_SCRIPT = path.normalize(
+  process.env.NODE_AGENT_GENERATOR_SCRIPT || path.join(GENERATOR_ROOT, "soft", "generator", "proxyyy_automated.sh")
+);
 const CLEANUP_CRON_AFTER_RUN = String(process.env.NODE_AGENT_CLEANUP_CRON_AFTER_RUN || "1").trim() !== "0";
 const DEFAULT_FINGERPRINT_PROFILE_VERSION = (
   String(process.env.NODE_AGENT_DEFAULT_FINGERPRINT_PROFILE_VERSION || "v2_android_ipv6_only_dns_custom").trim()
@@ -162,7 +169,9 @@ function ensureAuthorized(req) {
 
 const pergb = pergbStateLib.createPergb();
 const vpn = vpnLib.createVpn();
-const pergbServer = pergbTlsLib.createTlsServer({ pergb, vpn, apiKeyMatches: (given) => apiKeyMatches(given) });
+// Audit S-ORCH-1 — the TLS listener serves the same routes as :8085
+// (agentHandler = the plain listener's own request handler, hoisted below).
+const pergbServer = pergbTlsLib.createTlsServer({ pergb, vpn, apiKeyMatches: (given) => apiKeyMatches(given), agentHandler: handleAgentRequest });
 // Per-piece allocators (egress.js, deprovision, rebind) reserve and release
 // pool /64s through the agent's per-GB service: one ctl client, and the
 // excluded set the kills and attribution skip learns each /64 at once.
@@ -192,16 +201,6 @@ function parseJsonBody(req) {
     });
     req.on("error", reject);
   });
-}
-
-function resolveInputPath(baseDir, inputPath) {
-  if (!inputPath) {
-    return "";
-  }
-  if (path.isAbsolute(inputPath)) {
-    return path.normalize(inputPath);
-  }
-  return path.resolve(baseDir, inputPath);
 }
 
 function toPositiveInt(value, fallback = 0) {
@@ -929,7 +928,10 @@ async function parkFailedAttempt(startPort, sinceMs) {
     const kill = await deprovision.killCfgProcess(sp);
     if (kill.stillAlive) return { parked: false, reason: "still_running", killed: kill.killed };
     await fsp.rename(cfgPath, `${cfgPath}.failed`);
-    for (const f of [buildStartupScriptPath(sp), buildIpv6ListPath(sp), path.join(PROXY_ROOT, `running_server_${sp}.info`)]) {
+    // Audit L-U2 — the credentials list goes too (like perStartPortFiles /
+    // deprovision): a parked attempt's logins must not be picked up by the next
+    // batch on this start port.
+    for (const f of [buildStartupScriptPath(sp), buildIpv6ListPath(sp), buildCredentialsListPath(sp), path.join(PROXY_ROOT, `running_server_${sp}.info`)]) {
       await safeUnlink(f);
     }
     return { parked: true, killed: kill.killed, cfg: `${path.basename(cfgPath)}.failed` };
@@ -3013,15 +3015,8 @@ async function handleGenerate(req, res) {
     return;
   }
   const jobId = normalizeJobId(rawJobId);
+  // Audit S-NODE-2 — generatorScript is optional: empty = NODE_AGENT_GENERATOR_SCRIPT.
   const generatorScript = String(body.generatorScript || "").trim();
-  if (!generatorScript) {
-    sendJson(res, 400, {
-      success: false,
-      status: "failed",
-      error: "generatorScript is required",
-    });
-    return;
-  }
 
   const rawGeneratorArgs = Array.isArray(body.generatorArgs)
     ? body.generatorArgs.map((v) => String(v))
@@ -3050,17 +3045,25 @@ async function handleGenerate(req, res) {
   body.ipv6_policy = requiredIpv6Policy;
 
   const timeoutSec = Math.max(10, Number(body.timeoutSec || DEFAULT_TIMEOUT_SEC) || DEFAULT_TIMEOUT_SEC);
-  const cwd = resolveInputPath(process.cwd(), body.cwd || process.cwd());
-  const scriptPath = resolveInputPath(cwd, generatorScript);
-  if (!(await fileExists(scriptPath))) {
+  // Audit S-NODE-2 — the working directory is the agent's own, never the
+  // request's; the script must resolve (realpath) under NODE_AGENT_GENERATOR_ROOT.
+  const cwd = process.cwd();
+  if (body.cwd && path.resolve(String(body.cwd)) !== cwd) {
+    console.warn("[node-agent] generation job_id=%s ignored request cwd=%s", jobId, String(body.cwd));
+  }
+  const gen = await resolveGeneratorScript(generatorScript);
+  if (!gen.ok) {
     sendJson(res, 400, {
       success: false,
       status: "failed",
-      error: "generator_script_not_found",
-      scriptPath,
+      error: gen.error,
+      detail: gen.detail || null,
+      scriptPath: generatorScript || GENERATOR_SCRIPT,
+      allowedRoot: GENERATOR_ROOT,
     });
     return;
   }
+  const scriptPath = gen.scriptPath;
 
   const params = collectJobParams(body, rawGeneratorArgs);
   const profileDiagnostics = buildProfileDiagnostics(params.profile || {});
@@ -3363,6 +3366,8 @@ async function handleGenerate(req, res) {
         providedOutputDir: body.outputDir ?? null,
         providedProxiesListPath: body.proxiesListPath ?? null,
         providedMapCsvPath: body.mapCsvPath ?? null,
+        providedGeneratorScript: body.generatorScript ?? null,
+        providedCwd: body.cwd ?? null,
         fingerprintProfileVersion: profileDiagnostics.fingerprint_profile_version || null,
         profileSelectionSource: profileDiagnostics.profile_selection_source || null,
         // Wave FLEET-HEALTH (FO-06 / RES-12) — counts and flags only, never the
@@ -3535,6 +3540,25 @@ async function handleGenerate(req, res) {
       }
     }
 
+    // Audit L-U2 — no 3proxy serves this start port (the ps scan succeeded and
+    // matched nothing), so a random_users_<p>.list or an ipv6_<p>.list of the
+    // wrong length is a leftover of a released batch: its logins would be
+    // resold / its addresses would not fit the new ports. Drop it before the
+    // generator runs (an explicit identical credentials file is kept: the FO-06
+    // retry contract; an ipv6 list with exactly proxyCount lines is kept too).
+    if (instanceStateBefore.ok && !instanceStateBefore.instances.some((x) => x.startPort === params.startPort || x.cfgPath === cfgPath)) {
+      const staleLists = await dropStaleBatchLists({
+        startPort: params.startPort,
+        proxyCount: params.proxyCount,
+        keepCredentialsFile: Boolean(credentialLines) && (await credentialsFileState(credentialsPath, credentialLines)) === "same",
+      });
+      jobMeta.result.staleLists = staleLists;
+      await writeJobMetadata(metadataPath, jobMeta);
+      if (staleLists.credentials === "dropped" || staleLists.ipv6 === "dropped") {
+        console.warn("[generate] stale per-start-port list(s) dropped", { jobId, start_port: params.startPort, ...staleLists });
+      }
+    }
+
     const effectiveArgs = await buildGeneratorArgs({
       rawArgs: rawGeneratorArgs,
       scriptPath,
@@ -3559,11 +3583,7 @@ async function handleGenerate(req, res) {
     if (freshAddresses) {
       // AMENDMENT A1 — the dropped list's /64s go back to the per-GB pool
       // unless something per-piece still names them.
-      const staleNets = pergbPool.poolPresent() ? pergbPool.collectFileNets([buildIpv6ListPath(params.startPort)]) : new Set();
-      await safeUnlink(buildIpv6ListPath(params.startPort));
-      if (staleNets.size) {
-        await pergbPool.releaseUnusedNets(staleNets, { proxyRoot: PROXY_ROOT, ref: pergbPool.newRef("fresh", params.startPort) });
-      }
+      await dropIpv6List(params.startPort, "fresh");
     }
 
     markJobStatus(jobMeta, "running");
@@ -4362,7 +4382,7 @@ async function handleDescribe(req, res) {
   sendJson(res, 200, payload);
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleAgentRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   const pathname = url.pathname;
 
@@ -4635,7 +4655,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   sendJson(res, 404, { success: false, status: "failed", error: "not_found" });
-});
+}
+
+const server = http.createServer(handleAgentRequest);
 
 // Wave HTTP.A — only bind the port when run as the entrypoint, so unit
 // tests can ``require`` this module and exercise the pure helpers below
@@ -4644,7 +4666,7 @@ const server = http.createServer(async (req, res) => {
 // Wave FLEET-HEALTH (RES-10) — bind PORT on LISTEN_HOST (NODE_AGENT_HOST,
 // default 0.0.0.0). Exported so a test can assert the arguments with a fake.
 function listenAgent(srv = server, onListening = () => {}) {
-  return srv.listen(PORT, LISTEN_HOST, onListening);
+  return srv.listen(PORT, plainListenHost(), onListening);
 }
 
 if (require.main === module) {
@@ -4657,7 +4679,7 @@ if (require.main === module) {
   loadSampler.start();
   listenAgent(server, () => {
     console.log(
-      `[node-agent] listening on ${LISTEN_HOST}:${PORT}, jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}, jobs_keep=${JOBS_KEEP}, rebind_policy=${REBIND_POLICY}`
+      `[node-agent] listening on ${plainListenHost()}:${PORT} (plain_http=${allowPlainHttp()}), jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}, jobs_keep=${JOBS_KEEP}, rebind_policy=${REBIND_POLICY}`
     );
     // Wave FLEET-HEALTH — trim the job-directory backlog once, a minute after
     // start (the live node carried 1500 of them).
@@ -4776,4 +4798,109 @@ module.exports = {
   pergb,
   pergbServer,
   vpn,
+  // Audit S-ORCH-1 / S-NODE-2 / L-U2 — lane node-agent-hardening.
+  resolveGeneratorScript,
+  GENERATOR_ROOT,
+  GENERATOR_SCRIPT,
+  parkFailedAttempt,
+  dropStaleBatchLists,
+  dropIpv6List,
+  handleAgentRequest,
+  allowPlainHttp,
+  plainListenHost,
 };
+
+// --- lane: node-agent-hardening ---
+// Audit S-ORCH-1 — NODE_AGENT_ALLOW_PLAIN_HTTP (default true in this release):
+// :8085 stays a plain-HTTP listener on NODE_AGENT_HOST for orchestrators that
+// still call http://<ip>:8085. false = the cleartext port is loopback-only (the
+// node-local callers: watchdog_probe, `netrun-harden agent-key`, the
+// generator's /pergb/reserve_nets) and the orchestrator reaches the agent only
+// over the TLS listener :8086. Read at call time (function, not a const) so
+// it is safe above the entrypoint block.
+function allowPlainHttp(env = process.env) {
+  return !/^(0|off|false|no)$/i.test(String(env.NODE_AGENT_ALLOW_PLAIN_HTTP ?? "true").trim());
+}
+
+function plainListenHost(env = process.env) {
+  return allowPlainHttp(env) ? LISTEN_HOST : "127.0.0.1";
+}
+
+// Audit L-U2 — drop the ipv6_<p>.list of a start port; its pool /64s go back to
+// the per-GB pool unless something per-piece still names them (AMENDMENT A1).
+async function dropIpv6List(startPort, refKind) {
+  const listPath = buildIpv6ListPath(startPort);
+  const staleNets = pergbPool.poolPresent() ? pergbPool.collectFileNets([listPath]) : new Set();
+  await safeUnlink(listPath);
+  if (staleNets.size) {
+    await pergbPool.releaseUnusedNets(staleNets, { proxyRoot: PROXY_ROOT, ref: pergbPool.newRef(refKind, startPort) });
+  }
+}
+
+// Audit L-U2 — the leftovers of a batch no 3proxy serves any more. The
+// credentials list (random_users_<p>.list) is removed unless the caller keeps it
+// (explicit identical credentials, the FO-06 retry contract); the address list
+// only when its line count differs from proxyCount (an equal-count list is a
+// retry that keeps its addresses and its pool /64s). Counts only, never the
+// contents. -> { credentials, credentialsLines, ipv6, ipv6Lines } with
+// "absent" | "kept" | "dropped".
+async function dropStaleBatchLists({ startPort, proxyCount, keepCredentialsFile = false }) {
+  const out = { credentials: "absent", credentialsLines: 0, ipv6: "absent", ipv6Lines: 0 };
+  const readLines = async (filePath) => {
+    try {
+      return credentialLinesOf(await fsp.readFile(filePath, "utf-8")).length;
+    } catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      throw error;
+    }
+  };
+  const credLines = await readLines(buildCredentialsListPath(startPort));
+  if (credLines !== null) {
+    out.credentialsLines = credLines;
+    if (keepCredentialsFile) {
+      out.credentials = "kept";
+    } else {
+      await safeUnlink(buildCredentialsListPath(startPort));
+      out.credentials = "dropped";
+    }
+  }
+  const ipv6Lines = await readLines(buildIpv6ListPath(startPort));
+  if (ipv6Lines !== null) {
+    out.ipv6Lines = ipv6Lines;
+    if (ipv6Lines === Number(proxyCount)) {
+      out.ipv6 = "kept";
+    } else {
+      await dropIpv6List(startPort, "stale");
+      out.ipv6 = "dropped";
+    }
+  }
+  return out;
+}
+
+// Audit S-NODE-2 — which generator may /generate run? -> { ok: true, scriptPath }
+// (the REAL path, so a symlink inside the root pointing outside is rejected and
+// the spawned file is the vetted one) | { ok: false, error, detail? }.
+//   empty request            -> GENERATOR_SCRIPT
+//   relative path            -> generator_script_not_allowed (no cwd-relative resolution)
+//   missing / not a file     -> generator_script_not_found
+//   outside GENERATOR_ROOT   -> generator_script_not_allowed
+// realpath on BOTH sides: on macOS os.tmpdir() is /var/... -> /private/var/...
+async function resolveGeneratorScript(requested) {
+  const wanted = String(requested ?? "").trim();
+  let candidate = GENERATOR_SCRIPT;
+  if (wanted) {
+    if (!path.isAbsolute(wanted)) return { ok: false, error: "generator_script_not_allowed", detail: "relative_path" };
+    candidate = path.normalize(wanted);
+  }
+  let scriptReal;
+  try {
+    const st = await fsp.stat(candidate);
+    if (!st.isFile()) return { ok: false, error: "generator_script_not_found", detail: "not_a_regular_file" };
+    scriptReal = await fsp.realpath(candidate);
+  } catch (_error) {
+    return { ok: false, error: "generator_script_not_found" };
+  }
+  const rootReal = await fsp.realpath(GENERATOR_ROOT).catch(() => GENERATOR_ROOT);
+  if (!isPathInside(rootReal, scriptReal)) return { ok: false, error: "generator_script_not_allowed", detail: "outside_generator_root" };
+  return { ok: true, scriptPath: scriptReal };
+}

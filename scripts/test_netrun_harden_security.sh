@@ -53,6 +53,12 @@ cat > "$STUB/sshd" <<'EOF'
 echo "sshd $*" >> "$STUB_LOG"
 [ ! -f "$TMP_FLAGS/sshd_fail" ]
 EOF
+cat > "$STUB/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "curl $*" >> "$STUB_LOG"
+[ -f "$TMP_FLAGS/curl_code" ] || { printf '000'; exit 7; }
+cat "$TMP_FLAGS/curl_code"
+EOF
 cat > "$STUB/nft-persist" <<'EOF'
 #!/usr/bin/env bash
 echo "nft-persist $*" >> "$STUB_LOG"
@@ -180,6 +186,14 @@ echo "$out" | grep -q 'iifname "lo" accept' || fail "dry-run: localhost (the gen
 [ ! -s "$STUB_LOG" ] && [ ! -e "$TMP_FLAGS/nft_stdin" ] || fail "dry-run changed something: $(cat "$STUB_LOG")"
 run agent-firewall 999.1.2.3 >/dev/null 2>&1 && fail "a bad IPv4 accepted"
 run agent-firewall >/dev/null 2>&1 && fail "no IP and no live table: must refuse"
+# Audit S-ORCH-1: `status` names the TLS agent port check (:8086 answers or not)
+rm -f "$TMP_FLAGS/curl_code"
+out="$(run status 2>&1)"; echo "$out" | grep -q 'A3 agent TLS :8086: closed' || fail "status, :8086 not answering: $out"
+printf '200' > "$TMP_FLAGS/curl_code"
+out="$(run status 2>&1)"; echo "$out" | grep -q 'A3 agent TLS :8086: listening (HTTP 200)' || fail "status, :8086 answering: $out"
+grep -q 'curl .*https://127.0.0.1:8086/health' "$STUB_LOG" || fail "status must probe https://127.0.0.1:8086/health"
+rm -f "$TMP_FLAGS/curl_code"
+ok "status reports the agent TLS port 8086 (listening / closed)"
 # an older guard (8085 only): `agent-firewall` without an IP re-applies with its IP; `status` and `secure` notice
 printf 'table inet netrun_agent_guard {\n\tchain input {\n\t\ttcp dport 8085 ip saddr 95.217.98.125 accept\n\t\ttcp dport 8085 drop\n\t}\n}\n' > "$TMP_FLAGS/guard_table"
 out="$(run status 2>&1)"; echo "$out" | grep -q 'not for every agent port' || fail "status on an 8085-only guard: $out"

@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/netrun
 Environment=NODE_AGENT_HOST=0.0.0.0
+# Audit S-ORCH-1: once the orchestrator reaches this node over https (:8086) switch to
+# NODE_AGENT_HOST=127.0.0.1 (or NODE_AGENT_ALLOW_PLAIN_HTTP=false) so no cleartext port faces the internet.
 Environment=NODE_AGENT_PORT=8085
 Environment=NODE_AGENT_PROXY_ROOT=/opt/netrun/proxyserver
 Environment=NODE_AGENT_JOBS_ROOT=/opt/netrun/jobs

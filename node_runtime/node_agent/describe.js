@@ -74,6 +74,10 @@ async function buildDescribe({
       // the TLS port below); 1 / the port when this agent has it.
       pergb_radius: pergbRadius ? 1 : 0,
       pergb_tls_port: pergbRadius ? Number(pergbTlsPort) || 8086 : null,
+      // Audit S-ORCH-1 — the TLS listener serves the whole agent API (same
+      // routes, same X-API-KEY), whether or not per-GB is installed.
+      agent_tls: 1,
+      agent_tls_port: Number(pergbTlsPort) || 8086,
       // Amendment A13-I — per-piece proxies as RADIUS piece lists (kind
       // "piece", pieceNet), reserve_nets with explicit nets.
       pergb_pieces: pergbRadius ? 1 : 0,

@@ -1415,10 +1415,20 @@ answers; `site_down`: the site fails while SSH answers), a reminder every
 node's own internet is down (`HQ_REF_URL`, Cloudflare's trace) — it could not
 reach Telegram anyway, so a node never raises a false alarm about HQ.
 
-Config `/etc/netrun/hq-watch.env` (0600, root): `TG_TOKEN` (the admin bot),
-`TG_CHAT`, `TG_TOPIC`, `NODE_LABEL`; without it the unit is a no-op. The
-token reaches curl through its config on stdin, never argv. Test:
-`bash scripts/test_hq_watch.sh` (curl / timeout stubbed).
+Config `/etc/netrun/hq-watch.env` (0600, root, **written by the orchestrator**
+over the node_backup SSH channel — never by an installer, `user_data` or by hand):
+`HQ_WATCH_TG_TOKEN` (a **dedicated alerts-only bot**, never the shop / admin bot's
+token), `HQ_WATCH_TG_CHAT`, `HQ_WATCH_TG_TOPIC`, `NODE_LABEL`. The old names
+`TG_TOKEN` / `TG_CHAT` / `TG_TOPIC` are still read, with a deprecation warning on
+stderr (the journal). Without the file — or when it is readable by group/others
+(a 0644 file is ignored with a message, nothing is sent) — the unit is a quiet
+no-op; `scripts/node_followup_v2.sh` installs the watcher + timer on every node
+(`/usr/local/sbin/netrun-hq-watch`, 0700), so only the orchestrator decides
+whether a node talks. The token reaches curl through its config on stdin, never
+argv. Rotation: change the token on the orchestrator (its fingerprint changes →
+every node is re-pushed), then revoke the old bot in BotFather. Tests:
+`bash scripts/test_hq_watch.sh` (curl / timeout stubbed),
+`bash scripts/test_hq_watch_install.sh` (static).
 
 ## Smoke Generate
 
@@ -1435,7 +1445,7 @@ proxyType=socks5
 ipv6Policy=ipv6_only
 networkProfile=high_compatibility
 fingerprintProfileVersion=v2_android_ipv6_only_dns_custom
-generatorScript=/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh
+generatorScript=/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh   # optional; must resolve under NODE_AGENT_GENERATOR_ROOT
 ```
 
 ## Download proxies.list
@@ -1482,3 +1492,52 @@ client_os_profile_enforcement=not_controlled_by_proxy
 ipv6_policy=ipv6_only
 effective_ipv6_policy=ipv6_only
 ```
+
+<!-- --- lane: node-agent-hardening --- -->
+## Agent API over TLS (:8086) — audit S-ORCH-1
+
+`handleAgentRequest` (the plain listener's request handler) is also the handler of the TLS listener
+`pergb_tls_server.js`: every path that is not `/pergb*` or `/vpn*` is passed to it untouched, so
+`/health`, `/describe`, `/generate`, `/jobs`, `/deprovision`, `/egress`, `/firewall/desired`,
+`/accounting`, … behave identically over `https://<IP>:8086` and `http://<IP>:8085` — each route keeps
+its own `X-API-KEY` check (a keyless `/health` is still the liveness `{ok:true}`). The listener now
+opens on every node that has its IP certificate (lego `<ip>.crt/.key`, else `node.pem`), not only
+where per-GB is installed (`NETRUN_AGENT_TLS_REQUIRE_PERGB=1` brings the old gate back); the firewall
+gate is unchanged (`agent_firewall_without_8086` keeps it closed on a guard that lacks 8086 — run
+`netrun-harden agent-firewall`). `/health` → `pergb.tls.routes` is `"full"` (`"pergb_only"` for a
+listener built without the agent handler); `/describe` → `supports.agent_tls = 1`,
+`supports.agent_tls_port`.
+
+`NODE_AGENT_ALLOW_PLAIN_HTTP` (default `true`): the plain `:8085` stays on `NODE_AGENT_HOST`. `false`
+binds it to `127.0.0.1` only (the node-local callers — watchdog_probe, `netrun-harden agent-key`, the
+generator's `/pergb/reserve_nets` — keep working); do it only when the orchestrator shows no `http://`
+node URLs. Enrollment URLs printed by `bootstrap_new_node.sh` / sent by `quick-install.sh` are
+`https://<IP>:8086`. `netrun-harden status` reports `A3 agent TLS :8086: listening|closed`.
+
+### Stale per-start-port lists — audit L-U2
+
+When no 3proxy serves the requested start port, the agent removes a leftover
+`random_users_<p>.list` (unless it is identical to the request's explicit credentials — the FO-06
+retry) and an `ipv6_<p>.list` whose line count differs from `proxyCount` (its pool /64s are handed
+back) **before** the generator runs, and records `result.staleLists`
+(`{credentials, credentialsLines, ipv6, ipv6Lines}` — counts only) in `job.json`. The generator
+itself reuses `random_users_<p>.list` only when it holds exactly `proxyCount` valid
+`login:password` lines (otherwise it regenerates it atomically, 0600, and says so on stderr), refuses
+an `ipv6_<p>.list` of the wrong length (immediate failure instead of N listeners for an M-port batch),
+and its start-up script refuses to render a cfg from lists that do not match the batch (exit 1, no
+cfg, no spawn — never a `users :CL:` line). A parked failed attempt also loses its credentials list.
+Applies to batches generated after the deploy; existing cron start-up scripts are unchanged.
+
+### /generate runs only the vetted generator — audit S-NODE-2
+
+`/generate` used to execute any `generatorScript` (absolute paths allowed) from any `cwd` of the
+request body as root. Now: the script must resolve (`realpath`, so a symlink out of the root is
+rejected) under `NODE_AGENT_GENERATOR_ROOT` (default `/opt/netrun/node_runtime`); `generatorScript`
+is optional — empty runs `NODE_AGENT_GENERATOR_SCRIPT` (default
+`<root>/soft/generator/proxyyy_automated.sh`); a relative, out-of-root path is answered
+`400 generator_script_not_allowed` (`detail`: `relative_path` / `outside_generator_root`), a missing or
+non-regular file `400 generator_script_not_found`, before any job directory or lock is created. The
+body's `cwd` is never honoured (the agent's own cwd is used; a differing value is logged); `job.json`
+records `request.providedGeneratorScript` / `request.providedCwd` next to the values that actually
+ran. The orchestrator's canonical path is inside the default root, so nothing changes for it; a node
+with a non-standard `NETRUN_HOME` needs `NODE_AGENT_GENERATOR_ROOT` in its unit drop-in.

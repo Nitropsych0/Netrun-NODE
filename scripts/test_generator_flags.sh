@@ -156,6 +156,7 @@ ok "generator: no sysctl writes, no 3proxy download/build, no MSS/edge rules, no
 # ── 4. batch IPv6 generation ──────────────────────────────────────
 eval "$(extract random_ipv6_suffixes)"
 eval "$(extract generate_ipv6_addresses_if_needed)"
+eval "$(extract list_line_count)"
 out="$(random_ipv6_suffixes 2001:db8:0:1 64 1500)" || fail "random_ipv6_suffixes /64"
 [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1500 ] || fail "count"
 [ "$(printf '%s\n' "$out" | sort -u | wc -l | tr -d ' ')" = 1500 ] || fail "not unique"
@@ -190,6 +191,25 @@ unset -f od
   exit 0
 ) || exit 1
 ok "IPv6 generation: one od + one awk per batch, unique, /64 /56 /48 layout, NIC addresses skipped, 2 ip calls per batch"
+
+# ── 4b. Audit L-U2: an existing address list of the wrong length is refused, not reused ──
+(
+  log_err_and_exit() { echo "EXIT $1"; exit 3; }
+  routed_prefix=""; instance_id=18100; subnet=64; subnet_mask=2001:db8:0:1
+  L4="$TMP/ipv6_18100_short.list"; random_ipv6_list_file="$L4"
+  seq 1 199 | sed 's/^/2001:db8:0:1::/' > "$L4"; before="$(cksum < "$L4")"
+  proxy_count=200
+  out="$(generate_ipv6_addresses_if_needed 2>&1)"; rc=$?
+  [ "$rc" = 3 ] && echo "$out" | grep -q '^EXIT stale address list' && echo "$out" | grep -q '199 address' && echo "$out" | grep -q 'needs 200' \
+    || { echo "FAIL: 199 lines for 200 ports must exit naming 199 and 200 (rc=$rc): $out"; exit 1; }
+  [ "$(cksum < "$L4")" = "$before" ] || { echo "FAIL: the stale list was rewritten"; exit 1; }
+  seq 1 201 | sed 's/^/2001:db8:0:1::/' > "$L4"
+  out="$(generate_ipv6_addresses_if_needed 2>&1)"; rc=$?
+  [ "$rc" = 3 ] && echo "$out" | grep -q '201 address' || { echo "FAIL: 201 lines for 200 ports must be refused too: $out"; exit 1; }
+  seq 1 200 | sed 's/^/2001:db8:0:1::/' > "$L4"
+  generate_ipv6_addresses_if_needed | grep -q 'Using existing' || { echo "FAIL: 200 lines for 200 ports must be reused"; exit 1; }
+) || fail "4b: address list length check"
+ok "L-U2: an ipv6 list of the wrong length (199 / 201 for 200 ports) is refused with both numbers and left untouched; the exact one is reused"
 
 # ── 5. start-up script: spawn helper, missing list, deprecate switch ──
 for f in netrun_setting http_listen_ip_for_node create_startup_script; do eval "$(extract "$f")"; done
@@ -253,6 +273,58 @@ rm -f "$TMP/batch"
 PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$TMP/hfalse/proxyserver/proxy-startup_18100.sh" >/dev/null 2>&1
 grep -qx 'address add 2001:db8:0:1::a/128 dev eth9 nodad' "$TMP/batch" || fail "NETRUN_ANCHOR_DEPRECATE=False: $(cat "$TMP/batch" 2>/dev/null)"
 ok "start-up script: spawn helper with the cfg (0600, umask 077), refuses a missing address list, NETRUN_ANCHOR_DEPRECATE=0/off/OFF/False adds preferred anchors"
+
+# ── 5b. Audit L-U2: the start-up script never renders a cfg from lists that do not match the batch ──
+mk_script_n() { # label proxy_count  (reads $CREDS_TEXT and $IPV6_TEXT, printf-style)
+  (
+    set +u
+    H="$TMP/hn$1"; rm -rf "$H"; mkdir -p "$H/proxyserver/3proxy/bin"
+    printf '#!/bin/sh\nexit 0\n' > "$H/proxyserver/3proxy/bin/3proxy"; chmod +x "$H/proxyserver/3proxy/bin/3proxy"
+    get_subnet_mask() { echo "2001:db8:0:1"; }
+    is_auth_used() { return 0; }
+    bash_location="$(command -v bash)"; user_home_dir="$H"
+    start_port=18100; proxy_count="$2"; last_port=$((18100 + proxy_count - 1)); proxies_type=dual; mode_flag=-6
+    backconnect_ipv4=45.32.10.20; interface_name=eth9; subnet=64; instance_id=18100
+    dns_nserver_lines=$'  nserver 127.0.0.1\n  nserver ::1'; proxy_maxconn=512
+    user=""; password=""; use_random_auth=true; allowed_hosts=""; denied_hosts=""
+    proxyserver_config_path="$H/proxyserver/3proxy/3proxy_18100.cfg"
+    random_ipv6_list_file="$H/proxyserver/ipv6_18100.list"
+    random_users_list_file="$H/proxyserver/random_users_18100.list"
+    startup_script_path="$H/proxyserver/proxy-startup_18100.sh"
+    printf "$IPV6_TEXT" > "$random_ipv6_list_file"; printf "$CREDS_TEXT" > "$random_users_list_file"
+    NETRUN_ENV_FILE="$TMP/none.env" NETRUN_ANCHOR_DEPRECATE=1 create_startup_script
+  )
+}
+run_n() { # label -> exit code of the generated start-up script; helper calls in $TMP/helper_calls
+  rm -f "$TMP/helper_calls"
+  PATH="$TMP/stub:$PATH" NETRUN_3PROXY_SPAWN="$TMP/helper.sh" bash "$TMP/hn$1/proxyserver/proxy-startup_18100.sh" >"$TMP/n_out" 2>&1
+}
+CFGN() { echo "$TMP/hn$1/proxyserver/3proxy/3proxy_18100.cfg"; }
+V2='2001:db8:0:1::a\n2001:db8:0:1::b\n'
+# (i) 1 credential for 2 ports
+IPV6_TEXT="$V2" CREDS_TEXT='u1:p1\n' mk_script_n i 2 || fail "5b(i): create_startup_script"
+run_n i && fail "5b(i): a 1-line credentials list for 2 ports must not start"
+[ ! -f "$(CFGN i)" ] && [ ! -f "$TMP/helper_calls" ] && grep -q 'credentials in' "$TMP/n_out" || fail "5b(i): no cfg, no spawn, a reason on stderr: $(cat "$TMP/n_out")"
+# (ii) a second line with an empty part / no colon
+for bad in ':' 'u2' 'u2:' ':p2'; do
+  IPV6_TEXT="$V2" CREDS_TEXT="u1:p1\n$bad\n" mk_script_n ii 2 || fail "5b(ii): create_startup_script"
+  run_n ii && fail "5b(ii): credentials line '$bad' must not start"
+  [ ! -f "$(CFGN ii)" ] && [ ! -f "$TMP/helper_calls" ] || fail "5b(ii): '$bad' wrote a cfg or spawned"
+  grep -q 'malformed credentials' "$TMP/n_out" || fail "5b(ii): '$bad' reason: $(cat "$TMP/n_out")"
+done
+# (iii) 3 addresses for 2 ports (and 1 for 2)
+IPV6_TEXT='2001:db8:0:1::a\n2001:db8:0:1::b\n2001:db8:0:1::c\n' CREDS_TEXT='u1:p1\nu2:p2\n' mk_script_n iii 2 || fail "5b(iii): create_startup_script"
+run_n iii && fail "5b(iii): 3 addresses for 2 ports must not start"
+[ ! -f "$(CFGN iii)" ] && [ ! -f "$TMP/helper_calls" ] && grep -q 'addresses in' "$TMP/n_out" || fail "5b(iii): $(cat "$TMP/n_out")"
+IPV6_TEXT='2001:db8:0:1::a\n' CREDS_TEXT='u1:p1\nu2:p2\n' mk_script_n iiib 2 || fail "5b(iii): create_startup_script"
+run_n iiib && fail "5b(iii): 1 address for 2 ports must not start"
+# (iv) 2 valid lines + 2 addresses: starts as today, users u1:CL:p1 / u2:CL:p2, never `users :CL:`
+IPV6_TEXT="$V2" CREDS_TEXT='u1:p1\nu2:p2\n' mk_script_n iv 2 || fail "5b(iv): create_startup_script"
+run_n iv || fail "5b(iv): valid lists must start: $(cat "$TMP/n_out")"
+grep -q '^users u1:CL:p1$' "$(CFGN iv)" && grep -q '^users u2:CL:p2$' "$(CFGN iv)" || fail "5b(iv): cfg users: $(cat "$(CFGN iv)")"
+[ "$(grep -c '^users :CL:' "$(CFGN iv)")" = 0 ] || fail "5b(iv): a users :CL: line was rendered"
+grep -q 'helper BIN=' "$TMP/helper_calls" || fail "5b(iv): the spawn helper was not called"
+ok "L-U2: the start-up script refuses (exit 1, no cfg, no spawn) a short / malformed credentials list and a wrong-length address list; valid lists start with users u1:CL:p1 / u2:CL:p2 and never users :CL:"
 
 # ── 6. per-GB pool (AMENDMENT A1): reserve_nets only, fail closed ──
 eval "$(extract routed_ipv6_addresses)"

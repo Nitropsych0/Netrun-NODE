@@ -238,6 +238,21 @@ Unit=netrun-watchdog.service
 WantedBy=timers.target
 EOF
 
+# ── 4b) Install netrun-hq-watch (the node watches HQ; quiet without a config) ──
+# Audit S-NODE-3: the watcher is installed on EVERY node, but it sends nothing
+# until /etc/netrun/hq-watch.env exists — and that file (the DEDICATED alerts-only
+# bot's token) is pushed by the orchestrator over SSH, never written here:
+# user_data is readable from the provider's metadata service forever, and an
+# install argument would sit in the shell history / process list.
+HQ_WATCH_SRC="$SELF_DIR/../deploy/node/netrun-hq-watch.sh"
+for u in netrun-hq-watch.service netrun-hq-watch.timer; do
+  [ -f "$SELF_DIR/../deploy/node/$u" ] || fail "missing $SELF_DIR/../deploy/node/$u"
+done
+[ -f "$HQ_WATCH_SRC" ] || fail "missing $HQ_WATCH_SRC"
+install -m 0700 "$HQ_WATCH_SRC" /usr/local/sbin/netrun-hq-watch
+install -m 0644 "$SELF_DIR/../deploy/node/netrun-hq-watch.service" /etc/systemd/system/netrun-hq-watch.service
+install -m 0644 "$SELF_DIR/../deploy/node/netrun-hq-watch.timer" /etc/systemd/system/netrun-hq-watch.timer
+
 # Wave IPV6-ROTATION — a saved /etc/nftables.conf may hold the agent's table
 # ip6 netrun_egress, whose proxy-NDP addresses are gone after a reboot (the watchdog's
 # tier 2 reboots): nftables.service deletes it right after the boot load, so
@@ -261,6 +276,7 @@ systemctl enable netrun-watchdog.timer >/dev/null
 echo 0 > /var/lib/netrun/watchdog_failures 2>/dev/null || true
 rm -f /var/lib/netrun/watchdog_last_restart 2>/dev/null || true
 systemctl start  netrun-watchdog.timer
+systemctl enable --now netrun-hq-watch.timer >/dev/null
 
 # Also bump node-agent service limits if it's installed
 if [ -f /etc/systemd/system/netrun-node-agent.service ]; then
@@ -317,6 +333,8 @@ printf "  restore unit  : "
 systemctl is-enabled netrun-3proxy-restore.service 2>/dev/null
 printf "  watchdog timer: "
 systemctl is-active  netrun-watchdog.timer 2>/dev/null
+printf "  hq-watch timer: "
+systemctl is-active  netrun-hq-watch.timer 2>/dev/null
 printf "  watchdog next : "
 systemctl list-timers netrun-watchdog.timer --no-pager 2>/dev/null \
   | awk 'NR==2 {print $1, $2}'

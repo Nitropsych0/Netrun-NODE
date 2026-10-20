@@ -432,6 +432,27 @@ function delete_file_if_exists() {
   if test -f $1; then rm $1; fi;
 }
 
+# Audit L-U2 — per-start-port lists (random_users_<p>.list, ipv6_<p>.list) are
+# indexed by position (port N <-> line N). A list shorter than the batch gave
+# the trailing ports an EMPTY login / password (`users :CL:`), a longer one
+# silently skipped addresses. These two helpers decide whether a list is
+# exactly right for this batch.
+# list_line_count FILE -> number of non-empty lines (0 for a missing file)
+function list_line_count() {
+  local n
+  n=$(grep -c . "$1" 2>/dev/null) || n=0
+  echo "${n:-0}"
+}
+
+# credentials_list_is_valid FILE COUNT -> 0 iff FILE has exactly COUNT non-empty
+# lines and every one is login:password in the agent's alphabet
+# (CREDENTIAL_PART_RE in node_agent/server.js; the generator draws 8+8 of it)
+function credentials_list_is_valid() {
+  [ -f "$1" ] || return 1
+  [ "$(list_line_count "$1")" -eq "$2" ] || return 1
+  [ "$(grep . "$1" | grep -cvE '^[A-Za-z0-9]{1,32}:[A-Za-z0-9]{1,32}$')" -eq 0 ]
+}
+
 function install_package() {
   if ! is_package_installed $1; then
     if [ "$bootstrap_side_effects_allowed" != true ]; then
@@ -635,17 +656,34 @@ function remove_from_cron() {
 
 function generate_random_users_if_needed() {
   if [ $use_random_auth != true ]; then return; fi;
-  
-  # Only generate new credentials if file doesn't exist
-  # This preserves credentials across restarts
+
+  # Audit L-U2 — an existing list is reused (restarts, same-count retries, the
+  # agent-written FO-06 file) ONLY when it is exactly right for this batch:
+  # proxy_count lines, each a valid login:password. A shorter list used to be
+  # indexed past its end (empty credentials on the trailing ports); a longer
+  # or foreign one belongs to a batch that no longer runs (its logins would be
+  # resold). Reaching here means check_ports_not_listening passed: no 3proxy
+  # serves the old file, so replacing it is safe.
   if [ -f "$random_users_list_file" ]; then
-    echo "   Using existing credentials from $random_users_list_file"
-    return
+    if credentials_list_is_valid "$random_users_list_file" "$proxy_count"; then
+      echo "   Using existing credentials from $random_users_list_file"
+      return
+    fi
+    log_err "stale credentials list $random_users_list_file: $(list_line_count "$random_users_list_file") line(s) / invalid entries, batch needs $proxy_count — regenerating"
   fi
 
-  for i in $(seq 1 $proxy_count); do
-    echo $(create_random_string 8):$(create_random_string 8) >> $random_users_list_file;
-  done;
+  local tmp="${random_users_list_file}.tmp" i
+  rm -f "$tmp"
+  (
+    umask 077
+    for i in $(seq 1 $proxy_count); do
+      echo "$(create_random_string 8):$(create_random_string 8)"
+    done > "$tmp"
+  ) || { rm -f "$tmp"; log_err_and_exit "Error: cannot write $tmp"; }
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$random_users_list_file" || log_err_and_exit "Error: cannot replace $random_users_list_file"
+  credentials_list_is_valid "$random_users_list_file" "$proxy_count" \
+    || log_err_and_exit "Error: credentials list $random_users_list_file does not hold $proxy_count valid entries"
 }
 
 # Speed audit — COUNT random addresses for a /BITS under MASK, one per line,
@@ -879,6 +917,15 @@ function generate_ipv6_addresses_if_needed() {
   # Generate IPv6 addresses early if they don't exist yet
   # This is needed for nftables counter setup
   if [ -f "$random_ipv6_list_file" ]; then
+    # Audit L-U2 — refuse a list of the wrong length instead of starting N
+    # listeners for an M-port batch (the agent drops the stale per-start-port
+    # files before the generator runs; a routed / per-GB list also holds /64s
+    # only the agent may hand back, so no regeneration here).
+    local ipv6_lines
+    ipv6_lines="$(list_line_count "$random_ipv6_list_file")"
+    if [ "$ipv6_lines" -ne "$proxy_count" ]; then
+      log_err_and_exit "stale address list $random_ipv6_list_file: $ipv6_lines address(es), batch needs $proxy_count — remove the stale per-start-port files of $instance_id (the node agent drops them when no 3proxy serves that start port) or pass freshAddresses"
+    fi
     echo "   Using existing IPv6 addresses from $random_ipv6_list_file"
     return
   fi
@@ -984,6 +1031,32 @@ function create_startup_script() {
 	  exit 1
 	fi
 
+	# Audit L-U2 — never render a cfg from lists that do not match the batch:
+	# port N takes line N of both lists, so a short or malformed list used to
+	# give the trailing ports empty credentials (a "users :CL:" line) or no address.
+	if [ "\$(grep -c . "$random_ipv6_list_file")" -ne $proxy_count ]; then
+	  echo "proxy-startup_${instance_id}: \$(grep -c . "$random_ipv6_list_file") addresses in $random_ipv6_list_file, batch has $proxy_count ports — not starting (regenerate the batch)" >&2
+	  exit 1
+	fi
+	if [ $use_random_auth = true ]; then
+	  readarray -t proxy_random_credentials < $random_users_list_file
+	  if [ "\${#proxy_random_credentials[@]}" -lt $proxy_count ]; then
+	    echo "proxy-startup_${instance_id}: \${#proxy_random_credentials[@]} credentials in $random_users_list_file, batch has $proxy_count ports — not starting (regenerate the batch)" >&2
+	    exit 1
+	  fi
+	  for ((i = 0; i < $proxy_count; i++)); do
+	    c="\${proxy_random_credentials[\$i]}"
+	    case "\$c" in
+	      *:*) [ -n "\${c%%:*}" ] && [ -n "\${c#*:}" ] || c="" ;;
+	      *) c="" ;;
+	    esac
+	    if [ -z "\$c" ]; then
+	      echo "proxy-startup_${instance_id}: malformed credentials line \$((i + 1)) in $random_users_list_file — not starting (regenerate the batch)" >&2
+	      exit 1
+	    fi
+	  done
+	fi
+
 	immutable_config_part="daemon
 $dns_nserver_lines
 	  maxconn $proxy_maxconn
@@ -1024,7 +1097,6 @@ $dns_nserver_lines
 	port=$start_port
 	count=0
 	if [ "$proxies_type" = "http" ]; then proxy_startup_depending_on_type="proxy $mode_flag -n -a"; else proxy_startup_depending_on_type="socks $mode_flag -a"; fi;
-	if [ $use_random_auth = true ]; then readarray -t proxy_random_credentials < $random_users_list_file; fi;
 	for random_ipv6_address in \$(cat $random_ipv6_list_file); do
 	    if [ $use_random_auth = true ]; then
 	      IFS=":";

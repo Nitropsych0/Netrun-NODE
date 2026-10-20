@@ -13,16 +13,32 @@
 #     failed checks in a row → ONE alert, a reminder every HQ_REMIND_MIN (60)
 #     minutes, ONE «back» message once both answer. A failed send is retried
 #     on the next run.
-# Config /etc/netrun/hq-watch.env (0600, root): TG_TOKEN, TG_CHAT, TG_TOPIC,
-# NODE_LABEL; optional HQ_URL, HQ_HOST, HQ_REF_URL, HQ_FAILS, HQ_REMIND_MIN.
-# No config → a quiet no-op. Run by netrun-hq-watch.timer.
+# Config /etc/netrun/hq-watch.env (0600, root): HQ_WATCH_TG_TOKEN, HQ_WATCH_TG_CHAT,
+# HQ_WATCH_TG_TOPIC, NODE_LABEL; optional HQ_URL, HQ_HOST, HQ_REF_URL, HQ_FAILS,
+# HQ_REMIND_MIN. Audit S-NODE-3: the file is written by the orchestrator
+# (python -m orchestrator.hq_watch, over the node_backup SSH channel) — never by
+# an installer or by hand — and the token in it is a DEDICATED alerts-only bot,
+# never the shop / admin bot's. The old names TG_TOKEN / TG_CHAT / TG_TOPIC are
+# still read (a deprecation warning goes to stderr / the journal).
+# No config, a config readable by group/others, or no token/chat → a quiet
+# no-op (nothing is sent). Run by netrun-hq-watch.timer.
 set -u
 CONF="${HQ_WATCH_CONF:-/etc/netrun/hq-watch.env}"
 STATE_DIR="${HQ_WATCH_STATE_DIR:-/var/lib/netrun-hq-watch}"
 [ -r "$CONF" ] || exit 0
+# The file holds a bot token: group/other bits set = it may have been read (or
+# written) by someone else — ignore it, like "no config".
+mode=$(stat -c %a "$CONF" 2>/dev/null || stat -f %Lp "$CONF" 2>/dev/null || echo 777)
+case "$mode" in *00) ;; *) echo "netrun-hq-watch: $CONF must be 0600 root (is $mode), ignoring it" >&2; exit 0 ;; esac
 # shellcheck source=/dev/null
 . "$CONF"
-[ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ] || { echo "netrun-hq-watch: TG_TOKEN / TG_CHAT missing in $CONF" >&2; exit 0; }
+# New names first; the old TG_* names are a deprecated fallback (per variable).
+legacy=""
+if [ -z "${HQ_WATCH_TG_TOKEN:-}" ] && [ -n "${TG_TOKEN:-}" ]; then HQ_WATCH_TG_TOKEN="$TG_TOKEN"; legacy="$legacy TG_TOKEN"; fi
+if [ -z "${HQ_WATCH_TG_CHAT:-}" ] && [ -n "${TG_CHAT:-}" ]; then HQ_WATCH_TG_CHAT="$TG_CHAT"; legacy="$legacy TG_CHAT"; fi
+if [ -z "${HQ_WATCH_TG_TOPIC:-}" ] && [ -n "${TG_TOPIC:-}" ]; then HQ_WATCH_TG_TOPIC="$TG_TOPIC"; legacy="$legacy TG_TOPIC"; fi
+[ -z "$legacy" ] || echo "netrun-hq-watch: deprecated name(s) in $CONF:$legacy — use HQ_WATCH_TG_TOKEN / HQ_WATCH_TG_CHAT / HQ_WATCH_TG_TOPIC (pushed by the orchestrator)" >&2
+[ -n "${HQ_WATCH_TG_TOKEN:-}" ] && [ -n "${HQ_WATCH_TG_CHAT:-}" ] || { echo "netrun-hq-watch: HQ_WATCH_TG_TOKEN / HQ_WATCH_TG_CHAT missing in $CONF" >&2; exit 0; }
 HQ_URL="${HQ_URL:-https://netrun.world/}"
 HQ_HOST="${HQ_HOST:-95.217.98.125}"
 HQ_REF_URL="${HQ_REF_URL:-https://www.cloudflare.com/cdn-cgi/trace}"
@@ -43,10 +59,10 @@ tcp_ok() { timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
 # send <html> — the token rides in curl's config on stdin, never in argv.
 send() {
-  local args=(--data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=$1"
+  local args=(--data-urlencode "chat_id=$HQ_WATCH_TG_CHAT" --data-urlencode "text=$1"
     --data-urlencode "parse_mode=HTML" --data-urlencode "disable_web_page_preview=true")
-  [ -n "${TG_TOPIC:-}" ] && args+=(--data-urlencode "message_thread_id=$TG_TOPIC")
-  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
+  [ -n "${HQ_WATCH_TG_TOPIC:-}" ] && args+=(--data-urlencode "message_thread_id=$HQ_WATCH_TG_TOPIC")
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$HQ_WATCH_TG_TOKEN" \
     | curl -s -m 20 -o /dev/null -w '%{http_code}' -K - "${args[@]}" 2>/dev/null | grep -qx 200
 }
 

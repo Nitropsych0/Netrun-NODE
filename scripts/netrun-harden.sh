@@ -195,6 +195,15 @@ cmd_status() {
   else
     log "A3 agent firewall ($AGENT_PORTS): OFF"
   fi
+  # Audit S-ORCH-1: the agent's whole API is served over TLS on 8086 (the same
+  # routes as plain 8085); the orchestrator needs it answering before it can
+  # switch the node's URL to https. Any HTTP status means the listener is up.
+  local tls_code
+  tls_code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 https://127.0.0.1:8086/health 2>/dev/null || true)"
+  case "$tls_code" in
+    [1-5][0-9][0-9]) log "A3 agent TLS :8086: listening (HTTP $tls_code)" ;;
+    *) log "A3 agent TLS :8086: closed (rerun: netrun-harden agent-firewall, or check: netrun-https status)" ;;
+  esac
   log "A6 authorized_keys comments: $(awk '{print $NF}' /root/.ssh/authorized_keys 2>/dev/null | tr '\n' ' ')"
   log "2026-10-08 credential files readable by others: $(open_cred_paths | wc -l | tr -d ' ')"
   if grep -q "meta skuid 65535 jump" <<< "$(nft list table inet netrun_proxy_guard 2>/dev/null)"; then log "2026-10-08 3proxy egress guard: on"; else log "2026-10-08 3proxy egress guard: OFF (or the old skuid != form)"; fi

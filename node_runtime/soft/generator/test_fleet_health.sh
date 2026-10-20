@@ -9,6 +9,9 @@
 #   2. FO-06: a random_users_<start>.list written by the agent
 #      (server.js writeCredentialsFile) is REUSED by the generator and its
 #      logins/passwords land in the cfg in port order.
+#   2b. L-U2: a stale credentials list (wrong length / malformed) is
+#      regenerated atomically, never indexed past its end; an exact one is
+#      reused verbatim.
 #   bash node_runtime/soft/generator/test_fleet_health.sh
 set -uo pipefail
 
@@ -24,7 +27,8 @@ ok() { PASS=$((PASS + 1)); echo "ok: $1"; }
 extract() { sed -n "/^function $1()/,/^}/p" "$GEN"; }
 
 for f in is_valid_ip netrun_setting accounting_client_match setup_nftables_counters \
-         create_random_string generate_random_users_if_needed create_startup_script http_listen_ip_for_node; do
+         create_random_string generate_random_users_if_needed create_startup_script http_listen_ip_for_node \
+         list_line_count credentials_list_is_valid; do
   body="$(extract "$f")"
   [ -n "$body" ] || fail "function $f not found in generator"
   eval "$body"
@@ -139,5 +143,49 @@ ok "FO-06: the agent-written random_users_<start>.list is reused verbatim and la
 [ "$(wc -l < "$TMP/fresh.list" | tr -d ' ')" = 3 ] || fail "fresh credentials count"
 grep -qvE '^[A-Za-z0-9]{8}:[A-Za-z0-9]{8}$' "$TMP/fresh.list" && fail "fresh credentials format"
 ok "control: no file -> the generator draws 8+8 random credentials (unchanged)"
+
+# ── 2b. L-U2: stale credentials list is regenerated, never indexed past its end ──
+gen_creds() { # COUNT FILE -> runs generate_random_users_if_needed; stderr of log_err in $TMP/log_err
+  (
+    use_random_auth=true; proxy_count="$1"; random_users_list_file="$2"; script_log_file="$TMP/script.log"
+    log_err() { echo "$1" >> "$TMP/log_err"; }
+    log_err_and_exit() { log_err "$1"; exit 1; }
+    generate_random_users_if_needed
+  ) > /dev/null
+}
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+valid_lines() { [ "$(wc -l < "$1" | tr -d ' ')" = "$2" ] && ! grep -qvE '^[A-Za-z0-9]{8}:[A-Za-z0-9]{8}$' "$1"; }
+
+# (a) 1-line file, 3 ports -> 3 fresh lines, the old line gone, the log names 1 and 3
+L="$TMP/stale_a.list"; echo "OldLogin1:OldPass1x" > "$L"; : > "$TMP/log_err"
+gen_creds 3 "$L" || fail "2b(a): generator failed"
+valid_lines "$L" 3 || fail "2b(a): expected 3 fresh 8+8 lines: $(cat "$L")"
+grep -q OldLogin1 "$L" && fail "2b(a): the old line survived"
+grep -q "regenerating" "$TMP/log_err" && grep -q "1 line" "$TMP/log_err" && grep -q "needs 3" "$TMP/log_err" || fail "2b(a): the log must name 1 and 3: $(cat "$TMP/log_err")"
+# (e) no .tmp left, mode 600
+ls "$TMP"/stale_a.list.tmp >/dev/null 2>&1 && fail "2b(e): a .tmp file was left"
+[ "$(mode_of "$L")" = 600 ] || fail "2b(e): mode $(mode_of "$L") != 600"
+
+# (b) 5 lines, 3 ports -> 3 fresh lines, none of the old logins
+L="$TMP/stale_b.list"; printf 'OldA0001:xxxxxxx1\nOldB0002:xxxxxxx2\nOldC0003:xxxxxxx3\nOldD0004:xxxxxxx4\nOldE0005:xxxxxxx5\n' > "$L"
+gen_creds 3 "$L" || fail "2b(b): generator failed"
+valid_lines "$L" 3 || fail "2b(b): $(cat "$L")"
+grep -q 'Old[A-E]000' "$L" && fail "2b(b): an old login survived"
+
+# (c) a malformed line with the right count -> regenerated (empty line / no colon / dash)
+for bad in 'x1234567:y1234567\n\nz1234567:w1234567' 'x1234567:y1234567\nnocolon\nz1234567:w1234567' 'x1234567:y1234567\na-b:c\nz1234567:w1234567' 'x1234567:y1234567\n:onlypass\nz1234567:w1234567'; do
+  L="$TMP/stale_c.list"; printf "$bad\n" > "$L"; : > "$TMP/log_err"
+  gen_creds 3 "$L" || fail "2b(c): generator failed"
+  valid_lines "$L" 3 || fail "2b(c): not regenerated ($bad): $(cat "$L")"
+  grep -q "regenerating" "$TMP/log_err" || fail "2b(c): no regenerate note ($bad)"
+done
+# a blank-only trailing newline is not a line: exactly 3 valid lines are reused verbatim
+L="$TMP/stale_d.list"; printf 'Keep0001:Pass0001\nKeep0002:Pass0002\nKeep0003:Pass0003\n' > "$L"; before="$(cksum < "$L")"; : > "$TMP/log_err"
+gen_creds 3 "$L" || fail "2b(d): generator failed"
+[ "$(cksum < "$L")" = "$before" ] && [ ! -s "$TMP/log_err" ] || fail "2b(d): an exact list must be reused verbatim and silently"
+# the validity helpers themselves
+( credentials_list_is_valid "$L" 3 && ! credentials_list_is_valid "$L" 2 && ! credentials_list_is_valid "$L" 4 && ! credentials_list_is_valid "$TMP/none.list" 3 \
+  && [ "$(list_line_count "$TMP/none.list")" = 0 ] && [ "$(list_line_count "$L")" = 3 ] ) || fail "2b: credentials_list_is_valid / list_line_count"
+ok "L-U2: a stale credentials list (short / long / malformed) is regenerated atomically (0600, no .tmp), an exact one is reused verbatim"
 
 echo "test_fleet_health.sh — all $PASS generator checks passed"
