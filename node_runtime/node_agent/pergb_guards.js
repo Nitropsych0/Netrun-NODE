@@ -36,6 +36,10 @@ const SOFT_SHARE = 0.2;
 const IPV4_CLOSE_PCT = 60;
 const IPV4_REOPEN_PCT = 50;
 const LOGFS_MIN_FREE_PCT = 10;
+// P-N6: the 3proxy logs live on a 16 GB loop image; at ~2 000 conn/s it holds ~15 h of
+// backlog if the meter stalls. Warn (admission stays open) from 70 % used; the
+// gate at 10 % free stays what closes admission. Overridable: settings.logFsWarnUsedPct.
+const LOGFS_WARN_USED_PCT = 70;
 const METER_MAX_LAG_SEC = 30;
 const PROBE_FAILURES = 2;
 const RECOVER_EVERY_MS = 30000;
@@ -115,6 +119,8 @@ function createGuards(deps) {
     memory: null,
     pids: null,
     logFsFreePct: null,
+    logFsUsedPct: null,
+    logFsWarn: false,
     meterLagSec: null,
     diskClosed: false,
     lagClosed: false,
@@ -239,8 +245,18 @@ function createGuards(deps) {
     if (st.level !== prevLevel) log.log(`[pergb-guards] admission level ${prevLevel} -> ${st.level} (budget ${st.budgetPct === null ? "?" : st.budgetPct.toFixed(1)} %)`);
     st.logFsFreePct = logFsFreePct();
     st.diskClosed = st.logFsFreePct !== null && st.logFsFreePct < LOGFS_MIN_FREE_PCT;
+    st.logFsUsedPct = st.logFsFreePct === null ? null : 100 - st.logFsFreePct;
     st.meterLagSec = deps.meterLagSec ? deps.meterLagSec() : null;
     st.lagClosed = st.meterLagSec !== null && st.meterLagSec > METER_MAX_LAG_SEC;
+    const warnAt = Number.isFinite(settings.logFsWarnUsedPct) ? settings.logFsWarnUsedPct : LOGFS_WARN_USED_PCT;
+    const wasWarn = st.logFsWarn;
+    st.logFsWarn = st.logFsUsedPct !== null && st.logFsUsedPct >= warnAt;
+    if (st.logFsWarn && !wasWarn) {
+      // once per transition; lag-versus-volume is visible in the same line
+      const detail = { usedPct: Math.round(st.logFsUsedPct * 10) / 10, meterLagSec: st.meterLagSec };
+      log.log(`[pergb-guards] pergb_log_fs_high: log image ${detail.usedPct} % used, meter lag ${detail.meterLagSec === null ? "?" : detail.meterLagSec} s`);
+      if (deps.onEvent) deps.onEvent("pergb_log_fs_high", detail);
+    }
     st.admissionOpen = !(st.level === "hard" || st.diskClosed || st.lagClosed);
     st.softAccounts = st.admissionOpen && st.level === "soft" ? await softAccountsNow() : [];
     try {
@@ -325,6 +341,10 @@ function createGuards(deps) {
       ipv4: st.ipv4,
       ipv4AdmissionOpen: st.ipv4Open,
       logFsFreePct: st.logFsFreePct === null ? null : Math.round(st.logFsFreePct * 10) / 10,
+      logFsUsedPct: st.logFsUsedPct === null ? null : Math.round(st.logFsUsedPct * 10) / 10,
+      logFsWarn: st.logFsWarn,
+      // additive soft signals (admission is NOT closed by them); closedBy is unchanged
+      warnings: [st.logFsWarn ? "log_fs_warn" : null].filter(Boolean),
       meterLagSec: st.meterLagSec,
       admissionOpen: st.admissionOpen,
       softAccounts: st.softAccounts,
@@ -347,6 +367,7 @@ module.exports = {
   IPV4_CLOSE_PCT,
   IPV4_REOPEN_PCT,
   LOGFS_MIN_FREE_PCT,
+  LOGFS_WARN_USED_PCT,
   METER_MAX_LAG_SEC,
   nextLevel,
   nextIpv4Open,

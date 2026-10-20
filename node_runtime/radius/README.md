@@ -44,6 +44,29 @@ and `netrun-radius.service`.
 READY is sent after the state is loaded: ~0.5 s with 50k lists, 100k bindings
 and 25k accounts (measured on an M-series Mac; RSS ~235 MiB, live ~160 MiB).
 
+## Saturation signals (P-N2)
+
+The UDP loop is ONE thread (decode, HMAC, password check, a lock per authorisation):
+~2 000 requests/s measured on a node, tens of thousands/s in-process. Overload does
+not restart the service (the watchdog is pinged by the sweeper while the loop
+iterates; a pass is at most `DRAIN_MAX` = 512 datagrams) — it shows as the 16 MiB
+receive buffer filling and the kernel DROPPING datagrams (3proxy times out and the
+customer's connection fails). `status` therefore carries a `load` block, which the
+node agent exports as `/pergb` status `radius.*`:
+
+| `load` key | meaning |
+|---|---|
+| `requests`, `sendErrors`, `malformed`, `badAuthenticator` | engine counters since start (`sendErrors` > 0: replies the kernel refused) |
+| `drainFull` | passes that consumed all `DRAIN_MAX` datagrams = the backlog never emptied |
+| `loopMaxMs` | slowest drain pass of the last 30-60 s (two `LOOP_WINDOW_SEC` windows, decays) |
+| `udpDrops`, `udpRxQueue` | the socket's `drops` and `rx_queue` (bytes) from `/proc/net/udp`, sampled every 5 s; `null` where unreadable (not Linux, IPv6 bind) |
+
+plus `latency.p50Ms/p99Ms`. Alert on `udpDrops` growing between polls or `drainFull`
+growing; a high `udpRxQueue` that falls again is only a burst. Scale-up options, NOT
+implemented and gated on those signals firing on a real node: a short (login, port)
+accept cache in 3proxy-pergb's auth, a small C/Go RADIUS front, or `SO_REUSEPORT` with
+N processes (needs a shared state file / single sqlite writer).
+
 ## Request path
 
 `NAS-Port` in `[base, base+count)` → username (I1) → probe? → list exists,

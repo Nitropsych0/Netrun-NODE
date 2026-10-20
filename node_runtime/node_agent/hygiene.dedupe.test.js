@@ -12,6 +12,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 
 const h = require("./hygiene.js");
+const snapLib = require("./proc_snapshot.js");
 
 const NOW = Date.parse("2026-10-07T12:00:00.000Z");
 const OPT = "/opt/netrun/proxyserver";
@@ -26,7 +27,7 @@ const NOISE = [
   { pid: 903, age: 50, args: "[3proxy] <defunct>" },
 ];
 
-function fakeHost({ procs, listening = [], busy = false, cfgs = {}, env = {}, psFails = false, ssFails = false, onPs = null } = {}) {
+function fakeHost({ procs, listening = [], busy = false, cfgs = {}, env = {}, psFails = false, ssFails = false, onPs = null, snapshot = null } = {}) {
   const state = {
     procs: [...procs, ...NOISE].map((p) => ({ ...p })),
     calls: [],
@@ -80,9 +81,10 @@ function fakeHost({ procs, listening = [], busy = false, cfgs = {}, env = {}, ps
     now: () => NOW,
     isGenerationBusy: async () => (typeof state.busy === "function" ? state.busy() : state.busy),
     preferRoot: OPT,
+    snapshot,
     log: { log: sink("log"), warn: sink("warn"), error: sink("error") },
   });
-  return { hygiene, state };
+  return { hygiene, state, run };
 }
 
 const signals = (state, sig) => state.kills.filter(([, s]) => s === sig).map(([pid]) => pid);
@@ -342,4 +344,33 @@ test("start(): cron at once, first dedupe after 60 s, both every interval; stop(
   t.mock.timers.tick(600_000);
   await flush();
   assert.strictEqual(calls.length, 4, "stopped");
+});
+
+// Audit P-N4 — the reaper decides kills, so it reads {fresh: true} even when a
+// shared snapshot holds a younger view; its read then refreshes that snapshot.
+test("P-N4: with a shared snapshot the reaper still reads fresh (never a cached table) and writes its read through", async () => {
+  let host = null;
+  const snapshot = snapLib.createProcSnapshot({
+    run: (...a) => host.run(...a),
+    now: () => NOW,
+    ttlMs: 10000,
+    etimes: true,
+  });
+  const procs = [
+    { pid: 101, age: 50, args: viaRoot(18100) },
+    { pid: 202, age: 40, args: viaOpt(18100) },
+  ];
+  host = fakeHost({ procs, listening: [18100], snapshot });
+  const { hygiene, state } = host;
+  // /health warmed the cache while the duplicate still ran ...
+  await snapshot.ps();
+  const warm = state.psCount;
+  // ... and the duplicate died before the reaper's tick
+  state.procs = state.procs.filter((p) => p.pid !== 101);
+  const res = await hygiene.dedupe();
+  assert.strictEqual(res.outcome, "ok");
+  assert.deepStrictEqual(state.kills, [], "a cached view would have SIGTERMed a pid that is gone");
+  assert.strictEqual(state.psCount, warm + 1, "the reaper ran its own ps");
+  await snapshot.ps();
+  assert.strictEqual(state.psCount, warm + 1, "and /health now shares that read");
 });

@@ -15,6 +15,7 @@ const assert = require("node:assert");
 const sup = require("./supervisor.js");
 const cfgStatus = require("./cfg_status.js");
 const { withProcessLock } = require("./process_lock.js");
+const snapLib = require("./proc_snapshot.js");
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "netrun-supervisor-"));
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
@@ -113,7 +114,7 @@ test("planAnchors: re-add only addresses of a /64 the node has; deprecate only n
 });
 
 // A fake node: cfg dir on disk, ps / ss / systemctl / ip answered from state.
-function fakeNode(name, { cfgs = {}, env = {}, nowMs = 10_000_000, bootTimeMs = () => Date.now(), gc = null } = {}) {
+function fakeNode(name, { cfgs = {}, env = {}, nowMs = 10_000_000, bootTimeMs = () => Date.now(), gc = null, snapshot = null } = {}) {
   const dir = path.join(TMP, name, "3proxy");
   fs.mkdirSync(dir, { recursive: true });
   for (const [file, text] of Object.entries(cfgs)) {
@@ -164,12 +165,13 @@ function fakeNode(name, { cfgs = {}, env = {}, nowMs = 10_000_000, bootTimeMs = 
     readFile: async () => host.ifInet6,
     isGenerationBusy: async () => host.busy,
     processLock: withProcessLock,
+    snapshot,
     now: () => host.nowMs,
     log: quietLog,
     bootTimeMs, // default: every fixture cfg (mtime 1970) predates the boot
     ...(gc ? { ownedAddresses: async () => gc.owned(), readDisabledAnchors: async () => gc.disabled() } : {}),
   });
-  return { dir, host, supervisor, statusPath };
+  return { dir, host, supervisor, statusPath, run };
 }
 
 const CFG = (sp, addr) => `daemon\nnserver 127.0.0.1\nflush\nsocks -6 -a -p${sp} -i1.2.3.4 -e${addr}\nproxy -6 -n -a -p${sp - 10000} -i127.0.0.1 -e${addr}\n`;
@@ -664,4 +666,30 @@ test("tick: the GC deletes nothing while the rotation state is unknown, the disa
     assert.deepStrictEqual(host.batches.filter((b) => b.includes("address del")), [], c.name);
     assert.strictEqual(supervisor.status().gcSkipped, c.skipped, c.name);
   }
+});
+
+// Audit P-N4 — a respawn decision never rests on a cached ps / ss view: a batch that
+// came back between the cache fill and the tick must not be started a second time.
+test("P-N4: with a shared snapshot the supervisor reads fresh — a cached 'dead' view does not trigger a second respawn", async () => {
+  let node = null;
+  const snapshot = snapLib.createProcSnapshot({ run: (...a) => node.run(...a), now: () => node.host.nowMs, ttlMs: 10_000, etimes: true });
+  node = fakeNode("snapshot_fresh", { cfgs: { "3proxy_20000.cfg": CFG(20000, "2001:db8:0:1::b") }, snapshot });
+  const { dir, host, supervisor } = node;
+  let r = await supervisor.tick();
+  assert.strictEqual(r.outcome, "ok");
+  assert.deepStrictEqual(supervisor.status().pendingDown, [20000], "dead on the first sighting");
+  await snapshot.ps(); // /health caches the dead view ...
+  await snapshot.ss([20000]);
+  host.procs = [`91 5 /opt/netrun/proxyserver/3proxy/bin/3proxy ${path.join(dir, "3proxy_20000.cfg")}`]; // ... then the batch is back
+  host.listening = new Set([20000]);
+  host.nowMs += 5_000; // inside the cache TTL
+  const psBefore = host.calls.filter((c) => c.startsWith("ps ")).length;
+  r = await supervisor.tick();
+  assert.deepStrictEqual(host.spawned, [], "no respawn: the supervisor saw the batch running");
+  assert.ok(host.calls.filter((c) => c.startsWith("ps ")).length > psBefore, "it ran its own ps");
+  assert.deepStrictEqual(supervisor.status().pendingDown, []);
+  // its fresh read is now what /health gets
+  const psNow = host.calls.filter((c) => c.startsWith("ps ")).length;
+  assert.match((await snapshot.ps()).stdout, /^91 /);
+  assert.strictEqual(host.calls.filter((c) => c.startsWith("ps ")).length, psNow);
 });

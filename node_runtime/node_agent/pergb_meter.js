@@ -838,6 +838,7 @@ function createMeter(opts = {}) {
       unknownRecords: state.unknown.records,
       unknownSample: state.unknown.sample.slice(0, 20),
       pendingFiles: pending,
+      logFs: fsUsage(), // { total, free, usedPct, freePct } of the loop image; null when unreadable (P-N6)
       logins: Object.keys(state.logins).length,
       loginsKnown: known ? known.size : null,
       pieceLogins: known ? [...known.values()].filter((v) => v.kind === "piece").length : null,

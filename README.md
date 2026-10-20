@@ -1541,3 +1541,95 @@ body's `cwd` is never honoured (the agent's own cwd is used; a differing value i
 records `request.providedGeneratorScript` / `request.providedCwd` next to the values that actually
 ran. The orchestrator's canonical path is inside the default root, so nothing changes for it; a node
 with a non-standard `NETRUN_HOME` needs `NODE_AGENT_GENERATOR_ROOT` in its unit drop-in.
+
+<!-- lane: node-pergb-runtime -->
+## Per-GB runtime limits and signals
+
+### Slice limits: one sizing rule, reported back (P-U1)
+
+`netrun-pergb.slice` is sized from RAM in one rule, implemented in `pergb_runtime.js`
+(`maxConnsForRam`, `tasksMax`) and mirrored by `install_pergb.sh` `render_slices`
+(`scripts/test_install_pergb.sh` pins both to the same numbers):
+
+```text
+maxConns  <= MemoryMax / 100 KB - 2 x ports - 500      (RAM ceiling; clamped, with a warning)
+TasksMax   = 2 x ports + maxConns + 500                 (<= MemoryMax / 100 KB)
+```
+
+With the defaults (1536M, 1000 ports) the ceiling is 13228 connections and a default
+`maxConns` of 8000 gives `TasksMax=10500` — that figure in `deploy/node/netrun-pergb.slice`
+is only the default; the live value is the enable drop-in's. 22500 tasks (maxConns 20000)
+need `MemoryMax` of ~2.2G. `POST /pergb/enable` clamps a bigger `maxConns` instead of
+refusing it (an old orchestrator keeps working) and says so; a `sliceMemMax` too small for
+its ports (ceiling < 100) is `bad_params`.
+
+`GET /pergb/status` and the `POST /pergb/enable` response carry the EFFECTIVE limits as
+integers — `tasksMax`, `maxConns`, `sliceMemMax` (`null` while per-GB is off) — and
+`warnings: []` (`"max_conns_clamped"` while the requested `maxConns`, kept in
+`enable.json` `params`, is above the effective one). The enable response also has
+`applied.maxConnsRequested` / `applied.warnings`. Verify the live slice on every per-GB node:
+
+```bash
+systemctl show netrun-pergb.slice -p TasksMax -p MemoryMax
+cat /etc/systemd/system/netrun-pergb.slice.d/50-netrun-enable.conf
+```
+
+### RADIUS saturation signals in `/pergb` status (P-N2)
+
+`GET /pergb/status` (and the enable response) `radius` block carries, besides `p50Ms` /
+`p99Ms`, the single-threaded RADIUS loop's load: `requests`, `sendErrors`, `drainFull`,
+`udpDrops`, `udpRxQueue`, `loopMaxMs` (`null` = unknown: ctl down, an older RADIUS, or no
+`/proc/net/udp`). `udpDrops` growing between polls means datagrams were lost — per-GB
+auth is failing right now; the watchdog does NOT fire on overload. Details and the
+deferred scale-up options (auth cache, `SO_REUSEPORT`): `node_runtime/radius/README.md`.
+
+### Log image usage warning (P-N6)
+
+3proxy-pergb writes one log line per connection onto the 16 GB loop image
+(`NETRUN_PERGB_LOG_SIZE`); at ~2 000 conn/s that is ~25 GB/day raw, i.e. ~15 h of backlog
+if the meter stalls (a full image = unmetered traffic, not an outage). `/pergb` status
+now reports `logFsUsedPct` (also in `guards`), `logFsWarn` (`true` from 70 % used;
+admission stays open) and `warnings: ["log_fs_warn", ...]`; the existing admission gate
+(`guards.closedBy: ["log_fs"]` at < 10 % free) and the meter-lag gate are unchanged.
+The meter's own status has `logFs: {total, free, usedPct, freePct}`. The first crossing
+logs `pergb_log_fs_high` (and an agent event) with `meterLagSec`, so a stalled meter and
+plain volume can be told apart. Alert on `logFsWarn`.
+
+### One ps / ss scan for /health, hygiene and the supervisor (P-N4)
+
+`proc_snapshot.js` keeps ONE `ps -eo pid=,etimes=,args=` and one `ss -ltnH sport = …`
+result per port set for `NODE_AGENT_SNAPSHOT_TTL_MS` (default 10 000; `0` = every call
+scans, argv as before). `/health` (5-10 calls a minute) reads it; concurrent calls share
+one running scan; failed scans are never cached. hygiene's reaper and the supervisor decide
+kills / respawns, so they read `fresh` (never a cached view) and their read refreshes the
+cache. Every locked process-table change (`process_lock.js`), every released generation
+lock, and a `/health` that finds a `/generate` running, drop or bypass it, so health never
+shows a pre-generation table. `/health` has an additive `scanCache: {ttlMs, hits, misses,
+coalesced, lastRefreshAt, entries}`. After a deploy, compare `/health` latency and agent CPU
+on a loaded node (`scanCache.hits` should dominate `misses`).
+
+### nft counter dump cost (P-N3)
+
+`GET /accounting` still reads ONE bulk `nft -j list counters` per poll cycle (a targeted
+per-counter read measured slower), cached across the 500-port chunks. What changed: the dump
+timeout scales with the counter count of the previous dump — `max(20 s, ceil(count / 12 000 x
+1.1 s x 6))`, at most `NODE_AGENT_NFT_DUMP_TIMEOUT_MAX_MS` (60 s) — so a growing node degrades
+gradually instead of hitting a fixed 20 s wall; a dump slower than `NODE_AGENT_NFT_DUMP_WARN_MS`
+(5 s) logs `[accounting] slow nft counter dump: <ms> for <n> items`, and a failed one
+`nft counter dump failed after <ms> (timeout …)` (each at most every 5 min; grep the agent
+journal). The orchestrator's `TRAFFIC_POLL_REQUEST_TIMEOUT_SEC` must exceed 60 s + parse time
+for the scaling to matter (config note for the orchestrator repo).
+
+### Ephemeral ports and `tcp_tw_reuse` on per-GB nodes (P-N5)
+
+`install_node_v2.sh` sets `net.ipv4.ip_local_port_range = 1024 8000` (6 977 ports per source
+address). Per-piece 3proxy binds its own IPv6 before it connects, so each proxy has its own
+pool (~110 new connections/s per proxy at 60 s TIME_WAIT). The per-GB haproxy → 3proxy
+loopback leg uses ONE destination per listener and lives on loopback `tcp_tw_reuse`:
+`net.ipv4.tcp_tw_reuse = 2` is pinned in `deploy/node/99-zz-netrun-tcp.conf` (installed by the
+installer / follow-up, and onto existing nodes by `apply_capacity_tuning.sh --only
+fingerprint`, which also removes a legacy `tcp_tw_reuse` line from `/etc/sysctl.conf`).
+**Never `0` on a per-GB node**: it caps every listener at ~115 conn/s (a cliff without an
+error); `1` would also recycle sockets towards the internet. `GET /health` →
+`nodeTuning.tcpTwReuse` / `tcpTwReuseOk` (false only for `0`). Ops: `sysctl
+net.ipv4.tcp_tw_reuse` must print 2; watch `ss -s` TIME-WAIT on per-GB nodes.

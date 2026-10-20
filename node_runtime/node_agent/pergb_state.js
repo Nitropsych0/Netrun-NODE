@@ -584,6 +584,7 @@ function createPergb(deps = {}) {
     run,
     now,
     log,
+    onEvent: (type, detail) => event(type, detail),
     settings: { cgroupRoot: settings.cgroupRoot, sliceCgroup: rt.SLICE_CGROUP, logDir: rtSettings.logDir, ...(deps.guardSettings || {}) },
     readFile: deps.readFile,
     statfs: deps.statfs,
@@ -1107,7 +1108,7 @@ function createPergb(deps = {}) {
     startLoops();
     event("pergb_enabled", { base: enableDoc.base, changed: applied.changed.length, restarted: applied.restarted });
     const st = await status();
-    return { status: 200, body: { ...st, applied: { changed: applied.changed, restarted: applied.restarted, started: applied.started, reloaded: applied.reloaded, secretCreated: applied.secretCreated }, excludedPush: ex, ipv4: ipv4Result } };
+    return { status: 200, body: { ...st, applied: { warnings: applied.warnings, maxConnsRequested: applied.maxConnsRequested, changed: applied.changed, restarted: applied.restarted, started: applied.started, reloaded: applied.reloaded, secretCreated: applied.secretCreated }, excludedPush: ex, ipv4: ipv4Result } };
   }
 
   async function reapplyGuard() {
@@ -1384,6 +1385,8 @@ function createPergb(deps = {}) {
     }
   }
 
+  const loadOf = (st, key) => (st && st.load && st.load[key] !== undefined ? st.load[key] : null);
+
   async function status() {
     reloadIfChanged();
     const e = enableDoc;
@@ -1403,10 +1406,18 @@ function createPergb(deps = {}) {
     }
     const g = guards.status();
     const m = meter.status();
+    const lim = rt.limitsOfEnable(e);
     return {
       success: true,
       enabled: Boolean(e && e.enabled === true),
       version: VERSION,
+      // the effective slice limits (after the RAM ceiling), integers or null
+      tasksMax: lim.tasksMax,
+      maxConns: lim.maxConns,
+      sliceMemMax: lim.sliceMemMax,
+      logFsUsedPct: g.logFsUsedPct,
+      logFsWarn: g.logFsWarn,
+      warnings: [...lim.warnings, ...g.warnings],
       base: e ? e.base : null,
       count: e ? e.count : null,
       last: e ? e.last : null,
@@ -1427,6 +1438,13 @@ function createPergb(deps = {}) {
         ready: st ? st.ready : null,
         p50Ms: st && st.latency ? st.latency.p50Ms : null,
         p99Ms: st && st.latency ? st.latency.p99Ms : null,
+        // P-N2 saturation signals (engine op_status "load"); null = unknown (ctl down / an older radius)
+        requests: loadOf(st, "requests"),
+        sendErrors: loadOf(st, "sendErrors"),
+        drainFull: loadOf(st, "drainFull"),
+        udpDrops: loadOf(st, "udpDrops"),
+        udpRxQueue: loadOf(st, "udpRxQueue"),
+        loopMaxMs: loadOf(st, "loopMaxMs"),
         dbRecovered: st ? st.dbRecovered : null,
         admission: st ? st.admission : null,
         ipv4AdmissionOpen: st ? st.ipv4AdmissionOpen : null,
@@ -1444,6 +1462,8 @@ function createPergb(deps = {}) {
         pidsPct: g.pidsPct,
         ipv4PortsPct: g.ipv4PortsPct,
         logFsFreePct: g.logFsFreePct,
+        logFsUsedPct: g.logFsUsedPct,
+        logFsWarn: g.logFsWarn,
         meterLagSec: m.meterLagSec,
         clockSynced: g.clockSynced,
         admissionOpen: g.admissionOpen,

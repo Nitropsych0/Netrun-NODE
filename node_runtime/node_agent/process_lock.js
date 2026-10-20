@@ -15,6 +15,13 @@
 
 let tail = Promise.resolve();
 let depth = 0;
+// P-N4 — subscribers told after every locked section: the process table may have
+// changed, so a cached ps / ss snapshot (proc_snapshot.js) is no longer true.
+const listeners = [];
+
+function onSettled(fn) {
+  listeners.push(fn);
+}
 
 function withProcessLock(fn) {
   const run = tail.then(async () => {
@@ -23,6 +30,11 @@ function withProcessLock(fn) {
       return await fn();
     } finally {
       depth -= 1;
+      for (const l of listeners) {
+        try {
+          l();
+        } catch {}
+      }
     }
   });
   tail = run.catch(() => {});
@@ -33,4 +45,4 @@ function isLocked() {
   return depth > 0;
 }
 
-module.exports = { withProcessLock, isLocked };
+module.exports = { withProcessLock, isLocked, onSettled };

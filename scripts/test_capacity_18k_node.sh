@@ -53,9 +53,12 @@ for kv in 'net.ipv4.ip_local_port_range = 1024 8000' 'net.ipv6.conf.all.accept_r
 done
 # Audit FP-01 — the TCP signature lives in its own file (sorts after /etc/sysctl.conf).
 for kv in 'net.ipv4.tcp_timestamps = 1' 'net.ipv4.tcp_mtu_probing = 1' 'net.ipv4.ip_default_ttl = 64' \
-          'net.ipv4.tcp_sack = 1' 'net.ipv4.tcp_window_scaling = 1' 'net.ipv4.tcp_rmem = 4096 131072 6291456'; do
+          'net.ipv4.tcp_sack = 1' 'net.ipv4.tcp_window_scaling = 1' 'net.ipv4.tcp_rmem = 4096 131072 6291456' \
+          'net.ipv4.tcp_tw_reuse = 2'; do
   grep -qx "$kv" "$ROOT_DIR/deploy/node/99-zz-netrun-tcp.conf" || fail "TCP signature file lacks: $kv"
 done
+! grep -vE '^[[:space:]]*#' "$TMP/installer-99.conf" | grep -qE 'tcp_tw_reuse' || fail "tcp_tw_reuse belongs in 99-zz-netrun-tcp.conf only (one place)"
+grep -qE '^net.ipv4.tcp_tw_reuse = [01]$' "$ROOT_DIR/deploy/node/99-zz-netrun-tcp.conf" && fail "tcp_tw_reuse must stay 2 (0 = ~115 conn/s cliff on the per-GB loopback leg, 1 = also external sockets)"
 ! grep -qE 'tcp_timestamps|maxseg|proxy_normalization' "$TMP/installer-99.conf" || fail "installer 99-netrun.conf still carries TCP signature keys"
 ! grep -vE '^[[:space:]]*#' "$INSTALL" | grep -qE 'maxseg size set|add table inet proxy_normalization' || fail "installer still adds the MSS rule / normalization table"
 grep -q 'install -m 0644 "$src" "$SYSCTL_TCP_FILE"' "$INSTALL" || fail "installer does not install the TCP signature file"

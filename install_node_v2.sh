@@ -286,6 +286,10 @@ net.core.somaxconn = 8192
 # 3proxy uses plain connect(), whose ports are reused per destination port.
 # The one node-wide pool is IPv4 egress (bind 0.0.0.0:0), used only in the
 # dualstack egress mode for IPv4-only targets.
+# The per-GB loopback leg (one destination per listener, ~115 new connections/s
+# per listener from this range at 60 s TIME_WAIT) additionally relies on
+# net.ipv4.tcp_tw_reuse = 2 (loopback reuse) — pinned in 99-zz-netrun-tcp.conf,
+# never 0 on a per-GB node (audit P-N5; /health nodeTuning.tcpTwReuse).
 net.ipv4.ip_local_port_range = 1024 8000
 fs.file-max = 2097152
 

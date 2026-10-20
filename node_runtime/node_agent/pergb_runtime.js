@@ -249,9 +249,9 @@ function normalizeParams(raw) {
   if (dedicated !== null && dedicated !== p.egressIpv4) return bad("dedicatedIpv4, when set, is the egressIpv4");
   const family = p.family === undefined || p.family === null ? "dualstack" : p.family;
   if (!FAMILIES.has(family)) return bad("family must be dualstack or ipv6_only");
-  const maxConns =
+  const maxConnsAsked =
     p.maxConns === undefined || p.maxConns === null ? DEFAULT_MAX_CONNS : intIn(p.maxConns, 100, 1000000);
-  if (maxConns === null) return bad("maxConns must be an integer 100..1000000");
+  if (maxConnsAsked === null) return bad("maxConns must be an integer 100..1000000");
   const logdump =
     p.logdumpBytes === undefined || p.logdumpBytes === null ? DEFAULT_LOGDUMP : intIn(p.logdumpBytes, 4096, 1 << 30);
   if (logdump === null) return bad("logdumpBytes must be an integer 4096..1073741824");
@@ -269,11 +269,24 @@ function normalizeParams(raw) {
   const mem =
     p.sliceMemMax === undefined || p.sliceMemMax === null ? DEFAULT_SLICE_MEM_MAX : parseSize(p.sliceMemMax);
   if (mem === null || mem < 256 * 1024 * 1024) return bad("sliceMemMax must be a size of at least 256M");
+  // RAM ceiling: a connection costs ~100 KB of the slice's memory; the one
+  // sizing rule (maxConnsForRam) clamps instead of rejecting, so an old
+  // orchestrator that still sends 20000 keeps working — the clamp is reported.
+  const ceiling = maxConnsForRam(mem, count);
+  if (ceiling < 100) return bad(`sliceMemMax ${sizeText(mem)} is too small for ${count} ports (RAM ceiling ${ceiling} connections)`);
+  const warnings = [];
+  let maxConns = maxConnsAsked;
+  if (maxConnsAsked > ceiling) {
+    maxConns = ceiling;
+    warnings.push(WARN_MAX_CONNS_CLAMPED);
+  }
   const cpuWeight =
     p.cpuWeight === undefined || p.cpuWeight === null ? DEFAULT_CPU_WEIGHT : intIn(p.cpuWeight, 1, 10000);
   if (cpuWeight === null) return bad("cpuWeight must be an integer 1..10000");
   return {
     ok: true,
+    warnings,
+    maxConnsRequested: maxConnsAsked,
     params: {
       base,
       count,
@@ -438,9 +451,36 @@ function hopServers(name, listen, net, extra = "") {
   return out.join("\n");
 }
 
+// The ONE sizing rule for the per-GB slice: TasksMax = listener threads (2
+// per port) + one thread per connection + margin, and maxConns itself is
+// capped by RAM (maxConnsForRam), so TasksMax can never promise more tasks
+// than MemoryMax carries. deploy/node/install_pergb.sh render_slices applies
+// the same two formulas (scripts/test_install_pergb.sh pins them together).
+const WARN_MAX_CONNS_CLAMPED = "max_conns_clamped";
+const BYTES_PER_CONN = 100 * 1024;
+const TASKS_MARGIN = 500;
+
+function maxConnsForRam(sliceMemMax, count) {
+  return Math.floor(sliceMemMax / BYTES_PER_CONN) - 2 * count - TASKS_MARGIN;
+}
+
 function tasksMax(params) {
-  // listener threads (2 per port) + one thread per connection + margin
-  return 2 * params.count + params.maxConns + 500;
+  return 2 * params.count + params.maxConns + TASKS_MARGIN;
+}
+
+// The effective limits, as integers: what the slice really carries.
+function effectiveLimits(params) {
+  return { tasksMax: tasksMax(params), maxConns: params.maxConns, sliceMemMax: params.sliceMemMax };
+}
+
+// The same from enable.json (null for a disabled / unreadable one), plus the
+// warnings the enable left: the maxConns the orchestrator asked for (kept in
+// the raw params) that the RAM ceiling cut.
+function limitsOfEnable(e) {
+  const none = { tasksMax: null, maxConns: null, sliceMemMax: null, warnings: [] };
+  if (!e || e.enabled !== true || ![e.count, e.maxConns, e.sliceMemMax].every(Number.isInteger)) return none;
+  const asked = e.params && typeof e.params === "object" ? Number(e.params.maxConns) : NaN;
+  return { ...effectiveLimits(e), warnings: asked > e.maxConns ? [WARN_MAX_CONNS_CLAMPED] : [] };
 }
 
 function renderSliceDropin(params) {
@@ -881,6 +921,9 @@ async function apply(raw, deps = {}) {
 
   const result = {
     ok: true,
+    warnings: norm.warnings,
+    maxConnsRequested: norm.maxConnsRequested,
+    ...effectiveLimits(params),
     changed: [],
     restarted: [],
     started: [],
@@ -1223,6 +1266,10 @@ module.exports = {
   renderSliceDropin,
   renderParentSliceDropin,
   tasksMax,
+  maxConnsForRam,
+  effectiveLimits,
+  limitsOfEnable,
+  WARN_MAX_CONNS_CLAMPED,
   newSecret,
   parseHashFile,
   parseIdFile,

@@ -41,6 +41,8 @@ SWEEP_INTERVAL = 5.0
 PRUNE_INTERVAL = 3600.0
 UDP_STALE = 3.0
 DRAIN_MAX = 512
+LOOP_WINDOW_SEC = 30.0  # engine.loop_max_ms reports the slowest pass of the last 1-2 windows
+UDP_SAMPLE_SEC = 5.0  # /proc/net/udp drops / rx_queue sampling
 
 
 def sd_notify(msg: str) -> bool:
@@ -76,6 +78,34 @@ def listen_fds() -> list:
     except ValueError:
         return []
     return list(range(3, 3 + count))
+
+
+def read_udp_stats(sock_name, path="/proc/net/udp"):
+    """(drops, rx_queue_bytes) of the IPv4 UDP socket bound to `sock_name` = (host, port)
+    from /proc/net/udp, or (None, None) on any error (no /proc, IPv6, no row). The kernel
+    counts a datagram it could not queue (receive buffer full) in the last column; the
+    loop falling behind therefore shows as drops here, not as a watchdog restart."""
+    try:
+        host, port = sock_name[0], int(sock_name[1])
+        if ":" in host:
+            return None, None
+        ip = int.from_bytes(socket.inet_aton(host), "little")
+        want = "%08X:%04X" % (ip, port)
+        with open(path) as fh:
+            rows = fh.read().splitlines()[1:]
+        any_row = None
+        for row in rows:
+            f = row.split()
+            if len(f) < 13 or f[1] != want:
+                if len(f) >= 13 and f[1] == "00000000:%04X" % port:
+                    any_row = f
+                continue
+            return int(f[-1]), int(f[4].split(":")[1], 16)
+        if any_row is not None:  # bound to 0.0.0.0
+            return int(any_row[-1]), int(any_row[4].split(":")[1], 16)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None, None
 
 
 def open_udp(listen: str | None) -> socket.socket:
@@ -173,6 +203,8 @@ class Server:
                 continue
             if not ready or sock not in ready:
                 continue
+            t0 = time.monotonic()
+            drained = 0
             for _ in range(DRAIN_MAX):
                 try:
                     data, peer = sock.recvfrom(4096)
@@ -180,6 +212,7 @@ class Server:
                     break
                 except OSError:
                     break
+                drained += 1
                 try:
                     out = handle(data)
                 except Exception as e:  # a bad packet must never stop the loop
@@ -191,6 +224,7 @@ class Server:
                     except OSError:
                         eng.counters["sendErrors"] += 1
             eng.udp_alive = time.monotonic()
+            eng.note_loop(eng.udp_alive - t0, drained >= DRAIN_MAX)
 
     def _writer(self):
         eng = self.engine
@@ -206,9 +240,15 @@ class Server:
 
     def _sweeper(self):
         eng = self.engine
-        last_sweep = last_prune = 0.0
+        last_sweep = last_prune = last_udp = last_roll = 0.0
         while not self.stop.wait(1.0):
             mono = time.monotonic()
+            if mono - last_roll >= LOOP_WINDOW_SEC:
+                last_roll = mono
+                eng.roll_loop_max()
+            if mono - last_udp >= UDP_SAMPLE_SEC:
+                last_udp = mono
+                eng.udp_drops, eng.udp_rx_queue = read_udp_stats(self.sock.getsockname())
             if self.watchdog and mono - eng.udp_alive < UDP_STALE:
                 sd_notify("WATCHDOG=1")
             if mono - last_sweep >= SWEEP_INTERVAL:

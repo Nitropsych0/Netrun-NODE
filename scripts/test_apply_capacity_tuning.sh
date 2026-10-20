@@ -481,7 +481,7 @@ ok "security: dry run = guard diff + status, nothing written; apply = netrun-har
 
 # ── 17. fingerprint (opt-in, FP-01): TCP pins, sysctl.conf purge, normalization rules ─
 R="$(new_root fp)"
-printf 'net.ipv4.tcp_timestamps = 0\nnet.ipv4.tcp_rmem = 4096 87380 6291456\nnet.ipv4.icmp_echo_ignore_all = 1\nvm.swappiness = 10\n' > "$R/etc/sysctl.conf"
+printf 'net.ipv4.tcp_timestamps = 0\nnet.ipv4.tcp_rmem = 4096 87380 6291456\nnet.ipv4.tcp_tw_reuse = 0\nnet.ipv4.icmp_echo_ignore_all = 1\nvm.swappiness = 10\n' > "$R/etc/sysctl.conf"
 mkdir -p "$R/opt/netrun/node_runtime/soft/generator"
 echo '# new generator' > "$R/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh"
 ND="$TMP/norm"; mkdir -p "$ND"
@@ -492,7 +492,7 @@ before="$(snapshot "$R")"
 rc="$(NORM_DIR="$ND" run_tool "$R" --only fingerprint)"
 [ "$rc" = 0 ] && [ "$before" = "$(snapshot "$R")" ] || { cat "$TMP/out"; fail "fingerprint dry-run changed files"; }
 grep -q '1340 = reads as OpenVPN' "$TMP/out" || { cat "$TMP/out"; fail "audit: 1340 clamp not flagged"; }
-grep -qE 'fingerprint +would-apply .*tcp-signature-file sysctl.conf:net.ipv4.tcp_timestamps net.ipv4.tcp_rmem nft-normalization-rules:3;' "$TMP/out" || { cat "$TMP/out"; fail "fingerprint plan"; }
+grep -qE 'fingerprint +would-apply .*tcp-signature-file sysctl.conf:net.ipv4.tcp_timestamps net.ipv4.tcp_rmem net.ipv4.tcp_tw_reuse nft-normalization-rules:3;' "$TMP/out" || { cat "$TMP/out"; fail "fingerprint plan"; }
 ! grep -q 'nft-normalization-table' "$TMP/out" || { cat "$TMP/out"; fail "the plan still drops the normalization table"; }
 : > "$R/opt/netrun/jobs/.generation.lock"
 rc="$(NORM_DIR="$ND" run_tool "$R" --apply --only fingerprint)"
@@ -501,7 +501,8 @@ rm -f "$R/opt/netrun/jobs/.generation.lock" "$TMP/nft_batch.applied"
 rc="$(NORM_DIR="$ND" run_tool "$R" --apply --only fingerprint)"
 [ "$rc" = 0 ] || { cat "$TMP/out"; fail "fingerprint apply exit $rc"; }
 cmp -s "$REPO_ROOT/deploy/node/99-zz-netrun-tcp.conf" "$R/etc/sysctl.d/99-zz-netrun-tcp.conf" || fail "TCP signature file"
-! grep -qE 'tcp_timestamps|tcp_rmem' "$R/etc/sysctl.conf" || fail "pinned keys left in /etc/sysctl.conf"
+! grep -qE 'tcp_timestamps|tcp_rmem|tcp_tw_reuse' "$R/etc/sysctl.conf" || fail "pinned keys left in /etc/sysctl.conf (a legacy tcp_tw_reuse = 0 included)"
+grep -qx 'net.ipv4.tcp_tw_reuse = 2' "$R/etc/sysctl.d/99-zz-netrun-tcp.conf" || fail "tcp_tw_reuse = 2 not pinned in the TCP file"
 grep -qx 'net.ipv4.icmp_echo_ignore_all = 1' "$R/etc/sysctl.conf" && grep -qx 'vm.swappiness = 10' "$R/etc/sysctl.conf" || fail "unrelated sysctl.conf lines removed"
 compgen -G "$R/etc/sysctl.conf.bak-fingerprint-*" > /dev/null || fail "no sysctl.conf backup"
 grep -qx "sysctl -p $R/etc/sysctl.d/99-zz-netrun-tcp.conf" "$CALLS" || fail "pins not applied at runtime"

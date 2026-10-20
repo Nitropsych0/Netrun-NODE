@@ -16,6 +16,7 @@ import rtest
 from rtest import BASE, account, plist
 
 import ctl
+import netrun_radius
 import proto
 import sockact
 import state
@@ -108,6 +109,34 @@ class Proc(unittest.TestCase):
         return self.recv(self.send(user, port))
 
 
+PROC_UDP = """  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  233: 0100007F:0714 00000000:0000 07 00000000:000041A0 00:00000000 00000000     0        0 11111 2 0000000000000000 42
+  234: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 22222 2 0000000000000000 0
+"""
+
+
+class UdpStats(unittest.TestCase):
+    """P-N2: the loop falling behind shows as kernel drops / rx_queue, read from /proc/net/udp."""
+
+    def proc(self, text):
+        d = rtest.tmpdir(self)
+        path = os.path.join(d, "udp")
+        with open(path, "w") as fh:
+            fh.write(text)
+        return path
+
+    def test_reads_drops_and_rx_queue_of_the_listening_socket(self):
+        path = self.proc(PROC_UDP)
+        self.assertEqual(netrun_radius.read_udp_stats(("127.0.0.1", 1812), path), (42, 0x41A0))
+        self.assertEqual(netrun_radius.read_udp_stats(("127.0.0.1", 53), path), (0, 0), "a wildcard bind matches too")
+
+    def test_fails_soft(self):
+        self.assertEqual(netrun_radius.read_udp_stats(("127.0.0.1", 1812), "/nonexistent/udp"), (None, None))
+        self.assertEqual(netrun_radius.read_udp_stats(("127.0.0.1", 9999), self.proc(PROC_UDP)), (None, None), "no row")
+        self.assertEqual(netrun_radius.read_udp_stats(("::1", 1812), self.proc(PROC_UDP)), (None, None), "IPv6 not read")
+        self.assertEqual(netrun_radius.read_udp_stats(("127.0.0.1", 1812), self.proc("garbage\nnot a row\n")), (None, None))
+
+
 class SocketActivation(Proc):
     def test_queued_datagrams_are_answered_after_a_restart(self):
         p, _ = self.start()
@@ -153,6 +182,27 @@ class SocketActivation(Proc):
             time.sleep(0.5)
         else:
             self.fail("the new secret was not picked up")
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(p.wait(10), 0)
+
+    def test_status_load_block_after_traffic(self):
+        """P-N2: the running server fills the load block (loop time, requests; drops where /proc has them)."""
+        p, _ = self.start()
+        self.push_basics()
+        for i in range(5):
+            self.assertTrue(self.ask("netrun-rotaaaa").accepted)
+        load = ctl.call(self.ctl_path, {"op": "status"})["load"]
+        self.assertGreaterEqual(load["requests"], 5)
+        self.assertEqual(load["sendErrors"], 0)
+        self.assertGreater(load["loopMaxMs"], 0.0, "the drain passes were timed")
+        self.assertIn("udpDrops", load)
+        if os.path.exists("/proc/net/udp"):
+            deadline = time.monotonic() + 8
+            while load["udpDrops"] is None and time.monotonic() < deadline:
+                time.sleep(0.2)
+                load = ctl.call(self.ctl_path, {"op": "status"})["load"]
+            self.assertIsInstance(load["udpDrops"], int)
+            self.assertIsInstance(load["udpRxQueue"], int)
         p.send_signal(signal.SIGTERM)
         self.assertEqual(p.wait(10), 0)
 

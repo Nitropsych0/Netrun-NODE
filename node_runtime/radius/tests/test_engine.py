@@ -224,6 +224,35 @@ class Basics(unittest.TestCase):
         self.assertGreaterEqual(st["latency"]["p99Ms"], st["latency"]["p50Ms"])
 
 
+    def test_load_block_has_the_saturation_signals(self):
+        """P-N2: op_status "load" carries exactly what the agent exports as /pergb radius.*."""
+        for _ in range(5):
+            ask(self.eng, "netrun-rotaaaa")
+        load = self.eng.dispatch({"op": "status"})["load"]
+        self.assertEqual(
+            set(load),
+            {"requests", "sendErrors", "malformed", "badAuthenticator", "drainFull", "loopMaxMs", "udpDrops", "udpRxQueue"},
+        )
+        self.assertEqual(load["requests"], 5)
+        self.assertEqual((load["sendErrors"], load["drainFull"], load["loopMaxMs"]), (0, 0, 0.0))
+        self.assertEqual((load["udpDrops"], load["udpRxQueue"]), (None, None), "unknown until the sweeper samples /proc")
+
+    def test_loop_max_and_drain_full_decay(self):
+        eng = self.eng
+        eng.note_loop(0.012, False)
+        eng.note_loop(0.004, True)
+        load = eng.dispatch({"op": "status"})["load"]
+        self.assertEqual((load["loopMaxMs"], load["drainFull"]), (12.0, 1))
+        eng.roll_loop_max()  # one window later the spike is still reported ...
+        self.assertEqual(eng.dispatch({"op": "status"})["load"]["loopMaxMs"], 12.0)
+        eng.roll_loop_max()  # ... and gone after the second
+        self.assertEqual(eng.dispatch({"op": "status"})["load"]["loopMaxMs"], 0.0)
+        self.assertEqual(eng.dispatch({"op": "status"})["load"]["drainFull"], 1, "a counter, it stays")
+        eng.udp_drops, eng.udp_rx_queue = 7, 4096
+        load = eng.dispatch({"op": "status"})["load"]
+        self.assertEqual((load["udpDrops"], load["udpRxQueue"]), (7, 4096))
+
+
 class DeadmanAndNear(unittest.TestCase):
     def setUp(self):
         self.clock = rtest.FakeClock()
