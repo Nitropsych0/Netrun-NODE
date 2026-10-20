@@ -178,7 +178,7 @@ WATCHDOG_SCRIPT="$ROOT/opt/netrun/scripts/watchdog_probe.sh"
 TCP_FILE="$ROOT/etc/sysctl.d/99-zz-netrun-tcp.conf"
 SYSCTL_CONF="$ROOT/etc/sysctl.conf"
 PROC_PIPE_SOFT="$ROOT/proc/sys/fs/pipe-user-pages-soft"
-TCP_KEYS="net.ipv4.ip_default_ttl net.ipv4.tcp_timestamps net.ipv4.tcp_sack net.ipv4.tcp_window_scaling net.ipv4.tcp_ecn net.ipv4.tcp_rmem net.ipv4.route.min_adv_mss net.ipv4.tcp_mtu_probing"
+TCP_KEYS="net.ipv4.ip_default_ttl net.ipv4.tcp_timestamps net.ipv4.tcp_sack net.ipv4.tcp_window_scaling net.ipv4.tcp_ecn net.ipv4.tcp_rmem net.ipv4.route.min_adv_mss net.ipv4.tcp_mtu_probing net.ipv4.tcp_tw_reuse"
 
 
 NFT_TABLE="proxy_accounting"

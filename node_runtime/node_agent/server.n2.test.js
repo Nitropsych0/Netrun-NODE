@@ -211,3 +211,15 @@ exit 3
   // The lift test's 18100 attempt failed too, but its cfg predates the generator run: never parked.
   assert.ok(!fs.existsSync(path.join(PROXY_ROOT, "3proxy", "3proxy_18100.cfg.failed")), "an older cfg is never parked");
 });
+
+// Audit P-N5 — the per-GB loopback leg depends on tcp_tw_reuse != 0 (pinned to 2):
+// /health nodeTuning reports the live value and flags 0.
+test("nodeTuning: tcpTwReuse is reported; 0 is flagged (ok false), 2 and 1 pass, unreadable is null", () => {
+  const { nodeTuningStatus } = require("./server.js");
+  const reader = (v) => (rel) => (rel === "net/ipv4/tcp_tw_reuse" ? v : rel === "net/ipv4/ip_local_port_range" ? "1024 8000" : null);
+  assert.deepStrictEqual([nodeTuningStatus(reader("2")).tcpTwReuse, nodeTuningStatus(reader("2")).tcpTwReuseOk], [2, true]);
+  assert.deepStrictEqual([nodeTuningStatus(reader("1")).tcpTwReuse, nodeTuningStatus(reader("1")).tcpTwReuseOk], [1, true]);
+  assert.deepStrictEqual([nodeTuningStatus(reader("0")).tcpTwReuse, nodeTuningStatus(reader("0")).tcpTwReuseOk], [0, false]);
+  assert.deepStrictEqual([nodeTuningStatus(reader(null)).tcpTwReuse, nodeTuningStatus(reader(null)).tcpTwReuseOk], [null, null]);
+  assert.strictEqual(nodeTuningStatus(reader("2")).ipLocalPortRange, "1024 8000", "existing fields unchanged");
+});

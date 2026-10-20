@@ -4185,18 +4185,24 @@ function readProcValue(relPath) {
     return null;
   }
 }
-function nodeTuningStatus() {
-  const range = readProcValue("net/ipv4/ip_local_port_range");
+function nodeTuningStatus(readProc = readProcValue) {
+  const range = readProc("net/ipv4/ip_local_port_range");
   const hi = range ? Number(range.split(" ")[1]) : NaN;
   const num = (v) => (v === null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
   return {
     ipLocalPortRange: range,
     ephemeralOverlapsProxyPorts: Number.isFinite(hi) ? hi >= PROXY_LISTEN_FLOOR : null,
     proxyListenFloor: PROXY_LISTEN_FLOOR,
-    tcpTimestamps: num(readProcValue("net/ipv4/tcp_timestamps")),
-    ipDefaultTtl: num(readProcValue("net/ipv4/ip_default_ttl")),
-    tcpRmem: readProcValue("net/ipv4/tcp_rmem"),
-    pipeUserPagesSoft: num(readProcValue("fs/pipe-user-pages-soft")),
+    tcpTimestamps: num(readProc("net/ipv4/tcp_timestamps")),
+    ipDefaultTtl: num(readProc("net/ipv4/ip_default_ttl")),
+    tcpRmem: readProc("net/ipv4/tcp_rmem"),
+    pipeUserPagesSoft: num(readProc("fs/pipe-user-pages-soft")),
+    // --- lane: node-pergb-runtime --- (P-N5) the per-GB haproxy -> 3proxy loopback leg
+    // needs loopback TIME_WAIT reuse: 2 (pinned in 99-zz-netrun-tcp.conf); 0 = a ~115
+    // conn/s cliff per listener. tcpTwReuseOk false = fix it (apply_capacity_tuning.sh
+    // --only fingerprint); null = unreadable.
+    tcpTwReuse: num(readProc("net/ipv4/tcp_tw_reuse")),
+    tcpTwReuseOk: num(readProc("net/ipv4/tcp_tw_reuse")) === null ? null : num(readProc("net/ipv4/tcp_tw_reuse")) !== 0,
   };
 }
 

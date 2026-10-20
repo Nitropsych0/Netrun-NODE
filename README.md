@@ -1560,3 +1560,17 @@ gradually instead of hitting a fixed 20 s wall; a dump slower than `NODE_AGENT_N
 `nft counter dump failed after <ms> (timeout …)` (each at most every 5 min; grep the agent
 journal). The orchestrator's `TRAFFIC_POLL_REQUEST_TIMEOUT_SEC` must exceed 60 s + parse time
 for the scaling to matter (config note for the orchestrator repo).
+
+### Ephemeral ports and `tcp_tw_reuse` on per-GB nodes (P-N5)
+
+`install_node_v2.sh` sets `net.ipv4.ip_local_port_range = 1024 8000` (6 977 ports per source
+address). Per-piece 3proxy binds its own IPv6 before it connects, so each proxy has its own
+pool (~110 new connections/s per proxy at 60 s TIME_WAIT). The per-GB haproxy → 3proxy
+loopback leg uses ONE destination per listener and lives on loopback `tcp_tw_reuse`:
+`net.ipv4.tcp_tw_reuse = 2` is pinned in `deploy/node/99-zz-netrun-tcp.conf` (installed by the
+installer / follow-up, and onto existing nodes by `apply_capacity_tuning.sh --only
+fingerprint`, which also removes a legacy `tcp_tw_reuse` line from `/etc/sysctl.conf`).
+**Never `0` on a per-GB node**: it caps every listener at ~115 conn/s (a cliff without an
+error); `1` would also recycle sockets towards the internet. `GET /health` →
+`nodeTuning.tcpTwReuse` / `tcpTwReuseOk` (false only for `0`). Ops: `sysctl
+net.ipv4.tcp_tw_reuse` must print 2; watch `ss -s` TIME-WAIT on per-GB nodes.
