@@ -75,6 +75,18 @@ const DEFAULT_AUTH_CHECK_TIMEOUT_MS = Math.max(1000, Number(process.env.NODE_AGE
 const DEFAULT_INSTANCE_WAIT_MS = Math.max(2000, Number(process.env.NODE_AGENT_INSTANCE_WAIT_MS || 12000));
 const DEFAULT_PORTS_LISTEN_WAIT_MS = Math.max(12000, Number(process.env.NODE_AGENT_PORTS_LISTEN_WAIT_MS || 90000));
 const DEFAULT_IPV6_EGRESS_URL = String(process.env.NODE_AGENT_IPV6_EGRESS_URL || "https://api64.ipify.org").trim();
+// Owner 2026-10-22 — one echo service is a single point of failure: from
+// Vultr Johannesburg api64.ipify.org never answered, so the node flapped
+// itself off sale every ~30 min. The egress checks try these in order and
+// take the first that answers (NODE_AGENT_IPV6_EGRESS_URLS, comma-separated,
+// overrides the list; NODE_AGENT_IPV6_EGRESS_URL stays the first entry).
+const DEFAULT_IPV6_EGRESS_URLS = (() => {
+  const raw = String(process.env.NODE_AGENT_IPV6_EGRESS_URLS || "").trim();
+  const list = raw
+    ? raw.split(",")
+    : [DEFAULT_IPV6_EGRESS_URL, "https://api64.ipify.org", "https://icanhazip.com", "https://ifconfig.co/ip"];
+  return [...new Set(list.map((u) => String(u || "").trim()).filter(Boolean))];
+})();
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_ROOT = path.join(PROXY_ROOT, "3proxy");
 // Audit S-NODE-2 — /generate executes generators only from under GENERATOR_ROOT
@@ -2023,6 +2035,7 @@ async function checkIpv6Egress(url, timeoutMs = 8000, { localAddress = null } = 
       {
         timeout: timeoutMs,
         family: 6,
+        headers: { accept: "text/plain", "user-agent": "netrun-node-agent" },
         ...(localAddress ? { localAddress } : {}),
       },
       (res) => {
@@ -2057,6 +2070,18 @@ async function checkIpv6Egress(url, timeoutMs = 8000, { localAddress = null } = 
       });
     });
   });
+}
+
+// The first echo service that answers wins; all failing → the last failure,
+// its error naming how many were tried (see DEFAULT_IPV6_EGRESS_URLS).
+async function checkIpv6EgressAny(urls, timeoutMs = 8000, opts = {}) {
+  const list = Array.isArray(urls) && urls.length ? urls : [DEFAULT_IPV6_EGRESS_URL];
+  let last = null;
+  for (const url of list) {
+    last = await checkIpv6Egress(url, timeoutMs, opts);
+    if (last.ok) return last;
+  }
+  return list.length > 1 ? { ...last, error: `${last.error} (all ${list.length} echo services)` } : last;
 }
 
 // Audit 2026-10-08 — /health ipv6EgressRouted: the egress self-check above
@@ -2105,7 +2130,7 @@ function routedEgressVerdict(target, res, checkedAt) {
 function createRoutedEgressProbe({
   ttlMs = ROUTED_EGRESS_TTL_MS,
   target = () => routedEgressTarget(),
-  check = (t) => checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000, { localAddress: t.address }),
+  check = (t) => checkIpv6EgressAny(DEFAULT_IPV6_EGRESS_URLS, 5000, { localAddress: t.address }),
   now = () => Date.now(),
 } = {}) {
   let cached = null;
@@ -3006,7 +3031,7 @@ async function validateGenerationOutput({
   }
   checks.auth_sample_ok = true;
 
-  const ipv6Check = await checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 8000);
+  const ipv6Check = await checkIpv6EgressAny(DEFAULT_IPV6_EGRESS_URLS, 8000);
   if (!ipv6Check.ok) {
     return {
       ok: false,
@@ -4266,7 +4291,7 @@ async function handleHealth(req, res) {
   }
   for (const c of inventory.cfgs) probePorts.add(probeOf(c.startPort));
   const [ipv6Check, dnsCheck, listenState, ipv6Addresses, httpsHostnamesStatus, ipv6EgressRouted, clock] = await Promise.all([
-    checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
+    checkIpv6EgressAny(DEFAULT_IPV6_EGRESS_URLS, 5000),
     checkDns(5000),
     listListeningExactPortsShared([...probePorts], { fresh: busy }),
     ipv6Coverage.get(),
@@ -4410,7 +4435,7 @@ async function handleDescribe(req, res) {
   let healthSnapshot = null;
   try {
     const [ipv6Check, dnsCheck] = await Promise.all([
-      checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
+      checkIpv6EgressAny(DEFAULT_IPV6_EGRESS_URLS, 5000),
       checkDns(5000),
     ]);
     const ipv6 = {
