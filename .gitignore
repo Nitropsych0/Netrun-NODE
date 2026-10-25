@@ -1,0 +1,3 @@
+# Python bytecode — never committed (three .pyc slipped into deploy/node/osfp once)
+__pycache__/
+*.py[cod]
