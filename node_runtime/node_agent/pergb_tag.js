@@ -167,15 +167,39 @@ function parsePrefix48(text) {
   return { text: `${bigToIpv6(base)}/48`, base };
 }
 
-// A tagger bound to one key and one /48:
-//   decodeAddress(text) -> null (not an IPv6 of the prefix) or
-//     { subnetId, iid (BigInt), listId, r16, valid }
+// A14: a pool block — an IPv6 prefix /29 .. /56 (canonical text, base, length);
+// null when it is not one.
+const BLOCK_LEN_MIN = 29;
+const BLOCK_LEN_MAX = 56;
+function parseBlock(text) {
+  const m = /^([^/\s]+)\/(\d{1,3})$/.exec(String(text || "").trim());
+  if (!m) return null;
+  const plen = Number(m[2]);
+  if (plen < BLOCK_LEN_MIN || plen > BLOCK_LEN_MAX) return null;
+  const big = ipv6ToBig(m[1]);
+  if (big === null) return null;
+  const host = (1n << BigInt(128 - plen)) - 1n;
+  if ((big & host) !== 0n) return null; // strict: no host bits
+  return { text: `${bigToIpv6(big)}/${plen}`, base: big, plen };
+}
+
+// Does prefix (base, plen) cover the address / prefix `big`?
+function covers(base, plen, big) {
+  const shift = BigInt(128 - plen);
+  return big >> shift === base >> shift;
+}
+
+// A tagger bound to one key and one /48 (+ A14: the extra pool blocks):
+//   decodeAddress(text) -> null (not an IPv6 of the prefix or a block) or
+//     { subnetId, iid (BigInt), listId, r16, valid } — subnetId is null for an
+//     address of an extra block (A14-P pieces: no per-/64 bookkeeping there)
 //   address(subnetId, listId, r16) -> text (tests, attribution checks)
-function createTagger({ key, prefix }) {
+function createTagger({ key, prefix, blocks }) {
   const k = Buffer.isBuffer(key) ? key : Buffer.from(String(key || ""), "base64");
   checkKey(k);
   const p = typeof prefix === "string" ? parsePrefix48(prefix) : prefix;
   if (!p) throw new TypeError("tagger needs the node's /48");
+  const extra = (blocks || []).filter((b) => b && !covers(b.base, b.plen, p.base));
   const cache = new Map(); // iid hex -> decode result (sockets repeat across ticks)
   function decodeIid(iid) {
     const keyHex = iid.toString(16);
@@ -189,10 +213,13 @@ function createTagger({ key, prefix }) {
   return {
     prefix: p.text,
     prefixBase: p.base,
+    blocks: extra.map((b) => b.text),
     decodeAddress(text) {
       const big = typeof text === "bigint" ? text : ipv6ToBig(text);
-      if (big === null || big >> 80n !== p.base >> 80n) return null;
-      const subnetId = Number((big >> 64n) & 0xffffn);
+      if (big === null) return null;
+      let subnetId = null;
+      if (big >> 80n === p.base >> 80n) subnetId = Number((big >> 64n) & 0xffffn);
+      else if (!extra.some((b) => covers(b.base, b.plen, big))) return null;
       const iid = big & ((1n << 64n) - 1n);
       const d = decodeIid(iid);
       return { subnetId, iid, listId: d.listId, r16: d.r16, valid: d.valid && iid >= IID_MIN };
@@ -218,5 +245,7 @@ module.exports = {
   ipv6ToBig,
   bigToIpv6,
   parsePrefix48,
+  parseBlock,
+  covers,
   createTagger,
 };

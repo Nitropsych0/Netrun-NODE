@@ -51,6 +51,7 @@ const STAGING_TTL_MS = 120000;
 const STAGING_MAX_BYTES = 256 * 1024 * 1024;
 const EXCLUDED_EVERY_MS = 10 * 60 * 1000;
 const CANARY_EVERY_MS = 10 * 60 * 1000;
+const BLOCKS_EVERY_MS = 60 * 1000; // A14: how often the extra pool blocks' routes are re-read
 const RADIUS_WATCH_MS = 2000;
 const REF_RE = /^[A-Za-z0-9:._-]{1,128}$/;
 const POOL_RE = /^([0-9a-fA-F]{1,4})-([0-9a-fA-F]{1,4})$/;
@@ -284,6 +285,10 @@ function createPergb(deps = {}) {
   let probeBusy = false;
   let lastExcludedAt = 0;
   let lastCanaryAt = 0;
+  // A14: the extra pool blocks of the params that have a local route here (only
+  // those reach RADIUS and the tagger: an unrouted block's piece would not work)
+  let routedBlocks = [];
+  let blocksCheckedAt = 0;
   let lastRadiusWatchAt = 0;
   let sockCache = null; // { at, view }
   const events = [];
@@ -495,7 +500,7 @@ function createPergb(deps = {}) {
     const key = params().addrKey;
     if (!pool || !key) return;
     try {
-      tagger = tagLib.createTagger({ key: Buffer.from(String(key), "base64"), prefix: pool.prefix });
+      tagger = tagLib.createTagger({ key: Buffer.from(String(key), "base64"), prefix: pool.prefix, blocks: routedBlocks });
     } catch (e) {
       log.error(`[pergb] address key: ${e.message || e}`);
     }
@@ -631,14 +636,45 @@ function createPergb(deps = {}) {
       prefix: pool.prefix,
       subnets: pool.pool,
       addrKey: p.addrKey,
+      poolBlocks: routedBlocks.map((b) => b.text),
       logdumpBytes: logdump(),
     };
     if (ph) facts.probe = { ...ph, canary: list.filter((c) => Array.isArray(c) && net.isIP(String(c[0])) && Number(c[1]) > 0).map((c) => [String(c[0]), Number(c[1])]) };
     return facts;
   }
 
+  // A14: the configured extra blocks (params.poolBlocks) and which of them are
+  // routed to this host (a local route covering the block).
+  function configuredBlocks() {
+    const raw = Array.isArray(params().poolBlocks) ? params().poolBlocks : [];
+    return raw.map((t) => tagLib.parseBlock(t)).filter(Boolean);
+  }
+
+  async function localRoutes() {
+    const r = await run("ip", ["-6", "route", "show", "table", "local"], { timeoutMs: 10000 });
+    const out = [];
+    for (const m of String((r && r.stdout) || "").matchAll(/^local\s+([0-9a-fA-F:]+)(?:\/(\d+))?\b/gm)) {
+      const big = tagLib.ipv6ToBig(m[1]);
+      if (big !== null) out.push({ base: big, plen: m[2] === undefined ? 128 : Number(m[2]) });
+    }
+    return out;
+  }
+
+  // Re-reads the routes; true when the routed set changed (the tagger is rebuilt).
+  async function refreshBlocks() {
+    blocksCheckedAt = now();
+    const want = configuredBlocks();
+    const routes = want.length ? await localRoutes() : [];
+    const next = want.filter((b) => routes.some((rt0) => rt0.plen <= b.plen && tagLib.covers(rt0.base, rt0.plen, b.base)));
+    const changed = next.map((b) => b.text).join(",") !== routedBlocks.map((b) => b.text).join(",");
+    routedBlocks = next;
+    if (changed) rebuildTagger();
+    return changed;
+  }
+
   async function pushFacts() {
     if (!enableDoc || !pool) return { ok: false, error: "pergb_off" };
+    await refreshBlocks();
     const facts = buildFacts();
     const p4 = await primaryIpv4();
     if (p4) facts.primaryIpv4 = p4;
@@ -775,6 +811,10 @@ function createPergb(deps = {}) {
       await smart.push();
       if (now() - lastExcludedAt >= EXCLUDED_EVERY_MS) await pushExcluded("periodic");
       if (now() - lastCanaryAt >= CANARY_EVERY_MS) await refreshCanary();
+      // A14: a block routed (or withdrawn) since — RADIUS and the tagger follow
+      if (now() - blocksCheckedAt >= BLOCKS_EVERY_MS && configuredBlocks().length + routedBlocks.length > 0) {
+        if (await refreshBlocks()) await pushFacts();
+      }
     } catch (e) {
       log.error(`[pergb] tick: ${(e && e.stack) || e}`);
     } finally {
@@ -917,6 +957,12 @@ function createPergb(deps = {}) {
     const pool0 = normalizePool(body.pool || body.subnets || DEFAULT_POOL);
     if (!pool0) return { error: bad("bad_params", "subnets must be <hex>-<hex>, e.g. 0000-fffe") };
     if (body.geo !== undefined && body.geo !== null && !/^[A-Za-z]{2}$/.test(String(body.geo))) return { error: bad("bad_params", "geo must be a 2-letter code") };
+    if (body.poolBlocks !== undefined && body.poolBlocks !== null) {
+      const pb = body.poolBlocks;
+      if (!Array.isArray(pb) || pb.length > 64 || pb.some((t) => !tagLib.parseBlock(t))) {
+        return { error: bad("bad_params", "poolBlocks must be up to 64 IPv6 prefixes /29 .. /56") };
+      }
+    }
     const ipv4s = Array.isArray(body.ipv4s) ? body.ipv4s.map(String) : [];
     if (ipv4s.length > 64 || ipv4s.some((ip) => !net.isIPv4(ip)) || new Set(ipv4s).size !== ipv4s.length) {
       return { error: bad("bad_params", "ipv4s must be up to 64 distinct IPv4 addresses") };
@@ -1487,6 +1533,7 @@ function createPergb(deps = {}) {
       enforcer: enforcer.status(),
       kill: killer.status(),
       excluded: { ...excludedInfo, local: excludedSet.size },
+      poolBlocks: { configured: configuredBlocks().map((b) => b.text), routed: routedBlocks.map((b) => b.text), checkedAt: blocksCheckedAt ? new Date(blocksCheckedAt).toISOString() : null },
       pieces: {
         lists: pieceNets.size,
         primaryIpv4: primaryKnown(),
@@ -1758,6 +1805,7 @@ function createPergb(deps = {}) {
     restoreReservations,
     refreshReserved,
     refreshCanary,
+    refreshBlocks,
     radiusWatch,
     meter,
     enforcer,

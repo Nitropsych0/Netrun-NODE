@@ -132,7 +132,8 @@ function createSmart(deps = {}) {
       }
       if (kind === null) continue;
       const d = tagger.decodeAddress(rec.bound);
-      if (!d || !d.valid || (excluded && excluded.has(d.subnetId))) continue;
+      // A14: an extra block's address (subnetId null) is a piece's — no avoid pairs
+      if (!d || !d.valid || d.subnetId === null || (excluded && excluded.has(d.subnetId))) continue;
       const site = psl.siteKey(rec.host, rec.dstIp, pslData || undefined);
       if (!site) continue;
       const key = `${d.subnetId}|${site}`;

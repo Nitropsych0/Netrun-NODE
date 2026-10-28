@@ -1238,6 +1238,12 @@ class Engine:
                 "primaryIpv4": f.primary_v4_str,
                 "prefix": f.prefix_str,
                 "subnets": [f.lo, f.hi],
+                # A14: the extra pool blocks (the primary /48 is status.pool.blocks' too)
+                "poolBlocks": [
+                    "%s/%d" % (ipaddress.IPv6Address(base << 64), plen)
+                    for base, plen in f.blocks
+                    if (base >> 16) != (f.prefix >> 80) or plen != 48
+                ],
             }
         return out
 

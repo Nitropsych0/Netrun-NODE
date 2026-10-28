@@ -116,7 +116,7 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
   const world = { sockets: [], cgroupSupport: true, listeners: [] };
   const run = T.fakeRun(world, {
     ip: async (args) => {
-      if (args[0] === "-6") return { code: 0, stdout: "local 2001:db8:aa::/48 dev lo proto kernel metric 0 pref medium\nlocal ::1 dev lo proto kernel metric 0 pref medium\n", stderr: "" };
+      if (args[0] === "-6") return { code: 0, stdout: "local 2001:db8:aa::/48 dev lo proto kernel metric 0 pref medium\nlocal ::1 dev lo proto kernel metric 0 pref medium\n" + (world.extraLocal6 || []).map((p) => `local ${p} dev lo metric 1024 pref medium\n`).join(""), stderr: "" };
       if (args[0] === "addr" && args[1] === "add") {
         world.v4 = [...(world.v4 || []), args[2].split("/")[0]];
         return { code: 0, stdout: "", stderr: "" };
@@ -560,6 +560,33 @@ test("per-GB agent end to end against the real netrun-radius", { skip, timeout: 
     const r2 = await request(port, "POST", "/pergb/enable", { body: { ...ENABLE, ipv4s }, ca: fs.readFileSync(c1.crt, "utf-8") });
     assert.strictEqual(r2.status, 200, JSON.stringify(r2.json));
     assert.ok(!run.calls.slice(again).some((c) => c[0] === "bash"), "no guard re-apply without new addresses");
+  });
+
+  await t.test("A14: poolBlocks — only the routed ones reach RADIUS; a block routed later follows", async () => {
+    const blocks = ["2001:db8:8000::/33", "2001:db8:1:100::/56"];
+    const call14 = (body) => request(port, "POST", "/pergb/enable", { body, ca: fs.readFileSync(c1.crt, "utf-8") });
+    world.extraLocal6 = ["2001:db8:8000::/33"];
+    const bad = await call14({ ...ENABLE, poolBlocks: ["2001:db8::/28"] });
+    assert.strictEqual(bad.status, 400);
+    const r = await call14({ ...ENABLE, poolBlocks: blocks });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    let st = await pergb.ctl.call("status", {});
+    assert.deepStrictEqual(st.facts.poolBlocks, ["2001:db8:8000::/33"]);
+    assert.deepStrictEqual(st.pool.blocks, [PREFIX, "2001:db8:8000::/33"]);
+    let ag = await pergb.status();
+    assert.deepStrictEqual(ag.poolBlocks.configured, blocks);
+    assert.deepStrictEqual(ag.poolBlocks.routed, ["2001:db8:8000::/33"]);
+    world.extraLocal6 = blocks.slice();
+    assert.strictEqual(await pergb.refreshBlocks(), true);
+    await pergb.pushFacts();
+    st = await pergb.ctl.call("status", {});
+    assert.deepStrictEqual(st.pool.blocks, ["2001:db8:1:100::/56", PREFIX, "2001:db8:8000::/33"]);
+    assert.strictEqual(await pergb.refreshBlocks(), false, "nothing changed");
+    world.extraLocal6 = [];
+    await call14(ENABLE);
+    await pergb.pushFacts();
+    ag = await pergb.status();
+    assert.deepStrictEqual(ag.poolBlocks.routed, []);
   });
 
   await t.test("disable: the pool file first, then the runtime; reserve answers pergb_off", async () => {
