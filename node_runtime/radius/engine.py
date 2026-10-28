@@ -13,7 +13,8 @@ per address), A8 (a shared pool, deterministic static, no caps), A10 (list
 modes per_request / timer / link / static, link epochs, TTL 30 s .. 24 h),
 A11 (the «липкая сессия» pause), A12 (ctl op `avoid`, smart rotation picks),
 A13 / A13-I (per-piece proxies: list and account kind "piece", one reserved
-/64 per piece, a fixed address, no quota, IPv4 via the node's primary IPv4).
+/64 per piece, a fixed address, no quota, IPv4 via the node's primary IPv4),
+A14-P (a piece on any /64 of the pool blocks, shared with per-GB: pieceNet64).
 """
 
 from __future__ import annotations
@@ -46,7 +47,8 @@ PIECE = "piece"  # A13-I: a per-piece proxy (list) and its account
 KINDS = (PERGB, PIECE)
 PIECE_REJECTS_KEPT = 100
 # status.features: what this RADIUS speaks beyond I5 (the agent checks before using it)
-FEATURES = ("pieces", "reserveExact", "reserved", "avoid", "primaryIpv4")
+FEATURES = ("pieces", "reserveExact", "reserved", "avoid", "primaryIpv4", "pieceNet64")
+POOL_BLOCK_LEN = (29, 56)  # A14: the prefix lengths a pool block may have
 MAX_EGRESS_V4 = 64  # A7: 1..64 per-GB IPv4s per node
 STICKY_PAUSES = (5, 10)  # A11: the two pause buttons (other values 1..60 are accepted)
 MAX_LINE_EPOCHS = 20000
@@ -141,6 +143,7 @@ class Facts:
         "prefix_str",
         "lo",
         "hi",
+        "blocks",
         "key",
         "probe_salt",
         "probe_hash",
@@ -228,6 +231,7 @@ class Facts:
             raise _bad("subnets") from None
         if f.lo > f.hi:
             raise _bad("subnets lo > hi")
+        f.blocks = _pool_blocks(d.get("poolBlocks"), net)
         try:
             key = base64.b64decode(d.get("addrKey") or "", validate=True)
         except (binascii.Error, ValueError, TypeError):
@@ -366,6 +370,7 @@ class PList:
         "pause",
         "kind",
         "piece_net",
+        "piece_net64",
     )
 
     @classmethod
@@ -401,9 +406,9 @@ class PList:
             raise _bad("list kind must be pergb or piece")
         if p.kind == PIECE:
             return cls._parse_piece(p, d)
-        if d.get("pieceNet") is not None:
-            raise _bad("pieceNet is for piece lists only (list %d)" % p.id)
-        p.piece_net = None
+        if d.get("pieceNet") is not None or d.get("pieceNet64") is not None:
+            raise _bad("pieceNet / pieceNet64 are for piece lists only (list %d)" % p.id)
+        p.piece_net = p.piece_net64 = None
         try:
             p.mode = uname.list_mode(d.get("mode") or uname.PER_REQUEST)
         except ValueError:
@@ -438,11 +443,20 @@ class PList:
         line_count = _int(d, "lineCount", required=False)
         if line_count is not None and line_count != 1:
             raise _bad("piece list %d: lineCount must be 1" % p.id)
-        if d.get("pieceNet") is None:
-            raise _bad("piece list %d: pieceNet is required" % p.id)
-        if isinstance(d.get("pieceNet"), str):
-            raise _bad("piece list %d: pieceNet must be an integer subnet id" % p.id)
-        p.piece_net = _int(d, "pieceNet", 0, 0xFFFF)
+        has_net, has_net64 = d.get("pieceNet") is not None, d.get("pieceNet64") is not None
+        if has_net == has_net64:
+            raise _bad("piece list %d: exactly one of pieceNet / pieceNet64 is required" % p.id)
+        p.piece_net = p.piece_net64 = None
+        if has_net64:
+            # A14-P: any /64 of the pool blocks, shared with per-GB; nothing reserved
+            try:
+                p.piece_net64 = _parse_net64(d.get("pieceNet64"))
+            except ValueError:
+                raise _bad("piece list %d: pieceNet64 must be an IPv6 /64" % p.id) from None
+        else:
+            if isinstance(d.get("pieceNet"), str):
+                raise _bad("piece list %d: pieceNet must be an integer subnet id" % p.id)
+            p.piece_net = _int(d, "pieceNet", 0, 0xFFFF)
         p.mode = uname.STATIC
         p.ttl = None
         p.anchor = 0.0
@@ -470,7 +484,9 @@ class PList:
             p.pause,
             kind,
             p.piece_net,
+            net64,
         ) = row
+        p.piece_net64 = _parse_net64(net64) if net64 else None
         p.kind = kind or PERGB
         p.mode = uname.LEGACY_MODES.get(p.mode, p.mode)
         p.anchor = anchor or 0.0
@@ -498,6 +514,7 @@ class PList:
             self.pause,
             self.kind,
             self.piece_net,
+            _net64_str(self.piece_net64) if self.piece_net64 is not None else None,
         )
 
     def view(self) -> dict:
@@ -511,7 +528,10 @@ class PList:
             "kind": self.kind,
         }
         if self.kind == PIECE:
-            v["pieceNet"] = self.piece_net
+            if self.piece_net64 is not None:
+                v["pieceNet64"] = _net64_str(self.piece_net64)
+            else:
+                v["pieceNet"] = self.piece_net
         return v
 
 
@@ -522,6 +542,49 @@ def _mode_key(p) -> tuple:
 
 def _addr_str(addr: int) -> str:
     return str(ipaddress.IPv6Address(addr))
+
+
+def _net64_str(n64: int) -> str:
+    return "%s/64" % ipaddress.IPv6Address(n64 << 64)
+
+
+def _parse_net64(v) -> int:
+    """A14-P: "<prefix>/64" -> its upper 64 bits; ValueError otherwise."""
+    if not isinstance(v, str):
+        raise ValueError("not a string")
+    net = ipaddress.IPv6Network(v.strip(), strict=True)
+    if net.prefixlen != 64:
+        raise ValueError("not a /64")
+    return int(net.network_address) >> 64
+
+
+def _pool_blocks(raw, primary: ipaddress.IPv6Network) -> tuple:
+    """A14: the pool blocks — ((upper 64 bits of the network, prefix length), ...),
+    sorted. The primary /48 is always one of them; poolBlocks adds /29 .. /56 more
+    (BGP-announced or routed by the provider), none overlapping another."""
+    nets = [primary]
+    if raw is not None:
+        if not isinstance(raw, list) or len(raw) > 64:
+            raise _bad("poolBlocks must be a list of up to 64 prefixes")
+        for item in raw:
+            try:
+                n = ipaddress.IPv6Network(item, strict=True)
+            except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError, TypeError):
+                raise _bad("poolBlocks: %r is not an IPv6 prefix" % (item,)) from None
+            if not POOL_BLOCK_LEN[0] <= n.prefixlen <= POOL_BLOCK_LEN[1]:
+                raise _bad("poolBlocks: %s must be /%d .. /%d" % (n, POOL_BLOCK_LEN[0], POOL_BLOCK_LEN[1]))
+            if n == primary:
+                continue
+            nets.append(n)
+    nets.sort()
+    for x, y in zip(nets, nets[1:]):
+        if x.overlaps(y):
+            raise _bad("poolBlocks: %s overlaps %s" % (x, y))
+    return tuple((int(n.network_address) >> 64, n.prefixlen) for n in nets)
+
+
+def _in_blocks(n64: int, blocks) -> bool:
+    return any((n64 >> (64 - plen)) == (base >> (64 - plen)) for base, plen in blocks)
 
 
 class Engine:
@@ -868,8 +931,10 @@ class Engine:
         if not self.adm_open or acct.id in self.adm_soft:
             return self._reject("capacity", lst, now)  # node protection applies to every login
         a = self.alloc
-        net = lst.piece_net
-        if not a.is_piece_net(net):
+        if lst.piece_net64 is not None:
+            if self._net64_error(lst.piece_net64) is not None:
+                return self._reject("list_off", lst, now)  # its block left the pool (or a scan found it)
+        elif not a.is_piece_net(lst.piece_net):
             # its /64 was released (or never reserved): never serve it from a shared /64
             return self._reject("list_off", lst, now)
         if fam == 4 and self.facts.family == "ipv6_only":
@@ -882,7 +947,26 @@ class Engine:
             if v4 in self.ipv4_closed or (not self.ipv4_open and v4 in f.egress_v4s):
                 return self._reject("capacity", lst, now)
             return None, None, v4
-        return None, a.piece_addr(lst.id, net).to_bytes(16, "big"), None
+        return None, self._piece_address(lst).to_bytes(16, "big"), None
+
+    def _piece_address(self, lst) -> int:
+        a = self.alloc
+        if lst.piece_net64 is not None:
+            return (lst.piece_net64 << 64) | a.piece_iid(lst.id)
+        return a.piece_addr(lst.id, lst.piece_net)
+
+    def _net64_error(self, n64: int) -> str | None:
+        """A14-P: why a piece may not use this /64 now (None: it may)."""
+        f = self.facts
+        if f is None or not _in_blocks(n64, f.blocks):
+            return "piece_net64_outside_pool"
+        if (n64 >> 16) == (f.prefix >> 80):  # the primary /48: the per-GB allocator's view
+            net = n64 & 0xFFFF
+            if not self.alloc.in_pool(net):
+                return "piece_net64_outside_pool"
+            if self.alloc.is_excluded(net):
+                return "piece_net64_excluded"  # an A13-I piece's or a 3proxy batch's /64
+        return None
 
     def _probe(self, req, password, fam, now):
         f = self.facts
@@ -1108,6 +1192,13 @@ class Engine:
                     "lines": len(self.alloc.mode),
                     "pieces": self.n_pieces,
                 },
+                "pool": {
+                    "blocks": [
+                        "%s/%d" % (ipaddress.IPv6Address(base << 64), plen) for base, plen in self.facts.blocks
+                    ]
+                    if self.facts is not None
+                    else [],
+                },
                 "pieces": {
                     "lists": self.n_pieces,
                     "lastRejected": list(self.piece_rejects[-20:]),
@@ -1304,7 +1395,10 @@ class Engine:
         def refuse(p, error, **extra):
             r = {"id": p.id, "login": p.login, "kind": p.kind, "error": error}
             if p.kind == PIECE:
-                r["pieceNet"] = p.piece_net
+                if p.piece_net64 is not None:
+                    r["pieceNet64"] = _net64_str(p.piece_net64)
+                else:
+                    r["pieceNet"] = p.piece_net
             r.update(extra)
             out.append(r)
 
@@ -1315,6 +1409,11 @@ class Engine:
                 refuse(p, "account_kind_mismatch", accountKind=acct.kind)
                 continue
             if p.kind != PIECE:
+                continue
+            if p.piece_net64 is not None:
+                err = self._net64_error(p.piece_net64)
+                if err is not None:
+                    refuse(p, err)
                 continue
             net = p.piece_net
             if not a.in_pool(net):
@@ -1359,8 +1458,8 @@ class Engine:
             if p.kind != PIECE:
                 continue
             old = old_lists.get(p.id)
-            if old is None or old.kind != PIECE or old.piece_net != p.piece_net:
-                out[str(p.id)] = _addr_str(a.piece_addr(p.id, p.piece_net))
+            if old is None or old.kind != PIECE or (old.piece_net, old.piece_net64) != (p.piece_net, p.piece_net64):
+                out[str(p.id)] = _addr_str(self._piece_address(p))
         return out
 
     def _account_transition(self, old, new, out):
@@ -1394,7 +1493,7 @@ class Engine:
             # O(n) diff runs without the engine lock; the UDP thread keeps serving.
             old_accounts, old_lists = self.accounts, self.lists
             # A13-I: refused records are not installed (a list that had been is removed)
-            incumbent = {p.id: p.piece_net for p in old_lists.values() if p.kind == PIECE}
+            incumbent = {p.id: p.piece_net for p in old_lists.values() if p.kind == PIECE and p.piece_net64 is None}
             rejected = self._check_lists(list(new_lists.values()), new_accounts.get, {}, incumbent)
             rejected_ids = {r["id"] for r in rejected}
             for lid in rejected_ids:
@@ -1516,7 +1615,7 @@ class Engine:
             if any(p.kind == PIECE for p in live):
                 op_ids = {p.id for p in lsts}
                 for q in self.lists.values():
-                    if q.kind == PIECE:
+                    if q.kind == PIECE and q.piece_net64 is None:
                         if q.id in op_ids:
                             incumbent[q.id] = q.piece_net
                         else:

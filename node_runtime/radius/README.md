@@ -156,6 +156,30 @@ were not near the limit keep being served (plan V22).
   (≤ 200k entries, soonest expiry evicted first); not persisted — the agent
   pushes the full set after a restart or an epoch change.
 
+## Per-piece proxies on the whole pool (A14-P)
+
+Owner 2026-10-29 (docs/a14_wide_pool_spread.md): a per-piece proxy is one
+address spread over the WHOLE pool, shared with per-GB — no /64 of its own.
+
+- **Pool blocks.** `facts.poolBlocks`: up to 64 more IPv6 prefixes, /29 .. /56,
+  none overlapping another (BGP-announced by `netrun-bgp`, or routed by the
+  provider). The primary `prefix` /48 is always a block. `status.pool.blocks`
+  lists them. Per-GB still draws from the primary /48 (`subnets`) for now.
+- **Records.** A piece list carries `pieceNet64: "<prefix>/64"` instead of
+  `pieceNet` (exactly one of the two). The orchestrator picks the /64 (its
+  spread placement) once, at purchase; the node adds the piece's host part —
+  the same tag as A13-I (`piece_iid`), so two pieces in one /64 never collide
+  and the traffic of the address is still the list's. Nothing is reserved:
+  per-GB keeps drawing from that /64.
+- **Refusals** (`pieces.rejected[].error`): `piece_net64_outside_pool` (in no
+  block, or the primary /48's `ffff` / outside `subnets`) and
+  `piece_net64_excluded` (a /64 of the primary /48 that a scan found or that is
+  reserved — an A13-I piece's or a 3proxy batch's). Checked again on every
+  request: a block that leaves the pool answers `list_off`.
+- Schema 4 adds `lists.piece_net64`; a schema-2/3 file is migrated in place.
+- `features` gains `pieceNet64`. A13-I pieces (`pieceNet`) keep working until
+  the last one expires.
+
 ## Per-piece proxies (A13, contract A13-I)
 
 A per-piece IPv6 proxy is issued through this same engine: no 3proxy batch, no

@@ -525,13 +525,13 @@ class PiecePersistence(PieceBase):
         eng = rtest.make_engine(self, clock=self.clock, path=d, with_facts=False)
         self.assertEqual((eng.epoch, eng.seq), (4294967999, 17))
         self.assertFalse(eng.db_recovered)
-        self.assertEqual(eng.store.migrated, "2->3")
+        self.assertEqual(eng.store.migrated, "2->4")
         self.assertEqual(eng.lists[10].kind, "pergb")
         self.assertEqual(eng.accounts[1].kind, "pergb")
         self.assertEqual(eng.alloc.reserved[77], "piece:order_5")
         r = ask(eng, "netrun-rotaaaa", password=PW)
         self.assertTrue(r.accepted)
-        # and the migrated file is schema 3 now: a piece on the kept reservation
+        # and the migrated file is schema 4 now: a piece on the kept reservation
         r = eng.dispatch(
             {"op": "snapshot", "seq": 18, "accounts": [piece_account(100)], "lists": [piece(500, "pieceaa", 100, 77)]}
         )

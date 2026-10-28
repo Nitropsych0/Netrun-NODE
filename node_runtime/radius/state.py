@@ -10,10 +10,10 @@ Tables
   nets                    excluded sources per /64 (scan flag, reservation ref)
   reservations            reserve_nets / release_nets idempotency records
 
-Schema 3 (amendments A6/A8/A10/A11, A13-I): accounts.kind, lists.kind and
-lists.piece_net. A schema-2 file is migrated in place (the columns are added,
-default kind "pergb"; the epoch, the reservations and everything else stay). A
-schema-1 file is unknown and is moved aside like a corrupt one (new epoch; the
+Schema 4 (amendments A6/A8/A10/A11, A13-I, A14-P): accounts.kind, lists.kind,
+lists.piece_net and lists.piece_net64. A schema-2 or schema-3 file is migrated in
+place (the columns are added, default kind "pergb"; the epoch, the reservations
+and everything else stay). A schema-1 file is unknown and is moved aside like a corrupt one (new epoch; the
 orchestrator re-pushes everything).
 
 Binding changes are written in batches (every 100 ms by the writer thread); ctl
@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 EVENT_RETENTION_SEC = 7 * 86400
 
 SCHEMA = (
@@ -44,7 +44,8 @@ SCHEMA = (
     "CREATE TABLE IF NOT EXISTS lists(id INTEGER PRIMARY KEY, login TEXT NOT NULL UNIQUE, account_id INTEGER NOT NULL,"
     " pw_salt TEXT NOT NULL, pw_hash TEXT NOT NULL, pw_rev INTEGER NOT NULL, status TEXT NOT NULL,"
     " mode TEXT NOT NULL, ttl_sec INTEGER, timer_anchor REAL, link_epoch INTEGER NOT NULL DEFAULT 0,"
-    " line_epochs TEXT, sticky_pause INTEGER, kind TEXT NOT NULL DEFAULT 'pergb', piece_net INTEGER)",
+    " line_epochs TEXT, sticky_pause INTEGER, kind TEXT NOT NULL DEFAULT 'pergb', piece_net INTEGER,"
+    " piece_net64 TEXT)",
     "CREATE TABLE IF NOT EXISTS bindings(list_id INTEGER NOT NULL, slot TEXT NOT NULL, kind TEXT NOT NULL,"
     " addr BLOB NOT NULL, net INTEGER NOT NULL, v4 INTEGER NOT NULL, account_id INTEGER NOT NULL,"
     " created_at REAL NOT NULL, expires_at REAL, last_used_at REAL, PRIMARY KEY(list_id, slot, kind)) WITHOUT ROWID",
@@ -65,6 +66,9 @@ MIGRATE_2_3 = (
     "ALTER TABLE lists ADD COLUMN kind TEXT NOT NULL DEFAULT 'pergb'",
     "ALTER TABLE lists ADD COLUMN piece_net INTEGER",
 )
+
+# schema 3 -> 4 (A14-P): a piece placed on any /64 of the pool blocks
+MIGRATE_3_4 = ("ALTER TABLE lists ADD COLUMN piece_net64 TEXT",)
 
 
 def new_epoch() -> int:
@@ -124,7 +128,7 @@ class Store:
         self.write_errors = 0
         self.last_write_error = None
         self.corrupt = False
-        self.migrated = None  # "2->3" when this open migrated the schema
+        self.migrated = None  # "2->4" / "3->4" when this open migrated the schema
 
     # ---- open / recover ------------------------------------------------------------
 
@@ -196,12 +200,13 @@ class Store:
                 meta["schema"] = SCHEMA_VERSION
                 meta["created_at"] = repr(time.time())
                 conn.executemany("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", list(meta.items()))
-            elif meta.get("schema") == "2":
-                for stmt in MIGRATE_2_3:
+            elif meta.get("schema") in ("2", "3"):
+                old = meta["schema"]
+                for stmt in (MIGRATE_2_3 if old == "2" else ()) + MIGRATE_3_4:
                     conn.execute(stmt)
                 meta["schema"] = SCHEMA_VERSION
                 conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('schema', ?)", (SCHEMA_VERSION,))
-                self.migrated = "2->3"
+                self.migrated = old + "->" + SCHEMA_VERSION
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")
@@ -217,7 +222,7 @@ class Store:
             ).fetchall(),
             "lists": conn.execute(
                 "SELECT id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec, timer_anchor,"
-                " link_epoch, line_epochs, sticky_pause, kind, piece_net FROM lists"
+                " link_epoch, line_epochs, sticky_pause, kind, piece_net, piece_net64 FROM lists"
             ).fetchall(),
             "bindings": conn.execute(
                 "SELECT list_id, slot, kind, addr, net, v4, account_id, created_at, expires_at, last_used_at FROM bindings"
@@ -251,8 +256,8 @@ class Store:
                 conn,
                 batch.lists,
                 "INSERT OR REPLACE INTO lists(id, login, account_id, pw_salt, pw_hash, pw_rev, status, mode, ttl_sec,"
-                " timer_anchor, link_epoch, line_epochs, sticky_pause, kind, piece_net)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " timer_anchor, link_epoch, line_epochs, sticky_pause, kind, piece_net, piece_net64)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 "DELETE FROM lists WHERE id = ?",
             )
             if batch.bindings:
