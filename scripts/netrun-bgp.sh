@@ -12,9 +12,12 @@
 #
 # Settings: the environment first, then /etc/netrun/netrun.env (KEY=VALUE, the
 # same file the generator and the agent read):
-#   NETRUN_BGP_PREFIXES    prefixes to announce (space/comma separated, /32../48);
+#   NETRUN_BGP_PREFIXES    prefixes to announce (space/comma separated, /29../48);
 #                          default NETRUN_IPV6_ROUTED_PREFIX (the generator's prefix);
 #                          "none" = withdraw every prefix (a /48 moving to another node)
+#   NETRUN_POOL_LOCAL_PREFIXES  A14: pool blocks the provider routes to this host
+#                          itself (/29../56, not announced): only the local route
+#                          (+ the boot unit and the proxy guard), no BGP. Optional.
 #   NETRUN_BGP_LOCAL_ASN   required: the account's ASN from the Vultr portal (BGP tab)
 #   NETRUN_BGP_PASSWORD    required: the BGP password from the same tab
 #   NETRUN_BGP_PEER_ASN    default 64515 (Vultr, cloud compute)
@@ -70,6 +73,7 @@ NETRUN_ENV="${NETRUN_BGP_ENV_FILE:-/etc/netrun/netrun.env}"
 BIRD_CONF="${NETRUN_BGP_BIRD_CONF:-/etc/bird/bird.conf}"
 UNIT_DIR="${NETRUN_BGP_UNIT_DIR:-/etc/systemd/system}"
 LIST_FILE="${NETRUN_BGP_LIST_FILE:-/etc/netrun/bgp-prefixes}"
+LOCAL_LIST_FILE="${NETRUN_POOL_LOCAL_LIST_FILE:-/etc/netrun/pool-local-prefixes}"
 SELF="${NETRUN_BGP_SELF:-/usr/local/sbin/netrun-bgp}"
 GUARD_FILE="${NETRUN_BGP_GUARD_FILE:-/etc/netrun/nft-bgp-guard.nft}"
 GUARD_TABLE="netrun_bgp_guard"
@@ -99,21 +103,22 @@ setting() {
   printf '%s' "${val:-$def}"
 }
 
-# canonical_prefixes "<list>": one canonical IPv6 prefix per line, /32../48,
-# host bits cleared, sorted, duplicates and covered ones dropped; non-zero exit
-# on anything invalid.
+# canonical_prefixes "<list>" [min max]: one canonical IPv6 prefix per line,
+# /min../max (default /29../48: what BGP announces), host bits cleared, sorted,
+# duplicates and covered ones dropped; non-zero exit on anything invalid.
 canonical_prefixes() {
-  python3 - "$1" <<'PY'
+  python3 - "$1" "${2:-29}" "${3:-48}" <<'PY'
 import ipaddress, re, sys
 raw = [p for p in re.split(r"[\s,]+", sys.argv[1]) if p]
+lo, hi = int(sys.argv[2]), int(sys.argv[3])
 nets = []
 for p in raw:
     try:
         n = ipaddress.ip_network(p, strict=False)
     except ValueError:
         sys.exit(f"invalid prefix: {p}")
-    if n.version != 6 or not 32 <= n.prefixlen <= 48:
-        sys.exit(f"not an IPv6 /32../48 prefix: {p}")
+    if n.version != 6 or not lo <= n.prefixlen <= hi:
+        sys.exit(f"not an IPv6 /{lo}../{hi} prefix: {p}")
     nets.append(n)
 out = []
 for n in sorted(set(nets), key=lambda n: (n.prefixlen, int(n.network_address))):
@@ -187,7 +192,7 @@ unit_text() {  # <prefixes…>
   cat <<'EOF'
 # Written by netrun-bgp (scripts/netrun-bgp.sh).
 [Unit]
-Description=NETRUN - route our BGP-announced IPv6 prefixes to this host (local, dev lo)
+Description=NETRUN - route our IPv6 prefixes (BGP-announced and provider-routed pool blocks) to this host (local, dev lo)
 After=network-online.target
 Wants=network-online.target
 Before=netrun-3proxy-restore.service bird.service
@@ -351,6 +356,12 @@ load_settings() {
   else
     PREFIXES="$(canonical_prefixes "$plist")" || die "bad prefix list: $plist"
   fi
+  local llist
+  llist="$(setting NETRUN_POOL_LOCAL_PREFIXES "")"
+  LOCAL_ONLY=""
+  if [ -n "${llist// /}" ]; then
+    LOCAL_ONLY="$(canonical_prefixes "$llist" 29 56)" || die "bad NETRUN_POOL_LOCAL_PREFIXES: $llist"
+  fi
   LOCAL_ASN="$(setting NETRUN_BGP_LOCAL_ASN)"
   PASSWORD="$(setting NETRUN_BGP_PASSWORD)"
   PEER_ASN="$(setting NETRUN_BGP_PEER_ASN 64515)"
@@ -373,22 +384,29 @@ cmd_apply() {
     case "$a" in --dry-run) dry=1 ;; --install) install=1 ;; *) die "unknown option $a" ;; esac
   done
   load_settings
-  local -a new=() old=() added=() removed=()
+  local -a new=() old=() added=() removed=() lnew=() lold=() lremoved=()
   [ -z "$PREFIXES" ] || mapfile -t new <<< "$PREFIXES"
   [ -f "$LIST_FILE" ] && mapfile -t old < <(grep -v '^\s*$' "$LIST_FILE")
+  # A14: provider-routed pool blocks — a local route only
+  [ -z "$LOCAL_ONLY" ] || mapfile -t lnew <<< "$LOCAL_ONLY"
+  [ -f "$LOCAL_LIST_FILE" ] && mapfile -t lold < <(grep -v '^\s*$' "$LOCAL_LIST_FILE")
   local p q found
   for p in "${new[@]}"; do
     found=0; for q in "${old[@]}"; do [ "$p" = "$q" ] && found=1; done
     [ "$found" = 1 ] || added+=("$p")
   done
   for q in "${old[@]}"; do
-    found=0; for p in "${new[@]}"; do [ "$p" = "$q" ] && found=1; done
+    found=0; for p in "${new[@]}" "${lnew[@]}"; do [ "$p" = "$q" ] && found=1; done
     [ "$found" = 1 ] || removed+=("$q")
+  done
+  for q in "${lold[@]}"; do
+    found=0; for p in "${lnew[@]}" "${new[@]}"; do [ "$p" = "$q" ] && found=1; done
+    [ "$found" = 1 ] || lremoved+=("$q")
   done
 
   local conf unit dropin
   conf="$(bird_conf_text "$ROUTER_ID" "$SOURCE6" "$LOCAL_ASN" "$NEIGHBOR6" "$PEER_ASN" "$MULTIHOP" "$PASSWORD" "${new[@]}")"
-  unit="$(unit_text "${new[@]}")"
+  unit="$(unit_text "${new[@]}" "${lnew[@]}")"
   dropin="$(bird_dropin_text)"
 
   if [ "$dry" = 1 ]; then
@@ -396,6 +414,9 @@ cmd_apply() {
     log "prefixes: ${new[*]:-none}"
     [ "${#added[@]}" -gt 0 ] && log "new (local route first, then announce): ${added[*]}"
     [ "${#removed[@]}" -gt 0 ] && log "dropped (withdraw first, then the route): ${removed[*]}"
+    [ "${#lnew[@]}" -gt 0 ] && log "provider-routed pool blocks (local route only): ${lnew[*]}"
+    [ "${#lremoved[@]}" -gt 0 ] && log "provider-routed blocks dropped (route goes): ${lremoved[*]}"
+    for p in "${lnew[@]}"; do has_local_route "$p" || log "local route missing now: $p"; done
     for p in "${new[@]}"; do has_local_route "$p" || log "local route missing now: $p"; done
     log "router id $ROUTER_ID, source $SOURCE6, AS $LOCAL_ASN -> $NEIGHBOR6 AS $PEER_ASN"
     if command -v birdc >/dev/null 2>&1; then log "BIRD announces now: $(loaded_prefixes | tr '\n' ' ')"; fi
@@ -424,7 +445,8 @@ cmd_apply() {
   protect_env
 
   # 1. local routes for every announced prefix (new ones before BIRD sees them)
-  for p in "${new[@]}"; do ip -6 route replace local "$p" dev lo; done
+  # and every provider-routed pool block (A14)
+  for p in "${new[@]}" "${lnew[@]}"; do ip -6 route replace local "$p" dev lo; done
 
   # boot: the routes unit and the bird ordering; the :179 guard before BIRD
   # (re)starts listening
@@ -466,16 +488,20 @@ cmd_apply() {
     sleep "$wait"
     for q in "${removed[@]}"; do ip -6 route del local "$q" dev lo 2>/dev/null || true; done
   fi
+  # a provider-routed block is not announced: its route just goes
+  for q in "${lremoved[@]}"; do ip -6 route del local "$q" dev lo 2>/dev/null || true; done
   write_if_changed "$LIST_FILE" 0644 - "$PREFIXES" || true
+  if [ -n "$LOCAL_ONLY" ] || [ -f "$LOCAL_LIST_FILE" ]; then write_if_changed "$LOCAL_LIST_FILE" 0644 - "$LOCAL_ONLY" || true; fi
   install_self
   refresh_proxy_guard
   log "announced: ${new[*]:-none}"
+  [ "${#lnew[@]}" -eq 0 ] || log "provider-routed pool blocks: ${lnew[*]}"
 }
 
 cmd_status() {
   load_settings
   local p
-  for p in $PREFIXES; do
+  for p in $PREFIXES $LOCAL_ONLY; do
     if has_local_route "$p"; then echo "route  $p  local dev lo: yes"; else echo "route  $p  local dev lo: MISSING"; fi
   done
   birdc show protocols "$PROTO" 2>/dev/null | tail -n +2 || echo "bird: not running"
@@ -485,7 +511,7 @@ cmd_status() {
 cmd_check() {
   load_settings
   local p bad=0
-  for p in $PREFIXES; do has_local_route "$p" || { echo "missing local route: $p"; bad=1; }; done
+  for p in $PREFIXES $LOCAL_ONLY; do has_local_route "$p" || { echo "missing local route: $p"; bad=1; }; done
   if ! grep -q Established <<< "$(birdc show protocols "$PROTO" 2>/dev/null)"; then
     echo "BGP session $PROTO is not Established"; bad=1
   fi

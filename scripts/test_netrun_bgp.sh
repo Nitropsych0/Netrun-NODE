@@ -105,6 +105,7 @@ export PATH="$STUB:$PATH"
 
 export NETRUN_BGP_ENV_FILE="$TMP/netrun.env" NETRUN_BGP_BIRD_CONF="$TMP/bird/bird.conf" \
        NETRUN_BGP_UNIT_DIR="$TMP/systemd" NETRUN_BGP_LIST_FILE="$TMP/bgp-prefixes" \
+       NETRUN_POOL_LOCAL_LIST_FILE="$TMP/pool-local-prefixes" \
        NETRUN_BGP_SELF="$TMP/sbin/netrun-bgp" NETRUN_BGP_WITHDRAW_WAIT=0 \
        NETRUN_BGP_GUARD_FILE="$TMP/netrun/nft-bgp-guard.nft" NETRUN_BGP_PROXY_GUARD="$STUB/proxy-guard"
 cat > "$NETRUN_BGP_ENV_FILE" <<'EOF'
@@ -120,10 +121,14 @@ canon() { NETRUN_BGP_SOURCED=1 bash -c 'source "$1"; shift; canonical_prefixes "
 [ "$(canon "2602:f2dc:b0::/48, 2602:f2dc:a9::/48 2602:f2dc:a9::/48")" = $'2602:f2dc:a9::/48\n2602:f2dc:b0::/48' ] \
   || fail "canonical: sorted, deduplicated"
 [ "$(canon "2602:f2dc:a900::/40 2602:f2dc:a9ab::/48")" = "2602:f2dc:a900::/40" ] || fail "canonical: a covered prefix is dropped"
-for bad in "2602:f2dc:a9::/49" "2602::/31" "10.0.0.0/24" "nope/48"; do
+for bad in "2602:f2dc:a9::/49" "2602::/28" "10.0.0.0/24" "nope/48"; do
   canon "$bad" >/dev/null 2>&1 && fail "canonical accepts $bad"
 done
-ok "canonical_prefixes: canonical, sorted, deduplicated; /32../48 IPv6 only"
+[ "$(canon "2602:f2d8::/29")" = "2602:f2d8::/29" ] || fail "canonical: a /29 (A14) is announced"
+canon56() { NETRUN_BGP_SOURCED=1 bash -c 'source "$1"; shift; canonical_prefixes "$1" 29 56' _ "$BGP" "$1"; }
+[ "$(canon56 "2a01:4f8:1:2300::/56")" = "2a01:4f8:1:2300::/56" ] || fail "canonical 29..56: a provider /56"
+canon56 "2a01:4f8:1:2300::/57" >/dev/null 2>&1 && fail "canonical 29..56 accepts a /57"
+ok "canonical_prefixes: canonical, sorted, deduplicated; /29../48 IPv6 (or /29../56 for local-only blocks)"
 
 # ── part 2: dry run touches nothing ───────────────────────────────
 out="$(run apply --dry-run)" || fail "dry run failed: $out"
@@ -341,5 +346,22 @@ echo "Established" > "$BIRD_SESSION"
 : > "$ROUTES"
 run check >/dev/null && fail "check passes without the local route"
 ok "check: ok only with every route and an Established session"
+
+# ── part 9: A14 provider-routed pool blocks — a local route, never announced ──
+echo "NETRUN_POOL_LOCAL_PREFIXES=2a01:4f8:1:2300::/56" >> "$NETRUN_BGP_ENV_FILE"
+: > "$STUB_LOG"
+out="$(run apply)" || fail "apply with a local-only block failed: $out"
+grep -q "route replace local 2a01:4f8:1:2300::/56 dev lo" "$STUB_LOG" || fail "local-only block: route added"
+grep -q "2a01:4f8:1:2300" "$NETRUN_BGP_BIRD_CONF" && fail "local-only block announced over BGP"
+grep -qx "ExecStart=/sbin/ip -6 route replace local 2a01:4f8:1:2300::/56 dev lo" "$unit" || fail "local-only block in the boot unit"
+[ "$(cat "$TMP/pool-local-prefixes")" = "2a01:4f8:1:2300::/56" ] || fail "local-only list file"
+echo "$out" | grep -q "provider-routed pool blocks: 2a01:4f8:1:2300::/56" || fail "logged: $out"
+[ "$(run check)" = "ok" ] || fail "check ok with the local-only route"
+sed -i.bak '/^NETRUN_POOL_LOCAL_PREFIXES=/d' "$NETRUN_BGP_ENV_FILE"
+: > "$STUB_LOG"
+out="$(run apply)" || fail "apply without the local-only block failed: $out"
+grep -q "route del local 2a01:4f8:1:2300::/56 dev lo" "$STUB_LOG" || fail "dropped local-only block: route removed"
+! grep -q "2a01:4f8:1:2300" "$unit" || fail "boot unit follows"
+ok "A14 provider-routed blocks: local route + boot unit, never announced; dropped → route goes"
 
 echo "PASS ($PASS)"
