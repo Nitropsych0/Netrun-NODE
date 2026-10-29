@@ -164,7 +164,21 @@ address spread over the WHOLE pool, shared with per-GB — no /64 of its own.
 - **Pool blocks.** `facts.poolBlocks`: up to 64 more IPv6 prefixes, /29 .. /56,
   none overlapping another (BGP-announced by `netrun-bgp`, or routed by the
   provider). The primary `prefix` /48 is always a block. `status.pool.blocks`
-  lists them. Per-GB still draws from the primary /48 (`subnets`) for now.
+  lists them.
+- **Per-GB over every block (A14 stage 1b, `features` gains `poolWide`).**
+  Rotation, sticky, static, timer and link lines draw from the whole pool: a
+  /64 of the /48 keeps its subnet id as its `net`, a /64 of an extra block is
+  its absolute network number (`addr >> 64`, always >= 2^16). Nothing in an
+  extra block is excluded, so random picks are uniform over all candidates
+  (an extra /29 takes nearly every pick) and derived picks map their hash onto
+  the /48 range, then the blocks. Without extra blocks every pick is exactly
+  what it was. Remembered static and sticky lines keep their addresses; a
+  block that leaves the pool releases the lines on it (`pool_changed`) and
+  recomputes timer/link lines. `alloc` in `status` counts the blocks
+  (`candidates`/`free`/`sliceSize` include them; `extraBlocks`, `extra64`).
+  ctl `avoid` takes `net64: "<prefix>/64"` in place of `net` for an extra
+  block's /64 (one of the /48 is mapped to its subnet id); the agent sends it
+  only while RADIUS lists `poolWide`.
 - **Records.** A piece list carries `pieceNet64: "<prefix>/64"` instead of
   `pieceNet` (exactly one of the two). The orchestrator picks the /64 (its
   spread placement) once, at purchase; the node adds the piece's host part —

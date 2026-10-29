@@ -191,8 +191,9 @@ function covers(base, plen, big) {
 
 // A tagger bound to one key and one /48 (+ A14: the extra pool blocks):
 //   decodeAddress(text) -> null (not an IPv6 of the prefix or a block) or
-//     { subnetId, iid (BigInt), listId, r16, valid } — subnetId is null for an
-//     address of an extra block (A14-P pieces: no per-/64 bookkeeping there)
+//     { subnetId, net64, iid (BigInt), listId, r16, valid } — subnetId is null
+//     for an address of an extra block, whose /64 is net64 ("<prefix>/64"; null
+//     in the /48)
 //   address(subnetId, listId, r16) -> text (tests, attribution checks)
 function createTagger({ key, prefix, blocks }) {
   const k = Buffer.isBuffer(key) ? key : Buffer.from(String(key || ""), "base64");
@@ -222,7 +223,8 @@ function createTagger({ key, prefix, blocks }) {
       else if (!extra.some((b) => covers(b.base, b.plen, big))) return null;
       const iid = big & ((1n << 64n) - 1n);
       const d = decodeIid(iid);
-      return { subnetId, iid, listId: d.listId, r16: d.r16, valid: d.valid && iid >= IID_MIN };
+      const net64 = subnetId === null ? `${bigToIpv6((big >> 64n) << 64n)}/64` : null;
+      return { subnetId, net64, iid, listId: d.listId, r16: d.r16, valid: d.valid && iid >= IID_MIN };
     },
     address(subnetId, listId, r16) {
       const iid = encrypt(k, listId, r16);

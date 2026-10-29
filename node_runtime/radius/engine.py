@@ -14,7 +14,8 @@ modes per_request / timer / link / static, link epochs, TTL 30 s .. 24 h),
 A11 (the «липкая сессия» pause), A12 (ctl op `avoid`, smart rotation picks),
 A13 / A13-I (per-piece proxies: list and account kind "piece", one reserved
 /64 per piece, a fixed address, no quota, IPv4 via the node's primary IPv4),
-A14-P (a piece on any /64 of the pool blocks, shared with per-GB: pieceNet64).
+A14-P (a piece on any /64 of the pool blocks, shared with per-GB: pieceNet64),
+A14 1b (per-GB draws from every pool block, avoid entries by net64: poolWide).
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ PIECE = "piece"  # A13-I: a per-piece proxy (list) and its account
 KINDS = (PERGB, PIECE)
 PIECE_REJECTS_KEPT = 100
 # status.features: what this RADIUS speaks beyond I5 (the agent checks before using it)
-FEATURES = ("pieces", "reserveExact", "reserved", "avoid", "primaryIpv4", "pieceNet64")
+FEATURES = ("pieces", "reserveExact", "reserved", "avoid", "primaryIpv4", "pieceNet64", "poolWide")
 POOL_BLOCK_LEN = (29, 56)  # A14: the prefix lengths a pool block may have
 MAX_EGRESS_V4 = 64  # A7: 1..64 per-GB IPv4s per node
 STICKY_PAUSES = (5, 10)  # A11: the two pause buttons (other values 1..60 are accepted)
@@ -587,6 +588,11 @@ def _in_blocks(n64: int, blocks) -> bool:
     return any((n64 >> (64 - plen)) == (base >> (64 - plen)) for base, plen in blocks)
 
 
+def _extra_blocks(f) -> tuple:
+    """A14 1b: the pool blocks other than the primary /48 (per-GB draws from them too)."""
+    return tuple(b for b in f.blocks if b != (f.prefix >> 64, 48))
+
+
 class Engine:
     def __init__(self, store, secret: bytes | None = None, clock=time.time, rng=None, env=None):
         env = os.environ if env is None else env
@@ -750,7 +756,7 @@ class Engine:
         return len(dropped)
 
     def _set_facts(self, f: Facts, now: float):
-        self.alloc.configure(f.prefix, f.prefix_str, f.lo, f.hi, f.key, now)
+        self.alloc.configure(f.prefix, f.prefix_str, f.lo, f.hi, f.key, now, blocks=_extra_blocks(f))
         self.facts = f
         pend = getattr(self, "_pending_bindings", None)
         if pend:
@@ -911,7 +917,7 @@ class Engine:
                     v4 = self._line_v4(f, v4s, ln.v4)
                 else:
                     v6 = ln.addr.to_bytes(16, "big")
-                    a.last_used[ln.net] = int(now)  # reserve_nets spares /64s that served in the last 60 s
+                    a._touch(ln.net, now)  # reserve_nets spares /64s that served in the last 60 s
         except AllocError as e:
             return self._reject(e.reason, lst, now)
         if near is not None:
@@ -1804,8 +1810,23 @@ class Engine:
             self.ipv4_closed = frozenset(closed)
         return {"ok": True}
 
+    def _avoid_net(self, e) -> int:
+        """A12 avoid entry's /64: ``net`` (a subnet id of the /48) or, A14 1b, ``net64``
+        ("<prefix>/64", an extra block's /64; one of the /48 maps to its subnet id)."""
+        raw = e.get("net64")
+        if raw is None:
+            return _subnet_id(e.get("net"))
+        try:
+            n64 = _parse_net64(raw)
+        except (ValueError, TypeError):
+            raise _bad("avoid net64") from None
+        f = self.facts
+        if f is not None and (n64 >> 16) == (f.prefix >> 80):
+            return n64 & 0xFFFF
+        return n64
+
     def op_avoid(self, req):
-        """A12: {entries:[{net, site, until}], removed:[{net, site}], full} (memory only)."""
+        """A12: {entries:[{net | net64, site, until}], removed:[{net | net64, site}], full} (memory only)."""
         entries, removed = req.get("entries") or [], req.get("removed") or []
         if not isinstance(entries, list) or not isinstance(removed, list):
             raise _bad("entries and removed must be lists")
@@ -1824,11 +1845,11 @@ class Engine:
             until = _num(e, "until")
             if until is None:
                 raise _bad("avoid until")
-            parsed.append((_subnet_id(e.get("net")), site_of(e), float(until)))
+            parsed.append((self._avoid_net(e), site_of(e), float(until)))
         for e in removed:
             if not isinstance(e, dict):
                 raise _bad("avoid removed are objects")
-            gone.append((_subnet_id(e.get("net")), site_of(e)))
+            gone.append((self._avoid_net(e), site_of(e)))
         if parsed and self.psl is None:
             p = psl_lib.Psl.load()  # outside the lock: ~9k rules
             with self.lock:

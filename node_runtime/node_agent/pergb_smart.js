@@ -23,6 +23,8 @@
 // Delivery: ctl `avoid {entries:[{net, site, until}], removed:[{net, site}],
 // full}` with deltas every tick, the whole set after a RADIUS epoch change
 // (and while RADIUS does not know the op yet: retried every 5 min).
+// A14 1b: a /64 of an extra pool block goes as `net64: "<prefix>/64"` instead
+// of `net`, only while RADIUS says poolWide (an older one draws from the /48 only).
 
 const psl = require("./pergb_psl.js");
 
@@ -36,6 +38,16 @@ const SUCCESS_BYTES = 1024;
 const OWN_SIDE_CODES = new Set([11, 12, 15]);
 const PAIR_CAP = 200000;
 const RETRY_UNSUPPORTED_MS = 5 * 60 * 1000;
+
+// a pair's /64 on the wire: a subnet id of the /48, or an extra block's net64 text
+function netField(id) {
+  return typeof id === "number" ? { net: id } : { net64: id };
+}
+
+function keyNet(key) {
+  const s = key.slice(0, key.indexOf("|"));
+  return /^\d+$/.test(s) ? Number(s) : s;
+}
 
 // record -> "fail" | "ok" | "own" | null (neutral)
 function classifyRecord(rec, hadInterim = false) {
@@ -99,7 +111,7 @@ function createSmart(deps = {}) {
       p.events = [];
       const key = `${p.net}|${p.site}`;
       active.set(key, p.avoidUntil);
-      added.set(key, { net: p.net, site: p.site, until: Math.floor(p.avoidUntil / 1000) });
+      added.set(key, { ...netField(p.net), site: p.site, until: Math.floor(p.avoidUntil / 1000) });
       removed.delete(key);
       counters.verdicts += 1;
     }
@@ -110,6 +122,7 @@ function createSmart(deps = {}) {
     const tagger = deps.tagger ? deps.tagger() : null;
     if (!tagger) return;
     const excluded = deps.excluded ? deps.excluded() : null;
+    const wide = deps.wide ? deps.wide() : false;
     const t = now();
     for (const rec of records) {
       counters.records += 1;
@@ -132,14 +145,19 @@ function createSmart(deps = {}) {
       }
       if (kind === null) continue;
       const d = tagger.decodeAddress(rec.bound);
-      // A14: an extra block's address (subnetId null) is a piece's — no avoid pairs
-      if (!d || !d.valid || d.subnetId === null || (excluded && excluded.has(d.subnetId))) continue;
+      if (!d || !d.valid) continue;
+      let id;
+      if (d.subnetId !== null) {
+        if (excluded && excluded.has(d.subnetId)) continue;
+        id = d.subnetId;
+      } else if (wide && d.net64) id = d.net64; // A14 1b: an extra block's /64
+      else continue;
       const site = psl.siteKey(rec.host, rec.dstIp, pslData || undefined);
       if (!site) continue;
-      const key = `${d.subnetId}|${site}`;
+      const key = `${id}|${site}`;
       let p = pairs.get(key);
       if (!p) {
-        p = { net: d.subnetId, site, events: [], avoidUntil: null, level: 0, lastAvoidAt: null, lastSeen: t };
+        p = { net: id, site, events: [], avoidUntil: null, level: 0, lastAvoidAt: null, lastSeen: t };
         pairs.set(key, p);
       }
       p.lastSeen = t;
@@ -172,7 +190,7 @@ function createSmart(deps = {}) {
         active.delete(key);
         added.delete(key);
         const p = pairs.get(key);
-        removed.set(key, { net: p ? p.net : Number(key.split("|")[0]), site: p ? p.site : key.slice(key.indexOf("|") + 1) });
+        removed.set(key, { ...netField(p ? p.net : keyNet(key)), site: p ? p.site : key.slice(key.indexOf("|") + 1) });
       }
     }
   }
@@ -180,7 +198,7 @@ function createSmart(deps = {}) {
   function fullSet() {
     return [...active.entries()].map(([key, until]) => {
       const p = pairs.get(key);
-      return { net: p.net, site: p.site, until: Math.floor(until / 1000) };
+      return { ...netField(p.net), site: p.site, until: Math.floor(until / 1000) };
     });
   }
 

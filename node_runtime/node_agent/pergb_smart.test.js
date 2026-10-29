@@ -151,3 +151,34 @@ test("memory: tracked pairs stay capped", () => {
   for (let i = 0; i < 1000; i += 1) s.observe([rec(0x40 + (i % 50), { host: `site${i}.com`, inBytes: 4096 })]);
   assert.ok(s.status().trackedPairs <= 1000);
 });
+
+test("A14 1b: an extra block's /64 is learned and pushed as net64, only while RADIUS says poolWide", async () => {
+  let t = 1_790_000_000_000;
+  const now = () => t;
+  const tag = require("./pergb_tag.js");
+  const KEY = Buffer.from(T.KEY_B64, "base64");
+  const tagger = tag.createTagger({ key: KEY, prefix: T.PREFIX, blocks: [tag.parseBlock("2001:db8:8000::/33")] });
+  let wide = false;
+  const ctl = T.fakeCtl({});
+  const s = smartLib.createSmart({ now, ctl, log: QUIET, tagger: () => tagger, excluded: () => new Set(), wide: () => wide });
+  const wideAddr = tag.bigToIpv6(tag.ipv6ToBig("2001:db8:f00d:1234::") | tag.pieceIid(KEY, 7));
+  let port = 41000;
+  const rec = (bound) => ({
+    t: now(), code: 0, inBytes: 0, outBytes: 517, interim: false, host: "shop.example.com", dstIp: "93.184.216.34",
+    localIp: "127.0.0.3", port: 31000, clientIp: "127.0.0.1", clientPort: port++, bound,
+  });
+  s.observe([rec(wideAddr), rec(wideAddr), rec(wideAddr)]);
+  assert.strictEqual(s._active.size, 0, "RADIUS without poolWide: extra-block records are skipped");
+  wide = true;
+  s.observe([rec(wideAddr), rec(wideAddr), rec(wideAddr), rec(tagger.address(0x10, 7, 1)), rec(tagger.address(0x10, 7, 2)), rec(tagger.address(0x10, 7, 3))]);
+  assert.strictEqual(s._active.size, 2);
+  await s.push();
+  const call = ctl.calls.find((c) => c.op === "avoid");
+  const got = call.body.entries.map((e) => ("net64" in e ? ["net64", e.net64] : ["net", e.net])).sort();
+  assert.deepStrictEqual(got, [["net", 0x10], ["net64", "2001:db8:f00d:1234::/64"]]);
+  t += 31 * 60 * 1000; // the avoid periods end: both leave with the right field
+  await s.push();
+  const last = ctl.calls.filter((c) => c.op === "avoid").pop();
+  const removed = last.body.removed.map((e) => ("net64" in e ? e.net64 : e.net)).sort();
+  assert.deepStrictEqual(removed, ["2001:db8:f00d:1234::/64", 0x10].sort());
+});

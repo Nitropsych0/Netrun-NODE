@@ -52,3 +52,11 @@ test("covers: prefix containment", () => {
   assert.ok(tag.covers(b.base, b.plen, tag.ipv6ToBig("2001:db8:ffff:ffff::1")));
   assert.ok(!tag.covers(b.base, b.plen, tag.ipv6ToBig("2001:db8:7fff::1")));
 });
+
+test("tagger: an extra block's address carries its net64, a /48 address none", () => {
+  const t = tag.createTagger({ key: KEY, prefix: PREFIX, blocks: [tag.parseBlock("2001:db8:8000::/33")] });
+  const iid = tag.pieceIid(KEY, 9);
+  const d = t.decodeAddress(tag.bigToIpv6(tag.ipv6ToBig("2001:db8:f00d:1234::") | iid));
+  assert.strictEqual(d.net64, "2001:db8:f00d:1234::/64");
+  assert.strictEqual(t.decodeAddress(t.address(0x12, 9, 3)).net64, null);
+});

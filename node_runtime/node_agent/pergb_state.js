@@ -553,7 +553,15 @@ function createPergb(deps = {}) {
     }),
   });
   enforcer = enforcerLib.createEnforcer({ ctl, meter, killer, now, log, logdumpBytes: logdump });
-  const smart = smartLib.createSmart({ ctl, now, log, tagger: () => tagger, excluded: () => excludedSet });
+  const smart = smartLib.createSmart({
+    ctl,
+    now,
+    log,
+    tagger: () => tagger,
+    excluded: () => excludedSet,
+    // A14 1b: RADIUS draws per-GB from the extra blocks too and takes avoid pairs by net64
+    wide: () => !!(radius.last && Array.isArray(radius.last.features) && radius.last.features.includes("poolWide")),
+  });
 
   async function socketView(maxAgeMs = 3000) {
     if (sockCache && now() - sockCache.at <= maxAgeMs) return sockCache.view;

@@ -40,6 +40,16 @@ part uses r16 = H_r(k, kind, list, slot, extra, j) for j = 0, 1, ... until the
 interface id is >= 2^32; the IPv4 egress index (A7) is H_v4(...) mod N.
 H = HMAC-SHA256 (see _derive).
 
+Wide pool (A14 stage 1b): besides the /48, the pool may hold extra blocks
+(/29 .. /56, routed to the node). A /64 of the /48 keeps its 16-bit subnet id
+as its net; a /64 of an extra block is its absolute network number
+(addr >> 64, always >= 2^16), so one integer names any /64 and nothing the /48
+had changes meaning. Nothing in an extra block is excluded (scan and reserve
+are the /48's), so its candidates are implicit: random picks are uniform over
+every candidate of the pool (an extra /29 takes nearly all of them), derived
+picks map their hash onto the whole pool, last-used times of extra /64s live in
+a bounded LRU. Without extra blocks every pick is exactly what it was.
+
 Per-piece on RADIUS (A13, contract A13-I): a piece list owns ONE /64 of the
 pool, reserved through reserve_nets under a ref "piece:<order_ref>"; its
 address is that /64 + the tagged host H_r(k, "piece", list, "", "", j) — fixed
@@ -90,6 +100,7 @@ PAUSE = "pr"  # per_request line held by the A11 pause
 PIECE = "piece"  # A13: the derivation kind of a per-piece address
 PIECE_REF = "piece:"  # A13-I: reserve_nets refs of per-piece proxies start with this
 PIECE_IID_CACHE = 200_000
+WIDE_LU_MAX = 200_000  # A14 1b: last-used times kept for extra-block /64s (oldest forgotten)
 
 _LABEL_NET = b"netrun-pergb-pick\x00"
 _LABEL_R16 = b"netrun-pergb-pick-r\x00"
@@ -227,6 +238,10 @@ class Allocator:
         self.last_scan_id = None
         self.cand = _IndexedSet()
         self.last_used = _u32_array()
+        # A14 1b: extra pool blocks [(first net, size)], sorted; their /64s are all candidates
+        self.extra = ()
+        self.extra_total = 0
+        self.wide_lu = OrderedDict()  # extra-block net -> last used (bounded LRU)
         # remembered lines
         self.static = {}  # (list_id, slot) -> Line
         self.sticky = {}  # (list_id, slot) -> Line
@@ -268,12 +283,20 @@ class Allocator:
     def key(self) -> bytes:
         return self.tagger.key
 
-    def configure(self, prefix: int, prefix_str: str, lo: int, hi: int, key: bytes, now: float | None = None):
-        """Set the pool. A new prefix or key forgets every line; a smaller pool the outside ones."""
+    def configure(
+        self, prefix: int, prefix_str: str, lo: int, hi: int, key: bytes, now: float | None = None, blocks=()
+    ):
+        """Set the pool. A new prefix or key forgets every line; a smaller pool the outside ones.
+
+        blocks: the extra pool blocks as (upper 64 bits of the network, prefix length),
+        not overlapping the /48 or each other (the engine checks)."""
         now = self.clock() if now is None else now
         hi = min(hi, NET_SELF - 1)
         if lo < 0 or lo > hi:
             raise ValueError("bad pool range")
+        extra = tuple(sorted((base, 1 << (64 - plen)) for base, plen in blocks))
+        if any(base < NET_COUNT for base, _size in extra):
+            raise ValueError("bad pool block")
         if self.prefix is not None and prefix != self.prefix:
             self._forget_all("prefix_changed", now)
         elif self.tagger is not None and self.tagger.key != key:
@@ -283,12 +306,16 @@ class Allocator:
         if self.tagger is None or self.tagger.key != key:
             self.tagger = Tagger(key)
             self.piece_iids = {}
-        range_changed = (self.lo, self.hi) != (lo, hi)
+        range_changed = (self.lo, self.hi) != (lo, hi) or self.extra != extra
         self.lo, self.hi = lo, hi
+        self.extra = extra
+        self.extra_total = sum(size for _base, size in extra)
+        if self.wide_lu:
+            self.wide_lu = OrderedDict((n, t) for n, t in self.wide_lu.items() if self.in_pool(n))
         if range_changed:
             # derived addresses depend on the range: everything derived is recomputed
             for ln in list(self.static.values()) + list(self.sticky.values()):
-                if not lo <= ln.net <= hi:
+                if not self.in_pool(ln.net):
                     self.release(ln, "pool_changed", now)
             for ln in list(self.mode.values()):
                 self._drop(ln)
@@ -302,7 +329,53 @@ class Allocator:
         self.by_list = {lid: kinds for lid, kinds in self.by_list.items() if kinds}
 
     def in_pool(self, net: int) -> bool:
-        return self.lo <= net <= self.hi and net != NET_SELF
+        if net < NET_COUNT:
+            return self.lo <= net <= self.hi and net != NET_SELF
+        return self._extra_block(net) is not None
+
+    def _extra_block(self, net: int):
+        for base, size in self.extra:
+            if base <= net < base + size:
+                return base
+        return None
+
+    def is_cand(self, net: int) -> bool:
+        """A candidate: in the pool and not excluded (extra-block /64s always are)."""
+        if net < NET_COUNT:
+            return net in self.cand.index
+        return self._extra_block(net) is not None
+
+    def cand_count(self) -> int:
+        return len(self.cand) + self.extra_total
+
+    def _extra_net(self, i: int) -> int:
+        """The i-th /64 (0 <= i < extra_total) of the extra blocks."""
+        for base, size in self.extra:
+            if i < size:
+                return base + i
+            i -= size
+        raise IndexError(i)
+
+    def _pick(self, rng) -> int:
+        """A uniform random candidate of the whole pool."""
+        if not self.extra_total:
+            return self.cand.pick(rng)
+        i = rng.randrange(len(self.cand) + self.extra_total)
+        n = len(self.cand)
+        return self.cand.items[i] if i < n else self._extra_net(i - n)
+
+    def _lu(self, net: int) -> int:
+        return self.last_used[net] if net < NET_COUNT else self.wide_lu.get(net, 0)
+
+    def _touch(self, net: int, now: float):
+        if net < NET_COUNT:
+            self.last_used[net] = int(now)
+            return
+        lu = self.wide_lu
+        lu[net] = int(now)
+        lu.move_to_end(net)
+        while len(lu) > WIDE_LU_MAX:
+            lu.popitem(last=False)
 
     def is_excluded(self, net: int, now: float | None = None) -> bool:
         return net in self.scan or net in self.reserved
@@ -312,6 +385,7 @@ class Allocator:
         self.cand = _IndexedSet(cand)
 
     def pool_size(self) -> int:
+        """The /64s of the /48 part of the pool (excluded ones included)."""
         if self.prefix is None:
             return 0
         size = self.hi - self.lo + 1
@@ -322,15 +396,20 @@ class Allocator:
     # ---- addresses -----------------------------------------------------------------
 
     def addr_of(self, net: int, iid: int) -> int:
+        if net >= NET_COUNT:
+            return (net << 64) | iid
         return self.prefix | (net << 64) | iid
 
     def new_addr(self, net: int, list_id: int) -> int:
         return self.addr_of(net, self.tagger.make_iid(list_id, self.rng.getrandbits))
 
     def net_of(self, addr: int) -> int | None:
-        if self.prefix is None or (addr >> 80) != (self.prefix >> 80):
+        if self.prefix is None:
             return None
-        return (addr >> 64) & 0xFFFF
+        if (addr >> 80) == (self.prefix >> 80):
+            return (addr >> 64) & 0xFFFF
+        n = addr >> 64
+        return n if self.extra and self._extra_block(n) is not None else None
 
     @staticmethod
     def _seed(kind: str, list_id: int, slot: str, extra: str) -> bytes:
@@ -350,15 +429,20 @@ class Allocator:
         seed = _LABEL_NET + self._seed(kind, list_id, slot, extra)
         lo = self.lo
         size = self.hi - lo + 1
+        total = size + self.extra_total  # A14 1b: the hash maps onto the /48 range, then the extra blocks
         cand = self.cand.index
         mine = self.list_nets.get(list_id) if spread else None
         first_ok = None
         clashes = 0
         for i in range(DERIVE_MAX_PROBES):
             d = hmac.digest(key, seed + i.to_bytes(4, "big"), "sha256")
-            n = lo + int.from_bytes(d[:8], "big") % size
-            if n not in cand:
-                continue
+            g = int.from_bytes(d[:8], "big") % total
+            if g < size:
+                n = lo + g
+                if n not in cand:
+                    continue
+            else:
+                n = self._extra_net(g - size)
             if mine and mine.get(n):
                 if first_ok is None:
                     first_ok = n
@@ -369,7 +453,7 @@ class Allocator:
             return n
         if first_ok is not None:
             return first_ok
-        if len(self.cand):  # nearly the whole pool is per-piece's: any candidate
+        if len(self.cand):  # nearly the whole /48 is per-piece's and no extra block: any candidate
             return self.cand.items[int.from_bytes(hmac.digest(key, seed, "sha256")[:8], "big") % len(self.cand)]
         raise AllocError("capacity")
 
@@ -758,6 +842,7 @@ class Allocator:
         scan, reserved = self.scan, self.reserved
         top = self.prefix >> 80 if self.prefix is not None else None
         mask64 = (1 << 64) - 1
+        extra = self.extra
         for row in rows:
             list_id, slot, kind, addr16, net, v4, acct, created, expires, last_used = row
             addr = int.from_bytes(addr16, "big")
@@ -772,16 +857,18 @@ class Allocator:
                 dropped.append(row)
                 continue
             key = (list_id, slot)
-            if (
-                key in table
-                or not lo <= net <= hi
-                or net == NET_SELF
-                or net in scan
-                or net in reserved
-                or addr >> 80 != top
-                or (addr >> 64) & 0xFFFF != net
-                or (addr & mask64) < IID_MIN
-            ):
+            if net >= NET_COUNT:  # A14 1b: an extra-block /64
+                bad = not extra or addr >> 64 != net or self._extra_block(net) is None
+            else:
+                bad = (
+                    not lo <= net <= hi
+                    or net == NET_SELF
+                    or net in scan
+                    or net in reserved
+                    or addr >> 80 != top
+                    or (addr >> 64) & 0xFFFF != net
+                )
+            if key in table or bad or (addr & mask64) < IID_MIN:
                 dropped.append(row)
                 continue
             ln = Line(list_id, slot, kind, addr, net, v4, acct, created, expires)
@@ -818,8 +905,16 @@ class Allocator:
 
     def _draw(self) -> int:
         """The least recently used of a few random candidates."""
-        cand = self.cand
         rng = self.rng
+        if self.extra_total:
+            pick, lu = self._pick, self._lu
+            n = pick(rng)
+            for _ in range(ROTATE_BEST_OF - 1):
+                c = pick(rng)
+                if lu(c) < lu(n):
+                    n = c
+            return n
+        cand = self.cand
         last_used = self.last_used
         n = cand.pick(rng)
         for _ in range(ROTATE_BEST_OF - 1):
@@ -831,26 +926,25 @@ class Allocator:
     def pick_random(self, now: float, site: str | None = None) -> int:
         """A fresh /64 for a per_request pick: the least recently used of a few random
         candidates; A12: candidates this site refused are skipped, up to 16 draws."""
-        cand = self.cand
-        if not len(cand):
+        if not self.cand_count():
             raise AllocError("capacity")
         av = self.avoid.get(site) if site is not None else None
         if not av:
             n = self._draw()
         else:
             rng = self.rng
-            last_used = self.last_used
+            pick, lu = self._pick, self._lu
             skipped = False
             n = None
             for _ in range(AVOID_TRIES):
                 best = None
                 for _ in range(ROTATE_BEST_OF):
-                    c = cand.pick(rng)
+                    c = pick(rng)
                     until = av.get(c)
                     if until is not None and until > now:
                         skipped = True
                         continue
-                    if best is None or last_used[c] < last_used[best]:
+                    if best is None or lu(c) < lu(best):
                         best = c
                 if best is not None:
                     n = best
@@ -864,7 +958,7 @@ class Allocator:
                     ex.popitem(last=False)
             elif skipped:
                 self.avoid_picks.add(now)
-        self.last_used[n] = int(now)
+        self._touch(n, now)
         return n
 
     def rotate_addr(self, list_id: int, now: float, site: str | None = None) -> int:
@@ -901,20 +995,21 @@ class Allocator:
             prev = self.prev_net.get(key)
             if prev is not None and prev[1] > now:
                 avoid = prev[0]
-        cand = self.cand
-        if not len(cand):
+        total = self.cand_count()
+        if not total:
             raise AllocError("capacity")
+        pick = self._pick
         mine = self.list_nets.get(list_id)
         n = None
         for _ in range(SPREAD_TRIES):
-            c = cand.pick(self.rng)
-            if c == avoid and len(cand) > 1:
+            c = pick(self.rng)
+            if c == avoid and total > 1:
                 continue
             n = c
             if not mine or not mine.get(c):
                 break
         if n is None:
-            n = cand.pick(self.rng)
+            n = pick(self.rng)
         ln = Line(
             list_id, slot, STICKY, self.new_addr(n, list_id), n, self.rng.getrandbits(32), account_id, now, now + ttl
         )
@@ -966,7 +1061,7 @@ class Allocator:
         ln = self.mode.get((list_id, slot))
         if ln is not None and ln.kind == TIMER:
             if ln.key == key:
-                if ln.net in self.cand.index:
+                if self.is_cand(ln.net):
                     ln.last_seen = now
                     return ln
             elif (
@@ -974,7 +1069,7 @@ class Allocator:
                 and ln.key[1] == ttl
                 and ln.key[3:] == key[3:]  # a link change applies at once, never postponed
                 and now - ln.last_seen < pause
-                and ln.net in self.cand.index
+                and self.is_cand(ln.net)
             ):
                 due = anchor + (ln.key[2] + 1) * ttl  # the tick that ended the window it uses
                 if ln.pending_since is None:
@@ -988,7 +1083,7 @@ class Allocator:
     def link_line(self, list_id, slot, account_id, epochs, now) -> Line:
         key = (LINK,) + tuple(epochs)
         ln = self.mode.get((list_id, slot))
-        if ln is not None and ln.kind == LINK and ln.key == key and ln.net in self.cand.index:
+        if ln is not None and ln.kind == LINK and ln.key == key and self.is_cand(ln.net):
             ln.last_seen = now
             return ln
         return self._mode_line(list_id, slot, LINK, key, account_id, now, ":".join(str(e) for e in epochs))
@@ -996,7 +1091,7 @@ class Allocator:
     def pause_line(self, list_id, slot, account_id, pause, now, site=None) -> Line:
         """per_request with the A11 pause: a busy line keeps its address (at most 120 s past due)."""
         ln = self.mode.get((list_id, slot))
-        if ln is not None and ln.kind == PAUSE and now - ln.last_seen < pause and ln.net in self.cand.index:
+        if ln is not None and ln.kind == PAUSE and now - ln.last_seen < pause and self.is_cand(ln.net):
             if ln.pending_since is None:
                 ln.pending_since = now
             if now - ln.pending_since < STICKY_MAX_DEFER:
@@ -1118,12 +1213,15 @@ class Allocator:
 
     def stats(self, now: float) -> dict:
         n_static, n_sticky = len(self.static), len(self.sticky)
+        cand = self.cand_count()
         return {
-            "sliceSize": self.pool_size(),
-            "candidates": len(self.cand),
+            "sliceSize": self.pool_size() + self.extra_total,
+            "candidates": cand,
             "excluded": self.excluded_count(now),
             # A8: nothing is reserved for a per-GB customer, the pool is shared
-            "free": len(self.cand),
+            "free": cand,
+            "extraBlocks": len(self.extra),  # A14 1b
+            "extra64": self.extra_total,
             "boundExclusive": 0,
             "boundShared": n_static + n_sticky,
             "static": n_static,
@@ -1150,7 +1248,7 @@ class Allocator:
         for table, kind in ((self.static, STATIC), (self.sticky, STICKY)):
             for (lid, slot), ln in table.items():
                 assert ln.kind == kind and ln.list_id == lid and ln.slot == slot
-                assert ln.net in self.cand.index, (kind, ln.net)
+                assert self.is_cand(ln.net), (kind, ln.net)
                 assert self.net_of(ln.addr) == ln.net
                 assert (ln.addr & ((1 << 64) - 1)) >= IID_MIN
                 assert self.tagger.list_of(ln.addr & ((1 << 64) - 1)) == lid
